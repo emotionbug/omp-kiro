@@ -53,15 +53,65 @@ Key evidence:
 
 The capture's executable digest binds the caller's Node harness, and process trees are sampled. Network packets were not captured; authenticated request/status/schema observations came from the explicit harness. These limitations do not imply generation was exercised.
 
-## Authentication
+## Authentication acquisition and storage
 
-REA observed the Linux SQLite `auth_kv(key,value)` schema and the social-token record's field names without emitting values. Only the local Google social-login mode was observed and implemented. Other login providers, Builder ID, enterprise/OIDC, and non-Linux keychain storage are rejected rather than guessed.
+### Current social device protocol
+
+Exact-artifact social strings identify `/oauth/device/authorization`, `/oauth/device/poll`, and the current `https://app.kiro.dev/signin` portal:
+
+- Device schema/path markers: `ev_45b3e7289ec3115102f8323912181ede782965d10a0e1fad70de96b948ee355c`.
+- Portal/PKCE/redirect markers: `ev_8880d65d9498d3ca58fe82ec5078c5830c0f66cbd25374ea41f614735d576241`.
+
+Live safe initiation at the fixed desktop-auth service:
+
+- Google: `ev_bb35ca579b3ff67c0aaccc920b9fb8277133ce6eb4bfd60d42294faf11ced9c6`.
+- GitHub: `ev_173b9e8db290744ad9e60ac3f713241ef6b43c9b66d3da9614712c501e157ffb`.
+
+`POST /oauth/device/authorization` with public `clientId: kiro-cli` and `loginProvider: Google|Github` returned HTTP 200. Observed fields were deviceCode, userCode, verificationUri, verificationUriComplete, expiresInMilliseconds, and intervalInMilliseconds. Observed expiry was five minutes and interval five seconds. A poll to `/oauth/device/poll` using the private device code returned HTTP 200 `authorization_pending`. No approval was performed; codes/tokens were not emitted.
+
+This is a distinct social-device API, not the AWS OIDC device grant. Default standalone social login uses it without spawning CLI, opening a callback port, launching an OS browser, or reading a keychain.
+
+### Current social portal and PKCE
+
+Current portal release `7f6e24453bd10337` was inspected without authentication. Vendor JS SHA-256 was `510fd367579e0d01265758872d627b7234ff392bfec8f3f727a3683dc2f67d71`; DeviceLogin JS was `0211cc81f6bb515650645986aff762a9d0509474dedc1277ba79179936709c7c`.
+
+`ev_284471afa0c76e1a9fa81c69514c6d323b0270f509445162bac7eb334328b93e` and `ev_e8419528d0d42872156813d71c0564378447d40d95b29b0b72662362e699dad4` support the portal's required state/code_challenge/S256/redirect_uri/redirect_from fields and provider selection. The current portal accepts loopback HTTP(S) and approved Kiro HTTPS origins, not arbitrary custom URI schemes. It sends Google/GitHub results to the loopback `/oauth/callback` with provider, state, and code; the local client retains its verifier for exchange.
+
+The implementation's optional loopback/manual modes validate exact redirect, state, provider, duplicates, and S256 PKCE. Manual mode binds no port and accepts a full private callback URL from the user. The device page can be feature-disabled by account; no fallback is silently selected.
+
+Successful new social approval and credential issuance remain unexercised against production. Pending response fields and token-exchange validation were observed; approved response decoding is protocol reconstruction. If an acquired response lacks lifetime, the implementation obtains authoritative expiry through the verified refresh endpoint rather than inventing one.
+
+### Builder ID / IAM Identity Center
+
+Static `ev_484e93766f0781f85c25b0bf02310bc37886579f085a7bcac08b082ec35187ee` and `ev_d7d69eacd631639c9c4433d596f9842907f2a45bd2dab66706704bdc8aba6b49` identify current AWS SSO OIDC operations, device/refresh grants, default Builder ID portal, registration fields, and issuer-region metadata.
+
+Live independent REA probe `ev_13ea00fbbca7a06c8bc0caca60a49794b232bb87b08b3bb198a3a9df9c76b83e` observed:
+
+1. `POST https://oidc.us-east-1.amazonaws.com/client/register` with public client registration → HTTP 200.
+2. `/device_authorization` with that registration and Builder ID portal → HTTP 200; ten-minute expiry, one-second minimum interval.
+3. `/token` with the device grant after waiting → HTTP 400 `authorization_pending`.
+
+The exact current CLI clientName/scope vector was not recovered. The implementation uses the live-accepted `Kiro CLI` name and three historical public CodeWhisperer scopes. This proves service acceptance of initiation, **not exact equality with every current CLI registration request or enterprise entitlement**. Primary supplementation: [public Builder ID implementation](https://github.com/aws/amazon-q-developer-cli/blob/15cc8f3cd18c4272925ce1c7053268eedff1ea0a/crates/chat-cli/src/auth/builder_id.rs), [scope constants](https://github.com/aws/amazon-q-developer-cli/blob/15cc8f3cd18c4272925ce1c7053268eedff1ea0a/crates/chat-cli/src/auth/consts.rs), [AWS regional OIDC endpoints](https://docs.aws.amazon.com/general/latest/gr/sso.html#awsssooidcservice_service).
+
+Issuer region is not inference-runtime region. Enterprise approval, successful live OIDC issuance/refresh, and Kiro inference acceptance of newly issued OIDC credentials remain unexercised.
+
+### Managed store, refresh, and migration
+
+The HTTP transport now uses a separate owner-only SQLite store. Login acquisition returns credentials in memory; only the parent storage layer persists them. No OS keychain or CLI installation is required. Compare-and-swap guards refresh and pending-login races; logout writes a tombstone so an older pending operation cannot restore credentials.
+
+CLI SQLite is now an explicit read-only social-import source, not an implicit runtime fallback. Original schema/field evidence remains relevant to import:
 
 - Schema: `ev_b5150013c85f00f6d05176da76be6b079927bff62e222a2e6b5a8ae3538b1809`.
 - Token field names/provider/region only: `ev_dd9d1e9bd5d421bce92556ddfda6c7d6a5ed8bf90413be23688beccbdbd2bef5`.
-- Normal successful refresh: `ev_7df5062c6a3e65de90711e61c9d4035047dda8bb073871a07b393746fe04bff8`.
+- Successful Google refresh: `ev_7df5062c6a3e65de90711e61c9d4035047dda8bb073871a07b393746fe04bff8`; HTTP 200 with accessToken, expiresIn, profileArn, and refreshToken. Only schema predicates were emitted.
 
-Refresh returned HTTP 200 with `accessToken`, numeric `expiresIn`, `profileArn`, and `refreshToken`. The probe emitted schema/type predicates only. Rotated credentials were persisted using compare-and-swap against the original raw record; unrelated record fields were preserved. No generation occurred.
+### Standalone command verification and environmental boundary
+
+REA `ev_b5c79e19cf4db6f70409982243383b57b06fc35867c645e63e6bd53773b8190b` ran the actual new authentication CLI with a `PATH` excluding the local Kiro executable. It received an official live Google verification link, then was intentionally cancelled with SIGINT, exit 130; no credential file was created and no approval attempted. The observing harness suppressed actual verification codes/URLs and emitted predicates only.
+
+A separate controlled real-HTTP/CLI smoke exercised initiation → pending → approved credential decoding → private store → refresh rotation → actual Bun-hosted OMP use → logout. It used synthetic credentials and a local upstream fixture, not production approval.
+
+The user-reported environment-specific native CLI failure was not rerun. No specific root cause is asserted. Device acquisition removes local callback, browser-launch, and keychain dependencies; it still requires outbound HTTPS, provider feature availability, user approval, and applicable organization policy.
 
 ## Generation reconstruction and its limits
 

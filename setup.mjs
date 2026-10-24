@@ -159,7 +159,7 @@ Existing settings, other providers, and model defaults are retained.`);
     "XDG_CACHE_HOME",
     "OMP_KIRO_COMMAND",
     "OMP_KIRO_TRANSPORT",
-    "OMP_KIRO_AUTH_DB",
+    "OMP_KIRO_AUTH_FILE",
   ]) {
     if (env[key]) profileEnv[key] = env[key];
   }

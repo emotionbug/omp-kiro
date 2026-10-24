@@ -1,6 +1,6 @@
 {
   "name": "omp-kiro",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Use Kiro CLI as an Oh My Pi model provider while keeping OMP in control of tools.",
   "keywords": [
     "extension",
@@ -19,6 +19,9 @@
     "type": "git",
     "url": "https://github.com/emotionbug/omp-kiro.git"
   },
+  "bin": {
+    "omp-kiro": "./auth-cli.mjs"
+  },
   "files": [
     "index.js",
     "*.mjs",
@@ -28,9 +31,10 @@
   ],
   "type": "module",
   "scripts": {
-    "check": "node --check index.js && node --check bridge.mjs && node --check setup.mjs && node --check auth.mjs && node --check http.mjs && node --check eventstream.mjs",
+    "check": "node --check index.js && node --check bridge.mjs && node --check setup.mjs && node --check auth.mjs && node --check http.mjs && node --check eventstream.mjs && node --check auth-cli.mjs && node --check social-login.mjs && node --check oidc-login.mjs",
     "lint": "oxlint index.js *.mjs test",
     "test": "node --test test/*.test.mjs",
+    "auth": "node auth-cli.mjs",
     "setup:paseo": "node setup.mjs"
   },
   "devDependencies": {

@@ -8,7 +8,7 @@ This is an OMP extension package (`package.json#omp.extensions`). It offers a pe
 
 - OMP **18.12.6+**.
 - Node.js **22.13+** (the OMP host supplies Bun's SQLite implementation at runtime).
-- An authenticated `kiro-cli` supporting ACP HTTP MCP servers; developed with **Kiro CLI 2.28.0**.
+- **ACP only:** an authenticated `kiro-cli` supporting HTTP MCP servers; developed with **Kiro CLI 2.28.0**. HTTP authentication and generation do not require the Kiro executable.
 - Available Kiro account quota. This project does not bypass subscription limits.
 
 The host OMP installation supplies `@oh-my-pi/pi-ai`; no npm dependency installation or build is needed for a local checkout.
@@ -49,15 +49,70 @@ The default is `acp`: keep a Kiro process and ACP session for each OMP session, 
 omp --model kiro-cli/auto
 ```
 
-Direct HTTP bypasses the CLI process for generation, using the locally stored Kiro login:
+Direct HTTP bypasses the CLI for authentication and generation. Sign in with the standalone command first:
 
 ```bash
+npx github:emotionbug/omp-kiro login --provider google
 OMP_KIRO_TRANSPORT=http omp --model kiro-http/auto
 ```
 
 HTTP is an unofficial, version-dependent protocol. Selecting it does not fall back to ACP on errors and does not bypass account quota. Do not put bearer or refresh tokens in environment variables, OMP configuration, or this repository.
 
-`kiro-cli` and `kiro-http` have separate OMP catalog caches, but their live model ID sets match. Both use the current `KIRO_CLI` origin. The direct transport reads the existing Linux Google social login from `~/.local/share/kiro-cli/data.sqlite3`; `OMP_KIRO_AUTH_DB` can select a different local database. Expiring credentials are refreshed and rotated back into that record without overwriting a concurrent CLI login/logout. Builder ID, enterprise/OIDC, other social providers, and non-Linux keychain storage are not implemented; those accounts can use ACP.
+`kiro-cli` and `kiro-http` have separate OMP catalog caches, but their live model ID sets match. Both use the current `KIRO_CLI` origin.
+
+## Independent HTTP authentication
+
+The standalone `omp-kiro` command does not invoke `kiro-cli`, read its credentials implicitly, launch an OS browser, or require an OS keychain. The default **device flow** prints an official verification link and user code. Open the link on any browser-capable device and approve it; the command polls until completion, expiry, denial, or Ctrl+C.
+
+```bash
+# Google or GitHub, including SSH/headless/container environments
+npx github:emotionbug/omp-kiro login --provider google
+npx github:emotionbug/omp-kiro login --provider github
+
+# AWS Builder ID
+npx github:emotionbug/omp-kiro login --provider builder-id
+
+# IAM Identity Center: --region is the OIDC issuer region, not inference routing
+npx github:emotionbug/omp-kiro login --provider identity-center \
+  --start-url https://your-portal.awsapps.com/start --region us-east-1
+```
+
+From a checkout, use `npm run auth -- login ...` or `node auth-cli.mjs login ...`. GitHub installation through OMP does not necessarily put the command on your shell's `PATH`; the `npx` form works independently.
+
+For social accounts where device authorization is disabled, explicitly choose another flow:
+
+```bash
+# Browser is on the same host; listen on a loopback callback
+npx github:emotionbug/omp-kiro login --provider google --flow loopback
+
+# Remote browser: after approval, paste its full redirected URL privately
+npx github:emotionbug/omp-kiro login --provider google --flow manual
+```
+
+Manual mode does not bind a local port. A browser on another host may show a connection error for its loopback redirect; copy that full address from its address bar. It contains a short-lived authorization code: do not share or log it. Both callback modes validate state, exact redirect/provider, and S256 PKCE before exchanging the code. Device mode needs no local callback at all.
+
+This removes local browser-launch, callback-port, CLI installation, and keychain dependencies. It does not bypass corporate network restrictions, TLS validation, disabled provider features, or organization approval policies. The user's original environment-specific CLI failure was not reproduced, so no particular cause is claimed.
+
+### Credential storage and migration
+
+HTTP uses its own SQLite file at `$XDG_CONFIG_HOME/omp-kiro/auth.sqlite3`, or `~/.config/omp-kiro/auth.sqlite3` when XDG is unset. `OMP_KIRO_AUTH_FILE` must be an absolute path. Login's `--auth-file` selects a custom file; use the same file for later OMP/Paseo sessions.
+
+```bash
+npx github:emotionbug/omp-kiro auth status --json
+npx github:emotionbug/omp-kiro auth logout
+```
+
+Status never prints tokens. On POSIX the credential file is mode `0600`, with newly created directories mode `0700`; on Windows use a private user directory and appropriate ACLs. Refreshes persist rotation with compare-and-swap. Login/logout racing a refresh cannot be undone by that old operation. Logout changes only this plugin's store, not CLI or other service sessions.
+
+Version 0.2 read CLI SQLite directly; 0.3 is a clean cutover. To migrate an existing social login explicitly instead of authenticating again:
+
+```bash
+npx github:emotionbug/omp-kiro auth import-cli
+# Non-default source, read-only:
+npx github:emotionbug/omp-kiro auth import-cli --database /absolute/path/data.sqlite3
+```
+
+Import copies into the managed store and does not modify the source DB. Copied refresh credentials can still share the original service session's rotation/revocation lifecycle; a new standalone login is preferable for independent credentials. Native OIDC/keychain import is not implemented; use the standalone device flow. `OMP_KIRO_AUTH_DB` is no longer a runtime setting.
 
 Update a linked checkout with `git -C omp-kiro pull --ff-only`, then start a new OMP session. Remove the plugin with:
 
@@ -84,7 +139,7 @@ OMP_KIRO_TRANSPORT=http npm run setup:paseo -- \
 paseo daemon reload --home "$HOME/.paseo"
 ```
 
-Select **Kiro (HTTP)** with a `kiro-http/...` model. Setup stores transport and optional auth-database path, never credentials, in the profile environment.
+Select **Kiro (HTTP)** with a `kiro-http/...` model. Complete standalone login before setup. Setup stores transport and optional `OMP_KIRO_AUTH_FILE`, never credentials, in the profile environment.
 
 A conflicting profile is rejected instead of overwritten. Use `--profile another-id` for a separate profile. An existing disabled profile stays disabled. Rerun setup to add newly discovered Kiro models to Paseo.
 
@@ -120,7 +175,7 @@ The adapter decodes checksum-validated AWS event-stream frames, assembles interl
 - **Text only:** images and unsupported content are rejected. Thinking blocks are not forwarded as conversation text.
 - **Usage:** unreported token/cost fields remain numeric defaults, not a claim of free usage. HTTP forwards token counts only when upstream reports them.
 - **Planning limits:** ACP supplies no numeric limits, so it uses conservative 128,000-token context and 16,000-token output metadata. HTTP uses the live advertised limits, with conservative defaults for missing fields.
-- **Trust:** this is an unsandboxed OMP extension. ACP launches Kiro; HTTP reads and can refresh your existing local credential record. OMP owns tool permission decisions; the bridge is not an OS sandbox.
+- **Trust:** this is an unsandboxed OMP extension. ACP launches Kiro; HTTP uses the separate managed credential store. OMP owns tool permission decisions; the bridge is not an OS sandbox.
 
 A successful model listing only proves catalog access. Authentication, quota, or service restrictions can still prevent generation. Monthly quota errors are surfaced as errors; reinstalling or logging in again does not restore quota.
 
@@ -136,6 +191,8 @@ npm test
 The Node suite covers actual child/HTTP handoffs, persistence and resets, cancellation/cleanup, synthetic SQLite credentials and refresh races, native role/tool mapping, framing checks, interleaved calls, and model routing/pagination. Tests do not use account prompt quota.
 
 Actual OMP/Paseo runtime smokes exercised both transports with controlled ACP/HTTP peers, including real OMP file writes and forwarding actual tool results. The persistent smoke used one child across a tool handoff and a later user turn; only two ACP prompts were sent (8,903 and 207 characters in that fixture). Live authentication refresh and both model catalogs were verified; the two catalogs returned exactly the same 22 IDs.
+
+Live independent Google/GitHub device initiation and pending polling, plus Builder ID registration/device initiation, succeeded without browser approval. The actual standalone CLI also obtained a live verification link with Kiro absent from its `PATH`, then cancelled cleanly without saving credentials. A controlled CLI-to-OMP smoke exercised approval responses, private persistence, refresh rotation, actual Bun consumption, and logout. Successful new production approval/token issuance, enterprise approval, and inference using newly issued credentials remain unverified; they require user approval and service entitlement.
 
 **Real-provider generation remains unverified** because the account's monthly quota is known exhausted; it was not retried. The new generation payload's `systemPrompt` field/type is artifact-supported reconstruction, not captured live request acceptance. See [REA findings and evidence boundaries](docs/reverse-engineering.md).
 
