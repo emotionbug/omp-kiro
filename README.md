@@ -17,13 +17,21 @@ The host OMP installation supplies `@oh-my-pi/pi-ai`; no npm dependency installa
 
 ```bash
 kiro-cli login
-git clone https://github.com/emotionbug/omp-kiro.git
-omp install ./omp-kiro
+omp install github:emotionbug/omp-kiro
 omp models kiro-cli
 omp --model kiro-cli/auto
 ```
 
-OMP links local packages, so keep the checkout in place. For another model, select one returned by `omp models kiro-cli`, using the full `kiro-cli/<model-id>` selector. No API key or change to OMP's default model is required. Start a new OMP session after installing.
+For another model, select one returned by `omp models kiro-cli`, using the full `kiro-cli/<model-id>` selector. No API key or change to OMP's default model is required. Start a new OMP session after installing.
+
+For development or the optional Paseo setup, use a local checkout instead:
+
+```bash
+git clone https://github.com/emotionbug/omp-kiro.git
+omp install ./omp-kiro
+```
+
+OMP links local packages, so keep that checkout in place. GitHub-spec installations do not depend on a local checkout.
 
 To use a non-default Kiro executable:
 
