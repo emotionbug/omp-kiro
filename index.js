@@ -1,7 +1,8 @@
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
-import { discoverModels, runTurn } from "./bridge.mjs";
+import { closeSession, discoverModels, runTurn } from "./bridge.mjs";
+import { discoverHttpModels, runHttpTurn } from "./http.mjs";
 
-function streamKiro(model, context, options = {}) {
+function streamKiro(model, context, options = {}, transport) {
   const stream = new AssistantMessageEventStream();
   const message = {
     role: "assistant",
@@ -9,8 +10,7 @@ function streamKiro(model, context, options = {}) {
     api: model.api,
     provider: model.provider,
     model: model.id,
-    // ACP supplies no token/cost accounting. These required fields are not a
-    // claim of free usage; Kiro's subscription and quota remain authoritative.
+    // Missing upstream usage is unknown, not a claim of free requests.
     usage: {
       input: 0,
       output: 0,
@@ -26,11 +26,13 @@ function streamKiro(model, context, options = {}) {
     let text;
     stream.push({ type: "start", partial: message });
     try {
-      const { toolCall } = await runTurn({
+      const runTransport = transport === "http" ? runHttpTurn : runTurn;
+      const outcome = await runTransport({
         model: model.id,
         context,
         cwd: options.cwd ?? process.cwd(),
         signal: options.signal,
+        sessionId: options.sessionId,
         onText(delta) {
           if (!delta) return;
           if (!text) {
@@ -45,7 +47,8 @@ function streamKiro(model, context, options = {}) {
       options.signal?.throwIfAborted();
       if (text)
         stream.push({ type: "text_end", contentIndex: 0, content: text.text, partial: message });
-      if (toolCall) {
+      const toolCalls = outcome.toolCalls ?? (outcome.toolCall ? [outcome.toolCall] : []);
+      for (const toolCall of toolCalls) {
         const contentIndex = message.content.length;
         message.content.push(toolCall);
         stream.push({ type: "toolcall_start", contentIndex, partial: message });
@@ -56,8 +59,9 @@ function streamKiro(model, context, options = {}) {
           partial: message,
         });
         stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: message });
-        message.stopReason = "toolUse";
       }
+      if (outcome.usage) message.usage = outcome.usage;
+      message.stopReason = toolCalls.length ? "toolUse" : (outcome.stopReason ?? "stop");
       stream.push({ type: "done", reason: message.stopReason, message });
     } catch (error) {
       message.stopReason = options.signal?.aborted ? "aborted" : "error";
@@ -72,23 +76,35 @@ function streamKiro(model, context, options = {}) {
 }
 
 export default function kiroExtension(pi) {
-  pi.registerProvider("kiro-cli", {
+  const transport = process.env.OMP_KIRO_TRANSPORT || "acp";
+  if (transport !== "acp" && transport !== "http") {
+    throw new Error("OMP_KIRO_TRANSPORT must be acp or http");
+  }
+  pi.on("session_shutdown", (_event, ctx) => closeSession(ctx.sessionManager.getSessionId()));
+  pi.on("agent_end", (event, ctx) => {
+    const assistant = event.messages.findLast((message) => message.role === "assistant");
+    if (assistant?.stopReason === "aborted") {
+      return closeSession(ctx.sessionManager.getSessionId());
+    }
+  });
+  pi.on("session_before_switch", (_event, ctx) => closeSession(ctx.sessionManager.getSessionId()));
+  const provider = transport === "http" ? "kiro-http" : "kiro-cli";
+  pi.registerProvider(provider, {
     baseUrl: "https://kiro-cli.invalid/",
     apiKey: "kiro-cli-managed-auth",
-    api: "kiro-cli-acp",
-    streamSimple: streamKiro,
+    api: `kiro-cli-${transport}`,
+    streamSimple: (model, context, options) => streamKiro(model, context, options, transport),
     async fetchDynamicModels() {
-      const models = await discoverModels();
-      return models.map(({ id, name }) => ({
+      const models = await (transport === "http" ? discoverHttpModels() : discoverModels());
+      return models.map(({ id, name, contextWindow, maxTokens }) => ({
         id,
         name: `Kiro · ${name}`,
         reasoning: false,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        // ACP advertises model IDs but no numeric context/output limits. Use
-        // conservative OMP planning limits rather than infer them from names.
-        contextWindow: 128000,
-        maxTokens: 16000,
+        // ACP omits numeric limits; HTTP uses advertised limits when supplied.
+        contextWindow: contextWindow ?? 128000,
+        maxTokens: maxTokens ?? 16000,
       }));
     },
   });

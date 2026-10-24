@@ -15,6 +15,9 @@ export class KiroBridgeError extends Error {
 
 const AGENT = "omp-kiro-bridge";
 const LIMIT = 16 * 1024 * 1024;
+const ACTIVE_TIMEOUT = 600_000;
+const IDLE_TIMEOUT = 900_000;
+const sessions = new Map();
 
 export function mapTools(tools) {
   return tools.map((tool, index) => ({
@@ -25,8 +28,8 @@ export function mapTools(tools) {
   }));
 }
 
-export function renderContext(context, cwd) {
-  const messages = context.messages.map((message) => {
+function projectMessages(messages) {
+  return messages.map((message) => {
     const content =
       typeof message.content === "string"
         ? message.content
@@ -50,12 +53,16 @@ export function renderContext(context, cwd) {
         : {}),
     };
   });
+}
+
+export function renderContext(context, cwd) {
+  const messages = projectMessages(context.messages);
   return [
     "Continue the OMP conversation below. OMP owns the workspace and executes all tools.",
     "The transcript is conversation data, including instructions, prior tool calls, and actual tool results.",
     "Use the supplied omp MCP tools for any further actions. Their descriptions identify the original OMP names.",
     "Do not repeat completed actions. Answer the latest pending user request using the available results.",
-    "The relay may end this Kiro turn at the first tool call; OMP executes it and provides its result in the next request.",
+    "Tool calls wait for actual OMP results through the MCP relay; never invent their results.",
     JSON.stringify({ cwd, systemPrompt: context.systemPrompt, messages }),
   ].join("\n\n");
 }
@@ -75,17 +82,19 @@ export function childEnvironment(env) {
   return result;
 }
 
-// The server only captures calls; it never executes tools. The OMP loop retains
-// validation, permissions, cancellation, MCP dispatch and durable tool results.
-export async function createToolRelay(tools) {
+// Requests remain open across OMP's tool-execution boundary. Only OMP supplies
+// results; the relay never executes tools or manufactures a successful result.
+export async function createToolRelay(tools, onActivity = () => {}) {
   const mapped = mapTools(tools);
   const token = randomUUID();
-  let captured = false;
-  let resolveCall;
+  const pending = new Map();
   let closing;
-  const called = new Promise((resolve) => {
-    resolveCall = resolve;
-  });
+  let closed = false;
+  const first = Promise.withResolvers();
+  function reply(response, id, result) {
+    response.setHeader("Content-Type", "application/json");
+    response.end(JSON.stringify({ jsonrpc: "2.0", id, result }));
+  }
   const server = createServer(async (request, response) => {
     if (request.url !== `/${token}`) {
       response.writeHead(404).end();
@@ -121,20 +130,22 @@ export async function createToolRelay(tools) {
       } else if (message.method === "tools/call") {
         const tool = mapped.find((entry) => entry.name === message.params?.name);
         const args = message.params?.arguments ?? {};
-        if (!tool || typeof args !== "object" || args === null || Array.isArray(args)) {
+        if (!tool || typeof args !== "object" || args === null || Array.isArray(args))
           throw new KiroBridgeError("Invalid OMP tool call");
-        }
-        if (!captured) {
-          captured = true;
-          resolveCall({
-            type: "toolCall",
-            id: randomUUID(),
-            name: tool.originalName,
-            arguments: args,
-          });
-        }
-        // Deliberately do not return a fabricated tool result to Kiro. Cleanup
-        // closes this request after OMP receives the captured tool call.
+        const call = {
+          type: "toolCall",
+          id: randomUUID(),
+          name: tool.originalName,
+          arguments: args,
+        };
+        const entry = { call, response, rpcId: message.id, delivered: false };
+        pending.set(call.id, entry);
+        response.once("close", () => {
+          if (!closed && pending.get(call.id) === entry)
+            onActivity(new KiroBridgeError("Kiro disconnected while awaiting an OMP tool result"));
+        });
+        first.resolve(call);
+        onActivity();
         return;
       } else if (message.method === "ping") {
         result = {};
@@ -149,8 +160,7 @@ export async function createToolRelay(tools) {
         );
         return;
       }
-      response.setHeader("Content-Type", "application/json");
-      response.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
+      reply(response, message.id, result);
     } catch (error) {
       response.writeHead(400).end(error instanceof Error ? error.message : "Invalid MCP request");
     }
@@ -159,12 +169,37 @@ export async function createToolRelay(tools) {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", resolve);
   });
-  const address = server.address();
   return {
-    called,
-    url: `http://127.0.0.1:${address.port}/${token}`,
+    called: first.promise,
+    pending,
+    url: `http://127.0.0.1:${server.address().port}/${token}`,
+    takeCalls() {
+      const calls = [];
+      for (const entry of pending.values()) {
+        if (!entry.delivered) {
+          entry.delivered = true;
+          calls.push(entry.call);
+        }
+      }
+      return calls;
+    },
+    respond(message) {
+      const entry = pending.get(message.toolCallId);
+      if (!entry?.delivered || entry.call.name !== message.toolName)
+        throw new KiroBridgeError("OMP tool result does not match a waiting Kiro tool call");
+      const content =
+        typeof message.content === "string"
+          ? [{ type: "text", text: message.content }]
+          : message.content;
+      if (!Array.isArray(content) || content.some((block) => block.type !== "text"))
+        throw new KiroBridgeError("Kiro bridge requires text-only OMP tool results");
+      pending.delete(entry.call.id);
+      reply(entry.response, entry.rpcId, { content, isError: Boolean(message.isError) });
+    },
     close() {
       closing ??= new Promise((resolve) => {
+        closed = true;
+        pending.clear();
         server.close(resolve);
         server.closeAllConnections();
       });
@@ -174,7 +209,7 @@ export async function createToolRelay(tools) {
 }
 
 export async function openKiro({
-  signal,
+  signal = new AbortController().signal,
   onText = () => {},
   relayUrl,
   command = process.env.OMP_KIRO_COMMAND || "kiro-cli",
@@ -197,10 +232,18 @@ export async function openKiro({
     for (const entry of pending.values()) entry.reject(error);
     pending.clear();
   }
+  function killChild(exitSignal) {
+    try {
+      if (process.platform === "win32") child.kill(exitSignal);
+      else process.kill(-child.pid, exitSignal);
+    } catch (error) {
+      if (error.code !== "ESRCH") rejectPending(error);
+    }
+  }
   function terminate() {
     if (!child?.pid || exited || killTimer) return;
-    child.kill("SIGTERM");
-    killTimer = setTimeout(() => child.kill("SIGKILL"), 1000);
+    killChild("SIGTERM");
+    killTimer = setTimeout(() => killChild("SIGKILL"), 1000);
   }
   function abort() {
     rejectPending(signal.reason);
@@ -255,6 +298,9 @@ export async function openKiro({
     child = spawn(command, ["acp", "--agent-engine", "v2", "--agent", AGENT], {
       cwd,
       env: childEnvironment(process.env),
+      // The launcher can own a kiro-cli-chat descendant; terminate that whole
+      // private process group rather than leaving its ACP process behind.
+      detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
     });
     child.stderr.resume();
@@ -271,9 +317,10 @@ export async function openKiro({
       if (!child.pid) finished();
     });
     child.once("exit", (code, exitSignal) => {
-      finished();
+      // Wait for close as well as exit: descendants can retain ACP pipe ends.
       rejectPending(new KiroBridgeError(`Kiro exited (${code ?? exitSignal})`));
     });
+    child.once("close", finished);
     child.stdin.on("error", rejectPending);
     signal.addEventListener("abort", abort, { once: true });
     if (signal.aborted) abort();
@@ -320,7 +367,7 @@ export async function openKiro({
     const init = await rpc("initialize", {
       protocolVersion: 1,
       clientCapabilities: {},
-      clientInfo: { name: "omp-kiro", version: "0.1.0" },
+      clientInfo: { name: "omp-kiro", version: "0.2.0" },
     });
     if (relayUrl && !init.agentCapabilities?.mcpCapabilities?.http)
       throw new KiroBridgeError("Kiro must support ACP HTTP MCP servers");
@@ -328,7 +375,15 @@ export async function openKiro({
     const session = await rpc("session/new", { cwd, mcpServers });
     if (session.modes?.currentModeId !== AGENT)
       throw new KiroBridgeError("Kiro did not activate the isolated OMP bridge agent");
-    return { session, rpc, close };
+    return {
+      session,
+      initialize: init,
+      rpc,
+      close,
+      get closed() {
+        return ended;
+      },
+    };
   } catch (error) {
     await close();
     throw error;
@@ -350,39 +405,307 @@ export async function discoverModels() {
   }
 }
 
-export async function runTurn({ model, context, cwd, signal, onText }) {
-  const timeout = AbortSignal.timeout(600_000);
-  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
-  const transcript = renderContext(context, cwd);
-  if (transcript.length > LIMIT)
-    throw new KiroBridgeError(
-      "Kiro context exceeds the bridge limit; compact the OMP session first",
+function stableJson(value) {
+  return JSON.stringify(value, (_key, item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+    return Object.fromEntries(
+      Object.keys(item)
+        .sort()
+        .map((key) => [key, item[key]]),
     );
-  combined.throwIfAborted();
-  const relay = await createToolRelay(context.tools ?? []);
-  let connection;
-  try {
-    connection = await openKiro({ signal: combined, onText, relayUrl: relay.url });
-    const sessionId = connection.session.sessionId;
-    if (model !== connection.session.models?.currentModelId)
-      await connection.rpc("session/set_model", { sessionId, modelId: model });
-    const prompt = connection.rpc("session/prompt", {
-      sessionId,
-      prompt: [{ type: "text", text: transcript }],
-    });
-    const outcome = await Promise.race([
-      prompt.then((result) => ({ result })),
-      relay.called.then((toolCall) => ({ toolCall })),
-    ]);
-    if (outcome.toolCall) return { toolCall: outcome.toolCall };
-    if (outcome.result.stopReason !== "end_turn")
-      throw new KiroBridgeError(`Kiro stopped: ${outcome.result.stopReason}`);
-    return {};
-  } finally {
-    try {
-      if (connection) await connection.close();
-    } finally {
-      await relay.close();
+  });
+}
+
+function messageKeys(messages) {
+  return projectMessages(messages).map((message) => {
+    const blocks =
+      typeof message.content === "string"
+        ? [{ type: "text", text: message.content }]
+        : message.content;
+    const content = [];
+    for (const block of blocks) {
+      if (block.type === "text") {
+        if (!block.text) continue;
+        if (content.at(-1)?.type === "text") content.at(-1).text += block.text;
+        else content.push({ type: "text", text: block.text });
+      } else content.push(block);
     }
+    return stableJson({
+      ...message,
+      content,
+      ...(message.role === "toolResult" ? { isError: Boolean(message.isError) } : {}),
+    });
+  });
+}
+
+function pulse(state, error) {
+  if (error) state.failure ??= error;
+  state.changed.resolve();
+  state.changed = Promise.withResolvers();
+}
+
+function createSessionState(config, tools) {
+  const state = {
+    config,
+    controller: new AbortController(),
+    changed: Promise.withResolvers(),
+    prefix: [],
+    buffered: [],
+    bufferedSize: 0,
+    activeText: undefined,
+  };
+  state.ready = (async () => {
+    state.relay = await createToolRelay(tools, (error) => pulse(state, error));
+    state.controller.signal.throwIfAborted();
+    state.connection = await openKiro({
+      signal: state.controller.signal,
+      relayUrl: state.relay.url,
+      onText(text) {
+        if (state.activeText) state.activeText(text);
+        else {
+          state.bufferedSize += Buffer.byteLength(text);
+          if (state.bufferedSize > LIMIT)
+            throw new KiroBridgeError("Kiro buffered response exceeds the bridge limit");
+          state.buffered.push(text);
+        }
+      },
+    });
+  })();
+  // An inactive process may fail while OMP is executing a tool. Retain the
+  // failure for the next caller without an unhandled promise rejection.
+  state.ready.catch((error) => pulse(state, error));
+  return state;
+}
+
+function disposeState(state, reason = new KiroBridgeError("Kiro session closed")) {
+  if (!state) return Promise.resolve();
+  state.closing ??= (async () => {
+    state.controller.abort(reason);
+    pulse(state, reason);
+    await Promise.all([
+      state.relay?.close(),
+      state.connection?.close(),
+      state.ready.catch(() => {}),
+    ]);
+    // Initialization can publish its connection after teardown began.
+    await Promise.all([state.connection?.close(), state.relay?.close()]);
+    state.activeText = undefined;
+    state.buffered = [];
+  })();
+  return state.closing;
+}
+
+function hasPrefix(prefix, messages) {
+  return (
+    prefix.length <= messages.length &&
+    prefix.every((message, index) => message === messages[index])
+  );
+}
+
+async function awaitOutcome(state, signal) {
+  while (true) {
+    signal.throwIfAborted();
+    if (state.failure) throw state.failure;
+    if ([...state.relay.pending.values()].some((entry) => !entry.delivered)) {
+      // Collect parallel HTTP requests already arriving in this event-loop turn.
+      // Later arrivals remain queued and are returned by the next invocation.
+      await new Promise((resolve) => setImmediate(resolve));
+      signal.throwIfAborted();
+      if (state.failure) throw state.failure;
+      return { toolCalls: state.relay.takeCalls() };
+    }
+    if (state.prompt?.done) {
+      const { result, error } = state.prompt;
+      if (error) throw error;
+      if (state.relay.pending.size)
+        throw new KiroBridgeError("Kiro ended its prompt before receiving OMP tool results");
+      if (result.stopReason !== "end_turn")
+        throw new KiroBridgeError(`Kiro stopped: ${result.stopReason}`);
+      state.prompt = undefined;
+      return {};
+    }
+    await state.changed.promise;
+  }
+}
+
+async function activeTurn(slot, { model, context, cwd, signal, onText = () => {} }) {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(new DOMException("Kiro request timed out", "TimeoutError")),
+    ACTIVE_TIMEOUT,
+  );
+  timeout.unref();
+  const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+  let state;
+  let emitted = "";
+  function abort() {
+    if (state) {
+      state.controller.abort(combined.reason);
+      pulse(state, combined.reason);
+    }
+  }
+  try {
+    combined.throwIfAborted();
+    const keys = messageKeys(context.messages);
+    const config = stableJson({
+      model,
+      cwd,
+      systemPrompt: context.systemPrompt,
+      tools: mapTools(context.tools ?? []).map(({ originalName: _originalName, ...tool }) => tool),
+      command: process.env.OMP_KIRO_COMMAND || "kiro-cli",
+    });
+    state = slot.state;
+    if (
+      state &&
+      (state.config !== config ||
+        !hasPrefix(state.prefix, keys) ||
+        state.closing ||
+        state.failure ||
+        state.connection?.closed)
+    ) {
+      await disposeState(state);
+      state = slot.state = undefined;
+      combined.throwIfAborted();
+    }
+    if (!state) state = slot.state = createSessionState(config, context.tools ?? []);
+    state.activeText = (text) => {
+      emitted += text;
+      onText(text);
+    };
+    combined.addEventListener("abort", abort, { once: true });
+    if (combined.aborted) abort();
+    const buffered = state.buffered;
+    state.buffered = [];
+    state.bufferedSize = 0;
+    for (const text of buffered) {
+      combined.throwIfAborted();
+      state.activeText(text);
+    }
+    await state.ready;
+    combined.throwIfAborted();
+    const connection = state.connection;
+    const kiroSessionId = connection.session.sessionId;
+    if (!state.started) {
+      if (model !== connection.session.models?.currentModelId)
+        await connection.rpc("session/set_model", { sessionId: kiroSessionId, modelId: model });
+    }
+    if (state.prompt) {
+      const additions = projectMessages(context.messages.slice(state.prefix.length));
+      const waiting = [...state.relay.pending.values()].filter((entry) => entry.delivered);
+      const results = new Map(additions.map((message) => [message.toolCallId, message]));
+      if (
+        additions.some((message) => message.role !== "toolResult") ||
+        results.size !== additions.length ||
+        additions.length !== waiting.length ||
+        waiting.some((entry) => results.get(entry.call.id)?.toolName !== entry.call.name)
+      ) {
+        throw new KiroBridgeError(
+          "Continue the Kiro session with the actual matching results for all returned OMP tool calls",
+        );
+      }
+      // Validate the complete handoff before answering any request.
+      for (const message of additions) state.relay.respond(message);
+    } else {
+      const promptText = state.started
+        ? "Continue with only these new OMP messages; the preceding conversation is already in this session.\n\n" +
+          JSON.stringify({ messages: projectMessages(context.messages.slice(state.prefix.length)) })
+        : renderContext(context, cwd);
+      if (Buffer.byteLength(promptText) > LIMIT)
+        throw new KiroBridgeError(
+          "Kiro context exceeds the bridge limit; compact the OMP session first",
+        );
+      if (state.started && keys.length === state.prefix.length)
+        throw new KiroBridgeError("No new OMP messages to send to the Kiro session");
+      state.started = true;
+      const prompt = {};
+      state.prompt = prompt;
+      connection
+        .rpc("session/prompt", {
+          sessionId: kiroSessionId,
+          prompt: [{ type: "text", text: promptText }],
+        })
+        .then(
+          (result) => {
+            Object.assign(prompt, { done: true, result });
+            pulse(state);
+          },
+          (error) => {
+            Object.assign(prompt, { done: true, error });
+            pulse(state);
+          },
+        );
+    }
+    state.prefix = keys;
+    const outcome = await awaitOutcome(state, combined);
+    const content = [
+      ...(emitted ? [{ type: "text", text: emitted }] : []),
+      ...(outcome.toolCalls ?? []),
+    ];
+    state.prefix = [...keys, ...messageKeys([{ role: "assistant", content }])];
+    return outcome;
+  } catch (error) {
+    await disposeState(state, combined.aborted ? combined.reason : error);
+    if (slot.state === state) slot.state = undefined;
+    throw combined.aborted ? combined.reason : error;
+  } finally {
+    clearTimeout(timeout);
+    combined.removeEventListener("abort", abort);
+    if (state) state.activeText = undefined;
+  }
+}
+
+async function closeSlot(slot) {
+  slot.closed = true;
+  clearTimeout(slot.idleTimer);
+  if (sessions.get(slot.id) === slot) sessions.delete(slot.id);
+  await disposeState(slot.state);
+  await slot.tail;
+}
+
+export async function closeSession(sessionId) {
+  const slot = sessions.get(sessionId);
+  if (slot) await closeSlot(slot);
+}
+
+export async function closeAllSessions() {
+  await Promise.all([...sessions.values()].map(closeSlot));
+}
+
+export async function runTurn(options) {
+  options.signal?.throwIfAborted();
+  const persistent = typeof options.sessionId === "string" && options.sessionId.length > 0;
+  let slot = persistent ? sessions.get(options.sessionId) : undefined;
+  if (!slot) {
+    slot = { id: options.sessionId, tail: Promise.resolve(), closed: false };
+    if (persistent) sessions.set(options.sessionId, slot);
+  }
+  const queuedAbort = Promise.withResolvers();
+  let started = false;
+  const abortQueued = () => {
+    if (!started) queuedAbort.reject(options.signal.reason);
+  };
+  options.signal?.addEventListener("abort", abortQueued, { once: true });
+  const operation = slot.tail.then(async () => {
+    started = true;
+    options.signal?.throwIfAborted();
+    if (slot.closed) throw new KiroBridgeError("Kiro session closed");
+    clearTimeout(slot.idleTimer);
+    try {
+      return await activeTurn(slot, options);
+    } finally {
+      if (!persistent) await disposeState(slot.state);
+      else if (!slot.closed) {
+        slot.idleTimer = setTimeout(() => {
+          void closeSlot(slot);
+        }, IDLE_TIMEOUT);
+        slot.idleTimer.unref();
+      }
+    }
+  });
+  slot.tail = operation.catch(() => {});
+  try {
+    return await Promise.race([operation, queuedAbort.promise]);
+  } finally {
+    options.signal?.removeEventListener("abort", abortQueued);
   }
 }

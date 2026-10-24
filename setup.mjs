@@ -7,6 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { discoverModels } from "./bridge.mjs";
+import { discoverHttpModels } from "./http.mjs";
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
 
@@ -34,11 +35,17 @@ async function readConfig(path) {
 }
 
 async function prepareProfile({ existingValue, profileId, command, profileEnv }) {
+  const transport = profileEnv.OMP_KIRO_TRANSPORT || "acp";
+  if (transport !== "acp" && transport !== "http") {
+    throw new Error("OMP_KIRO_TRANSPORT must be acp or http.");
+  }
+  const label = transport === "http" ? "Kiro (HTTP)" : "Kiro (OMP)";
+  const provider = transport === "http" ? "kiro-http" : "kiro-cli";
   const existing = object(existingValue, `agents.providers.${profileId}`);
   if (
     existingValue !== undefined &&
     (existing.extends !== "omp" ||
-      existing.label !== "Kiro (OMP)" ||
+      existing.label !== label ||
       (existing.command && JSON.stringify(existing.command) !== JSON.stringify(command)))
   ) {
     throw new Error(
@@ -56,17 +63,17 @@ async function prepareProfile({ existingValue, profileId, command, profileEnv })
   if (existing.models !== undefined && !Array.isArray(existing.models)) {
     throw new Error(`agents.providers.${profileId}.models must be an array.`);
   }
-  const catalog = await discoverModels();
+  const catalog = await (transport === "http" ? discoverHttpModels() : discoverModels());
   if (catalog.length === 0)
     throw new Error("Kiro returned an empty model catalog; no configuration was changed.");
   const models = [...(existing.models ?? [])];
   for (const model of catalog) {
-    const id = `kiro-cli/${model.id}`;
+    const id = `${provider}/${model.id}`;
     if (!models.some((entry) => entry.id === id)) models.push({ id, label: model.name });
   }
   const profile = {
     extends: "omp",
-    label: "Kiro (OMP)",
+    label,
     enabled: true,
     ...existing,
     command,
@@ -75,7 +82,7 @@ async function prepareProfile({ existingValue, profileId, command, profileEnv })
       : {}),
     models,
   };
-  return { profile, catalog };
+  return { profile, catalog, provider };
 }
 
 async function saveConfig({ configPath, original, next }) {
@@ -115,10 +122,11 @@ async function main() {
   --omp-command <executable>  OMP executable, not shell arguments (default: omp)
   --profile <id>             Paseo provider ID (default: kiro-omp)
 
-Requires Node.js 22+, OMP, and an authenticated kiro-cli on PATH.
+Requires Node.js 22.13+, OMP, and an authenticated Kiro CLI login.
 OMP_KIRO_COMMAND can select a different Kiro executable.
-Installs the local OMP extension and merges a Kiro (OMP) profile into config.json.
-Model discovery uses ACP metadata only; no model prompt or daemon restart is sent.
+OMP_KIRO_TRANSPORT selects acp (default) or http.
+Installs the local OMP extension and merges a matching Kiro profile into config.json.
+Model discovery uses metadata only; no model prompt or daemon restart is sent.
 Existing settings, other providers, and model defaults are retained.`);
     return;
   }
@@ -150,6 +158,8 @@ Existing settings, other providers, and model defaults are retained.`);
     "XDG_STATE_HOME",
     "XDG_CACHE_HOME",
     "OMP_KIRO_COMMAND",
+    "OMP_KIRO_TRANSPORT",
+    "OMP_KIRO_AUTH_DB",
   ]) {
     if (env[key]) profileEnv[key] = env[key];
   }
@@ -159,7 +169,7 @@ Existing settings, other providers, and model defaults are retained.`);
   const config = object(original === null ? {} : JSON.parse(original), "config.json");
   const agents = object(config.agents, "agents");
   const providers = object(agents.providers, "agents.providers");
-  const { profile, catalog } = await prepareProfile({
+  const { profile, catalog, provider } = await prepareProfile({
     existingValue: providers[profileId],
     profileId,
     command: [ompCommand],
@@ -178,10 +188,11 @@ Existing settings, other providers, and model defaults are retained.`);
     agents: { ...agents, providers: { ...providers, [profileId]: profile } },
   };
   await saveConfig({ configPath, original, next });
-  console.log(`Registered ${profileId} (Kiro (OMP)) in ${configPath}.`);
-  console.log(`Models: ${catalog.map((model) => `kiro-cli/${model.id}`).join(", ")}`);
+  console.log(`Registered ${profileId} (${profile.label}) in ${configPath}.`);
+  console.log(`Models: ${catalog.map((model) => `${provider}/${model.id}`).join(", ")}`);
+  const transportPrefix = provider === "kiro-http" ? "OMP_KIRO_TRANSPORT=http " : "";
   console.log(
-    `Standalone: ${JSON.stringify(ompCommand)} --model ${JSON.stringify(`kiro-cli/${catalog[0].id}`)}`,
+    `Standalone: ${transportPrefix}${JSON.stringify(ompCommand)} --model ${JSON.stringify(`${provider}/${catalog[0].id}`)}`,
   );
   console.log(
     "Use the same OMP environment for standalone sessions. Keep this checkout in place: OMP links the local package.",
@@ -191,7 +202,7 @@ Existing settings, other providers, and model defaults are retained.`);
   console.log(
     `Reload configuration without restarting: paseo daemon reload --home ${JSON.stringify(dirname(configPath))}`,
   );
-  console.log("Then select Kiro (OMP) in Paseo. Setup did not reload or restart a daemon.");
+  console.log(`Then select ${profile.label} in Paseo. Setup did not reload or restart a daemon.`);
 }
 
 main().catch((error) => {

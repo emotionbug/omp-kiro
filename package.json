@@ -1,6 +1,6 @@
 {
   "name": "omp-kiro",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Use Kiro CLI as an Oh My Pi model provider while keeping OMP in control of tools.",
   "keywords": [
     "extension",
@@ -21,15 +21,15 @@
   },
   "files": [
     "index.js",
-    "bridge.mjs",
-    "setup.mjs",
+    "*.mjs",
+    "docs/",
     "README.md",
     "LICENSE"
   ],
   "type": "module",
   "scripts": {
-    "check": "node --check index.js && node --check bridge.mjs && node --check setup.mjs",
-    "lint": "oxlint index.js bridge.mjs setup.mjs test",
+    "check": "node --check index.js && node --check bridge.mjs && node --check setup.mjs && node --check auth.mjs && node --check http.mjs && node --check eventstream.mjs",
+    "lint": "oxlint index.js *.mjs test",
     "test": "node --test test/*.test.mjs",
     "setup:paseo": "node setup.mjs"
   },
@@ -45,7 +45,7 @@
     }
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13"
   },
   "omp": {
     "extensions": [
