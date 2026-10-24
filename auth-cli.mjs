@@ -11,9 +11,9 @@ import {
   logoutKiroAuth,
   readAuthSnapshot,
   saveKiroAuth,
-} from "./auth.mjs";
-import { loginSocial } from "./social-login.mjs";
-import { loginDevice } from "./oidc-login.mjs";
+} from "./server/auth.mjs";
+import { loginSocial } from "./server/social-login.mjs";
+import { loginDevice } from "./server/oidc-login.mjs";
 
 function usage() {
   console.log(`Usage: omp-kiro <command> [options]

@@ -1,0 +1,7 @@
+{
+  "id": "omp-kiro",
+  "name": "Kiro HTTP",
+  "description": "Direct Kiro HTTP coding agent and account usage. Uses its own managed Kiro login; no OMP or Kiro CLI process required.",
+  "requirements": { "paseo": ">=0.13.0" },
+  "build": [["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]]
+}

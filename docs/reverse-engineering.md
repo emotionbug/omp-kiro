@@ -1,4 +1,4 @@
-# Kiro 2.28.0 transport analysis
+# Kiro 2.28.0 protocol analysis
 
 This record separates runtime observations, static reconstruction, and unverified generation behavior. Credential values, authorization headers, refresh-token values, and account/profile identifiers are excluded.
 
@@ -38,6 +38,7 @@ Current artifact-backed routing:
 | Operation      | US East endpoint                                            | Target/origin                                                                                  |
 | -------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | Model metadata | `https://management.us-east-1.kiro.dev/`                    | `KiroControlPlaneBearerService.ListAvailableModels`, `KIRO_CLI`                                |
+| Account quota  | `https://management.us-east-1.kiro.dev/`                    | `AmazonCodeWhispererService.GetUsageLimits`, `KIRO_CLI`, `resourceType: AGENTIC_REQUEST`       |
 | Generation     | `https://runtime.us-east-1.kiro.dev/`                       | `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`, native user origin `KIRO_CLI` |
 | Social refresh | `https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken` | JSON refresh request                                                                           |
 
@@ -52,6 +53,16 @@ Key evidence:
 - Independent comparison of the actual exported ACP and HTTP implementations: `ev_028b099c76f813cbb73de386e256c9bb50da5c2d690f08ea025d9b8a7bb33451`; `acpCount=22`, `httpCount=22`, identical sorted IDs, both set differences empty, exit 0.
 
 The capture's executable digest binds the caller's Node harness, and process trees are sampled. Network packets were not captured; authenticated request/status/schema observations came from the explicit harness. These limitations do not imply generation was exercised.
+
+## Account quota and slash commands
+
+Exact-artifact field/operation observations `ev_a4ba2eac9fff89e034422fdaa2030ab44b4e115dd3d552dfae759c4697ce1926` and `ev_f00d13779f98fee27ce93ad7438858f87d1b98baa9331b46a447e18e8ff6b6a7` identified current usage, bonus, trial, add-on, and overage structures. The quota operation retains an `AmazonCodeWhispererService` target even though model discovery uses `KiroControlPlaneBearerService`; that does not imply the old Q hostname is correct.
+
+Live read-only `ev_73f9529862dccd2a9c3641a0bdd025c99e7eb58df0cd0d213f4b027db43f49d2` and `ev_69b10794b2389df79bec3dc01c07ded0845f8b5c6d3d6a60555a3bbd4585df88` received HTTP 200 from the current management route. Requests disabled email inclusion; the observing harness suppressed account/profile identity and credentials. These were explicit HTTPS harness requests, not intercepted CLI traffic.
+
+The live response returned the same purchased credit pool in both `addOnMetadata.addOns` and `overageCredits`. They are alternative projections, not extra allocations. Precision fields supersede rounded integer fields. Monthly, trial, bonus, purchased, and on-demand amounts are distinct; a service overage cap is not assumed to be spendable quota. Reset/expiry dates come from authoritative Unix-second fields. Unknown quota shapes and missing dates fail explicitly, not as zero/free usage. Live paid-account purchase/base branches were observed; optional trial/bonus and EU-region branches have controlled coverage, not live-account proof. No purchase, overage configuration change, or generation was performed.
+
+Packaged guide observations `ev_993885c4ee305f3280c07117c053efeafaa078189acebfaaac850748d148c0ad` and `ev_9ab0f259df5ee2cd1617aa0e35b4aa39a373ba879495846c70a98f58c2615f52` show engine-specific slash inventories. Some `/help` variants invoke an AI help agent. Consequently the integration implements local help and explicit account/model queries instead of forwarding arbitrary slash text to Kiro. OMP keeps its own history, compaction, tool-trust, and model machinery; ACP reset closes only the current bridge connection.
 
 ## Authentication acquisition and storage
 
@@ -112,6 +123,16 @@ REA `ev_b5c79e19cf4db6f70409982243383b57b06fc35867c645e63e6bd53773b8190b` ran th
 A separate controlled real-HTTP/CLI smoke exercised initiation → pending → approved credential decoding → private store → refresh rotation → actual Bun-hosted OMP use → logout. It used synthetic credentials and a local upstream fixture, not production approval.
 
 The user-reported environment-specific native CLI failure was not rerun. No specific root cause is asserted. Device acquisition removes local callback, browser-launch, and keychain dependencies; it still requires outbound HTTPS, provider feature availability, user approval, and applicable organization policy.
+
+## Native Paseo runtime boundary
+
+The native provider is a Paseo directory/Git plugin, not an OMP-derived profile. All imported implementation modules live under `server/`, as Paseo's runtime-ownership compiler requires. OMP and the standalone CLI import the same authentication and HTTP modules; no protocol copy or legacy forwarding shim remains.
+
+Actual isolated-daemon observation `ev_a2720ad1c9461378778134522fdcbb8b408b48f4a4ce9692ac48fb24bde41186` loaded the directory plugin, wrote a real workspace file through a controlled HTTP tool call, returned its actual result, denied a separate write, and approved the real injected `paseo/list_agents` MCP call. Metadata commands produced no additional generation. All account credentials and upstream generation were synthetic; non-loopback external requests were blocked.
+
+An initial actual refresh exposed changing user IDs and missing query user rows. After correction, `ev_e99ce981599d92f28869eff93ab4243e19ca72c28907d44cdc23e60719735519` proved exact deep equality of all ten provider timeline items, including four user rows and stable tool IDs, across SDK refresh. Query commands stayed out of native generation history. Core-generated envelope timestamps and envelope turn IDs are not preserved by current Paseo rehydration; no exact-envelope claim is made.
+
+The rendered standard Usage panel displayed the controlled Kiro Pro quota and fractional credit balance. Separately, the installed main-daemon plugin returned the actual 22-model catalog and real account quota without restarting the daemon or calling generation. SDK usage fetches read but never refresh/write the managed login. Current `PluginAgentSession` lacks `usageSession()`, so this release exposes account quota globally rather than claiming native per-agent quota association.
 
 ## Generation reconstruction and its limits
 

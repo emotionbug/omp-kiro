@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildHttpRequest, createHttpTransport, discoverHttpModels } from "../http.mjs";
-import { crc32, decodeEventStream } from "../eventstream.mjs";
+import { buildHttpRequest, createHttpTransport, discoverHttpModels } from "../server/http.mjs";
+import { crc32, decodeEventStream } from "../server/eventstream.mjs";
 
 const auth = {
   access_token: "fixture-access",

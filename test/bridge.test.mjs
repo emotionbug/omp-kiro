@@ -12,7 +12,7 @@ import {
   openKiro,
   renderContext,
   runTurn,
-} from "../bridge.mjs";
+} from "../server/bridge.mjs";
 
 const tools = [{ name: "read_file", description: "Read a file", parameters: { type: "object" } }];
 const context = {

@@ -1,6 +1,7 @@
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
-import { closeSession, discoverModels, runTurn } from "./bridge.mjs";
-import { discoverHttpModels, runHttpTurn } from "./http.mjs";
+import { closeSession, discoverModels, runTurn } from "./server/bridge.mjs";
+import { discoverHttpModels, runHttpTurn } from "./server/http.mjs";
+import { registerKiroCommands } from "./server/commands.mjs";
 
 function streamKiro(model, context, options = {}, transport) {
   const stream = new AssistantMessageEventStream();
@@ -108,4 +109,5 @@ export default function kiroExtension(pi) {
       }));
     },
   });
+  registerKiroCommands(pi, { transport });
 }

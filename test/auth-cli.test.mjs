@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { test } from "node:test";
-import { saveKiroAuth } from "../auth.mjs";
+import { saveKiroAuth } from "../server/auth.mjs";
 const run = promisify(execFile);
 const entry = fileURLToPath(new URL("../auth-cli.mjs", import.meta.url));
 

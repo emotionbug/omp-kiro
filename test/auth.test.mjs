@@ -10,8 +10,9 @@ import {
   loadKiroAuth,
   logoutKiroAuth,
   readAuthSnapshot,
+  readKiroAuth,
   saveKiroAuth,
-} from "../auth.mjs";
+} from "../server/auth.mjs";
 
 async function sqlite(path) {
   if (process.versions.bun) {
@@ -56,6 +57,16 @@ test("fresh managed login is used without consulting CLI storage or network", as
     },
   });
   assert.deepEqual(token, value);
+});
+
+test("read-only access preserves expired credentials without refreshing or rewriting storage", async (t) => {
+  const f = await fixture(t);
+  const before = await stat(f.authFile);
+  assert.deepEqual(await readKiroAuth({ authFile: f.authFile }), original);
+  assert.equal((await stat(f.authFile)).mtimeMs, before.mtimeMs);
+  assert.deepEqual(await f.read(), original);
+  await logoutKiroAuth({ authFile: f.authFile });
+  await assert.rejects(readKiroAuth({ authFile: f.authFile }), KiroAuthError);
 });
 
 test("expired social login persists rotation and preserves unrelated credential metadata", async (t) => {

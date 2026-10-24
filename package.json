@@ -1,13 +1,14 @@
 {
   "name": "omp-kiro",
-  "version": "0.3.0",
-  "description": "Use Kiro CLI as an Oh My Pi model provider while keeping OMP in control of tools.",
+  "version": "0.4.0",
+  "description": "Kiro ACP/HTTP model providers for OMP and a native Paseo HTTP coding agent with account usage.",
   "keywords": [
     "extension",
     "kiro",
     "model-provider",
     "oh-my-pi",
-    "omp"
+    "omp",
+    "paseo"
   ],
   "homepage": "https://github.com/emotionbug/omp-kiro#readme",
   "bugs": {
@@ -24,6 +25,10 @@
   },
   "files": [
     "index.js",
+    "index.server.ts",
+    "paseo-plugin.json",
+    "icon.svg",
+    "server/",
     "*.mjs",
     "docs/",
     "README.md",
@@ -31,14 +36,23 @@
   ],
   "type": "module",
   "scripts": {
-    "check": "node --check index.js && node --check bridge.mjs && node --check setup.mjs && node --check auth.mjs && node --check http.mjs && node --check eventstream.mjs && node --check auth-cli.mjs && node --check social-login.mjs && node --check oidc-login.mjs",
-    "lint": "oxlint index.js *.mjs test",
+    "check": "node --check index.js && node --check setup.mjs && node --check auth-cli.mjs && node --check server/bridge.mjs && node --check server/auth.mjs && node --check server/http.mjs && node --check server/eventstream.mjs && node --check server/social-login.mjs && node --check server/oidc-login.mjs && node --check server/usage.mjs && node --check server/commands.mjs && node --check server/provider.mjs && node --check server/usage-source.mjs && node --check server/tools.mjs && node --check server/mcp.mjs",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint index.js index.server.ts *.mjs server test",
     "test": "node --test test/*.test.mjs",
     "auth": "node auth-cli.mjs",
     "setup:paseo": "node setup.mjs"
   },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "ajv": "8.20.0"
+  },
   "devDependencies": {
-    "oxlint": "1.61.0"
+    "@getpaseo/plugin": "0.13.0",
+    "@types/node": "24.19.2",
+    "oxlint": "1.61.0",
+    "typescript": "5.9.3",
+    "zod": "4.4.3"
   },
   "peerDependencies": {
     "@oh-my-pi/pi-ai": ">=18.12.6"

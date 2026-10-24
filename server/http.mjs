@@ -117,8 +117,8 @@ export function buildHttpRequest({ model, context, cwd, sessionId }) {
   if (cwd) {
     current.userInputMessageContext.additionalContext = [
       {
-        name: "omp-workspace",
-        description: "OMP's working directory; OMP executes all requested tools.",
+        name: "workspace",
+        description: "The working directory; the host executes requested tools.",
         innerContext: cwd,
       },
     ];

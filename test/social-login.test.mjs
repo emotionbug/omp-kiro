@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { test } from "node:test";
-import { loginSocial, refreshSocial, SocialLoginError } from "../social-login.mjs";
+import { loginSocial, refreshSocial, SocialLoginError } from "../server/social-login.mjs";
 
 const AUTH = "https://prod.us-east-1.auth.desktop.kiro.dev";
 const time = Date.parse("2026-01-01T00:00:00Z");

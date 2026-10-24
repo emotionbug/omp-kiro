@@ -14,13 +14,15 @@ export class KiroAuthError extends Error {
   }
 }
 
-export function authFilePath(value = process.env.OMP_KIRO_AUTH_FILE) {
+export function authFilePath(value, env = process.env) {
+  value ??= env.OMP_KIRO_AUTH_FILE;
   if (value) {
     if (!isAbsolute(value)) throw new KiroAuthError("OMP_KIRO_AUTH_FILE must be an absolute path.");
     return value;
   }
-  const config = process.env.XDG_CONFIG_HOME;
-  const root = config && isAbsolute(config) ? config : join(homedir(), ".config");
+  const config = env.XDG_CONFIG_HOME;
+  const home = env.HOME && isAbsolute(env.HOME) ? env.HOME : homedir();
+  const root = config && isAbsolute(config) ? config : join(home, ".config");
   return join(root, "omp-kiro", "auth.sqlite3");
 }
 
@@ -125,6 +127,11 @@ function parseCredential(raw, { allowSignedOut = false } = {}) {
   }
   if (allowSignedOut && (credential === null || credential.kind === "logged-out")) return null;
   return validateCredential(credential);
+}
+
+// Usage-source fetches must never rotate or persist a credential.
+export async function readKiroAuth({ authFile = authFilePath(), signal } = {}) {
+  return parseCredential(await readAuthSnapshot({ authFile, signal }));
 }
 
 export async function saveKiroAuth(
