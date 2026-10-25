@@ -553,3 +553,23 @@ test("usage retry exhaustion is finite and permission failures are not retried",
     assert.equal(calls, expected);
   }
 });
+
+test("default usage recovery survives outages beyond the former total deadline and attempt limit", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let calls = 0;
+  const pending = fetchKiroUsage(options(payload(), {
+    retry: undefined,
+    fetchImpl: async () => {
+      calls++;
+      if (calls <= 4) return new Response(null, { status: 503 });
+      return Response.json(payload());
+    },
+  }));
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    await new Promise(setImmediate);
+    assert.equal(calls, attempt);
+    t.mock.timers.tick(30_000);
+  }
+  assert.equal((await pending).status, "available");
+  assert.equal(calls, 5);
+});

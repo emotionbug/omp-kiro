@@ -453,7 +453,7 @@ test("buffered tools from a failed attempt are never executed or duplicated", as
   assert.equal(executed, 1);
 });
 
-test("partial text disconnect remains an error for host continuation, never a success or replay", async () => {
+test("partial text remains terminal unless the caller explicitly chooses continuation or restart", async () => {
   let attempts = 0;
   const text = [];
   const run = createHttpTransport({
@@ -505,6 +505,8 @@ test("nonretryable HTTP, model, TLS, CRC and incomplete tool failures do not loo
     () => Response.json({ message: "Unauthorized" }, { status: 401 }),
     () => Response.json({ message: "Forbidden" }, { status: 403 }),
     () => Response.json({ __type: "InvalidModelException" }, { status: 503 }),
+    () => Response.json({ __type: "ThrottlingException", message: "Monthly quota exhausted" }, { status: 429 }),
+    () => Response.json({ __type: "ServiceQuotaExceededException" }, { status: 503 }),
     () => { throw tls; },
     () => response([corrupt]),
     () => response([frame("toolUseEvent", { toolUseId: "call", name: "read", input: '{"path":' })]),
@@ -520,7 +522,7 @@ test("nonretryable HTTP, model, TLS, CRC and incomplete tool failures do not loo
   }
 });
 
-test("host-owned generation retries can be disabled independently of catalog recovery", async () => {
+test("explicit finite generation policy can disable retries independently of catalog recovery", async () => {
   let generationAttempts = 0;
   const run = createHttpTransport({
     authProvider: async () => auth,
@@ -621,6 +623,168 @@ test("restart callback failure or cancellation prevents any replay", async () =>
       },
     }), (error) => error === reason);
     assert.equal(calls, 1);
+  }
+});
+
+test("OMP continuation survives repeated partial failures and preserves completed tools exactly once", async () => {
+  const completed = {
+    ...context,
+    messages: [
+      ...context.messages,
+      { role: "assistant", content: [{ type: "toolCall", id: "completed", name: "read", arguments: { path: "a" } }] },
+      { role: "toolResult", toolCallId: "completed", content: "already executed" },
+    ],
+  };
+  const bodies = [];
+  const text = [];
+  const run = createHttpTransport({
+    authProvider: async () => auth,
+    retry: { maxAttempts: null, baseDelayMs: 0, maxDelayMs: 0 },
+    fetchImpl: async (_url, init) => {
+      bodies.push(JSON.parse(init.body));
+      if (bodies.length <= 5) {
+        return interruptedResponse([
+          frame("assistantResponseEvent", { content: `part${bodies.length} ` }),
+          frame("toolUseEvent", { toolUseId: "discard", name: "read", input: '{"path":' }),
+        ]);
+      }
+      if (bodies.length === 6) throw disconnected();
+      return response([
+        frame("assistantResponseEvent", { content: "done" }),
+        frame("toolUseEvent", { toolUseId: "new-tool", name: "read", input: '{"path":"b"}', stop: true }),
+      ]);
+    },
+  });
+  const outcome = await run({
+    model: "unchanged-model", sessionId: "unchanged-session", cwd: "/workspace",
+    context: completed, continuePartial: true, onText: (fragment) => text.push(fragment),
+  });
+  assert.equal(text.join(""), "part1 part2 part3 part4 part5 done");
+  assert.equal(bodies.length, 7, "transport recovery is not limited by the host's three retries");
+  assert.deepEqual(bodies[5], bodies[6], "no-output outage retries the identical continuation body");
+  for (const [index, body] of bodies.entries()) {
+    assert.equal(body.profileArn, auth.profile_arn);
+    assert.equal(body.systemPrompt, bodies[0].systemPrompt);
+    const state = body.conversationState;
+    assert.equal(state.conversationId, bodies[0].conversationState.conversationId);
+    const current = state.currentMessage.userInputMessage;
+    assert.equal(current.modelId, "unchanged-model");
+    assert.equal(current.origin, "KIRO_CLI");
+    assert.deepEqual(current.userInputMessageContext.tools,
+      bodies[0].conversationState.currentMessage.userInputMessage.userInputMessageContext.tools);
+    const userInputs = [...state.history, state.currentMessage]
+      .flatMap((message) => message.userInputMessage ? [message.userInputMessage] : []);
+    assert.equal(userInputs.filter((message) => message.content === "Hello").length, 1);
+    assert.equal(userInputs.flatMap((message) => message.userInputMessageContext?.toolResults ?? []).length, 1);
+    assert.equal(state.history.flatMap((message) => message.assistantResponseMessage?.toolUses ?? []).length, 1);
+    assert.ok(!JSON.stringify(body).includes("discard"), "buffered failed tools never become history");
+    if (index > 0) assert.equal(current.userInputMessageContext.toolResults, undefined);
+  }
+  assert.deepEqual(outcome.toolCalls.map(({ id }) => id), ["new-tool"]);
+  assert.deepEqual(completed.messages.at(-1), {
+    role: "toolResult", toolCallId: "completed", content: "already executed",
+  }, "wire-only continuation does not mutate host history");
+});
+
+test("generation waits through an offline outage longer than three default retry periods", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const bodies = [];
+  const notices = [];
+  const run = createHttpTransport({
+    authProvider: async () => auth,
+    fetchImpl: async (_url, init) => {
+      bodies.push(init.body);
+      if (bodies.length <= 4)
+        throw Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("offline"), { code: "ENOTFOUND" }) });
+      return response([frame("assistantResponseEvent", { content: "Online" })]);
+    },
+  });
+  const text = [];
+  const pending = run({ model: "selected-only", context, onRetry: (info) => notices.push(info),
+    onText: (fragment) => text.push(fragment) });
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    await new Promise(setImmediate);
+    assert.equal(bodies.length, attempt);
+    t.mock.timers.tick(30_000);
+  }
+  await pending;
+  assert.equal(bodies.length, 5);
+  assert.equal(new Set(bodies).size, 1);
+  assert.deepEqual(text, ["Online"], "retry notices never enter model text");
+  assert.deepEqual(notices.map(({ delayMs, maxAttempts }) => [delayMs, maxAttempts]),
+    Array.from({ length: 4 }, () => [30_000, null]));
+  assert.ok(!JSON.stringify(notices).includes(auth.access_token));
+});
+
+test("long recovery reloads expired authentication without changing account, region, body or model", async (t) => {
+  const start = Date.now();
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: start });
+  let reads = 0;
+  const tokens = [], bodies = [];
+  const run = createHttpTransport({
+    authProvider: async () => {
+      reads++;
+      return { ...auth, access_token: reads === 1 ? "old-token" : "refreshed-token",
+        expires_at: new Date(start + (reads === 1 ? 120_000 : 3_600_000)).toISOString() };
+    },
+    fetchImpl: async (_url, init) => {
+      tokens.push(init.headers.authorization);
+      bodies.push(init.body);
+      if (bodies.length <= 4) throw disconnected();
+      return response([frame("assistantResponseEvent", { content: "Online" })]);
+    },
+  });
+  const pending = run({ model: "selected-only", context });
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    await new Promise(setImmediate);
+    t.mock.timers.tick(30_000);
+  }
+  await pending;
+  assert.equal(reads, 2);
+  assert.deepEqual(tokens, ["Bearer old-token", "Bearer old-token",
+    "Bearer refreshed-token", "Bearer refreshed-token", "Bearer refreshed-token"]);
+  assert.equal(new Set(bodies).size, 1);
+});
+
+test("recovery never silently switches accounts or regions during credential reload", async () => {
+  for (const replacement of [
+    { ...auth, profile_arn: "arn:aws:codewhisperer:eu-central-1:123:profile/new-account" },
+    { ...auth, provider: "github" },
+  ]) {
+    let reads = 0, calls = 0;
+    const original = { ...auth, expires_at: new Date(Date.now() + 3_600_000).toISOString() };
+    const run = createHttpTransport({
+      retry: fastRetry,
+      authProvider: async () => ++reads === 1 ? original : replacement,
+      fetchImpl: async () => { calls++; throw disconnected(); },
+    });
+    await assert.rejects(run({ model: "selected-only", context,
+      onRetry() { original.expires_at = new Date(0).toISOString(); } }), /login or region changed/);
+    assert.equal(calls, 1);
+  }
+});
+
+test("committed continuation never turns malformed JSON, unknown tools or CRC into a retry", async () => {
+  const corrupt = frame("metadataEvent", {});
+  corrupt[corrupt.length - 5] ^= 1;
+  for (const frames of [
+    [frame("toolUseEvent", { toolUseId: "bad-json", name: "read", input: "{bad", stop: true })],
+    [frame("toolUseEvent", { toolUseId: "not-supplied", name: "missing", input: "{}", stop: true })],
+    [corrupt],
+  ]) {
+    let calls = 0;
+    const text = [];
+    const run = createHttpTransport({
+      authProvider: async () => auth, retry: fastRetry,
+      fetchImpl: async () => {
+        calls++;
+        return interruptedResponse([frame("assistantResponseEvent", { content: "Committed" }), ...frames]);
+      },
+    });
+    await assert.rejects(run({ model: "selected-only", context, continuePartial: true,
+      onText: (fragment) => text.push(fragment) }));
+    assert.equal(calls, 1);
+    assert.deepEqual(text, ["Committed"]);
   }
 });
 

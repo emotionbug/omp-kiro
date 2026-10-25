@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { refreshSocial } from "./social-login.mjs";
 import { refreshOidc } from "./oidc-login.mjs";
+import { abortableRequest } from "./network.mjs";
 
 const refreshing = new Map();
 
@@ -204,15 +205,27 @@ export async function loadKiroAuth({
   fetchImpl = globalThis.fetch,
   authFile = authFilePath(),
   now = Date.now,
+  retry,
+  expectedCredential,
 } = {}) {
   signal?.throwIfAborted();
   const raw = await readAuthSnapshot({ authFile, signal });
   const credential = parseCredential(raw);
+  if (expectedCredential) {
+    const sameProfile = credential.profile_arn && credential.profile_arn === expectedCredential.profile_arn;
+    const sameTokens = credential.access_token === expectedCredential.access_token &&
+      credential.refresh_token === expectedCredential.refresh_token;
+    // Without a profile ARN, unchanged stored tokens are our account binding.
+    // An independent login must not be mistaken for this turn's refresh.
+    if (authIdentity(credential) !== authIdentity(expectedCredential) || (!sameProfile && !sameTokens))
+      throw new KiroAuthError("Kiro login or region changed during recovery; start a new turn.");
+  }
   if (Date.parse(credential.expires_at) > now() + 60_000) return credential;
   if (refreshing.has(authFile)) {
-    await refreshing.get(authFile);
+    if (signal) await abortableRequest(() => refreshing.get(authFile), signal);
+    else await refreshing.get(authFile);
     signal?.throwIfAborted();
-    return loadKiroAuth({ signal, fetchImpl, authFile, now });
+    return loadKiroAuth({ signal, fetchImpl, authFile, now, retry, expectedCredential });
   }
   const refresh = async () => {
     if (typeof credential.refresh_token !== "string" || !credential.refresh_token) {
@@ -221,7 +234,9 @@ export async function loadKiroAuth({
       );
     }
     const update = credential.kind === "social" ? refreshSocial : refreshOidc;
-    const refreshed = await update({ credential, signal, fetchImpl, now });
+    const refreshed = await update({ credential, signal, fetchImpl, now, retry });
+    if (credential.profile_arn && refreshed.profile_arn && credential.profile_arn !== refreshed.profile_arn)
+      throw new KiroAuthError("Kiro account profile changed during refresh; sign in again explicitly.");
     const updated = { ...credential, ...refreshed };
     await saveKiroAuth(updated, { authFile, expectedRaw: raw, signal });
     return updated;
@@ -233,6 +248,26 @@ export async function loadKiroAuth({
   } finally {
     if (refreshing.get(authFile) === pending) refreshing.delete(authFile);
   }
+}
+
+function authIdentity(auth) {
+  return JSON.stringify([
+    auth.kind, auth.provider, auth.region ?? (auth.kind === "social" ? "us-east-1" : undefined),
+    auth.profile_arn, auth.client_id,
+  ]);
+}
+
+/** Refresh before a replay-safe HTTP attempt without silently changing identity. */
+export async function refreshExpiredKiroAuth(credential, {
+  signal, fetchImpl, authFile, retry, authProvider = loadKiroAuth, now = Date.now,
+} = {}) {
+  if (!(Date.parse(credential.expires_at) <= now() + 60_000)) return credential;
+  const refreshed = await authProvider({
+    signal, fetchImpl, authFile, retry, now, expectedCredential: credential,
+  });
+  if (authIdentity(credential) !== authIdentity(refreshed))
+    throw new KiroAuthError("Kiro login or region changed during recovery; start a new turn.");
+  return refreshed;
 }
 
 export async function importCliAuth({

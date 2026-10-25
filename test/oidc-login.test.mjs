@@ -141,18 +141,16 @@ test("pending maintains interval and slow_down adds five seconds permanently", a
   assert.deepEqual(f.sleeps, [1000, 1000, 6000, 6000]);
 });
 
-test("network failure and service errors back off without leaking error details", async () => {
-  const f = fixture([
-    registration,
-    device,
-    () => {
-      throw new Error("fixture-secret-in-network-message");
-    },
-    error("unrecognized", 503),
-    issued,
-  ]);
+test("explicit service rejection backs off without replaying an ambiguous token response", async () => {
+  const f = fixture([registration, device, error("unrecognized", 503), issued]);
   await loginDevice(f.options);
-  assert.deepEqual(f.sleeps, [1000, 2000, 4000]);
+  assert.deepEqual(f.sleeps, [1000, 2000]);
+  const lost = fixture([registration, device, () => {
+    throw new Error("fixture-secret-in-network-message");
+  }, issued]);
+  await assert.rejects(loginDevice(lost.options),
+    (failure) => failure.code === "network_error" && !failure.message.includes("fixture-secret"));
+  assert.equal(lost.requests.length, 3, "an ambiguously accepted device token is not polled again");
 });
 
 test("missing interval defaults to RFC 8628 five seconds", async () => {
@@ -411,7 +409,7 @@ test("request timeout is bounded and refresh reports it without upstream data", 
   );
 });
 
-test("timed-out token polling backs off before retrying", async () => {
+test("timed-out token acquisition is terminal because the device code may already be consumed", async () => {
   const f = fixture([
     registration,
     device,
@@ -421,8 +419,9 @@ test("timed-out token polling backs off before retrying", async () => {
     },
     issued,
   ]);
-  await loginDevice({ ...f.options, requestTimeoutMs: 1 });
-  assert.deepEqual(f.sleeps, [1000, 2000]);
+  await assert.rejects(loginDevice({ ...f.options, requestTimeoutMs: 1 }), { code: "request_timeout" });
+  assert.deepEqual(f.sleeps, [1000]);
+  assert.equal(f.requests.length, 3);
 });
 
 test("refresh cancellation never becomes a network error", async () => {
@@ -491,4 +490,50 @@ test("OIDC device-code exchange remains owned by polling, without nested transpo
   assert.equal(f.requests.length, 4);
   assert.equal(f.requests.filter((request) => request.url.endsWith("/token")).length, 2);
   assert.deepEqual(f.sleeps, [1000, 2000]);
+});
+
+test("OIDC refresh recovers a multi-attempt pre-connect outage with the same single-use credential", async () => {
+  const requests = [];
+  const refreshed = await refreshOidc({
+    credential: existing, now: () => INITIAL,
+    retry: { maxAttempts: null, baseDelayMs: 0, maxDelayMs: 0 },
+    fetchImpl: async (url, init) => {
+      requests.push({ url, body: init.body });
+      if (requests.length <= 4) throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("private DNS failure"), { code: "ENOTFOUND" }),
+      });
+      return Response.json(issued);
+    },
+  });
+  assert.equal(refreshed.access_token, issued.accessToken);
+  assert.equal(requests.length, 5);
+  assert.ok(requests.every((request) => request.url === requests[0].url && request.body === requests[0].body));
+});
+
+test("OIDC token response-body loss is not treated as a new pre-connect attempt", async () => {
+  let calls = 0;
+  await assert.rejects(refreshOidc({
+    credential: existing, now: () => INITIAL,
+    retry: { maxAttempts: null, baseDelayMs: 0, maxDelayMs: 0 },
+    fetchImpl: async () => {
+      calls++;
+      return new Response(new ReadableStream({ start(controller) {
+        controller.error(Object.assign(new Error("private response loss"), { code: "UND_ERR_CONNECT_TIMEOUT" }));
+      } }));
+    },
+  }), (failure) => !failure.message.includes("private"));
+  assert.equal(calls, 1);
+});
+
+test("OIDC refresh reports a permanent grant failure immediately even when HTTP status is 503", async () => {
+  let calls = 0;
+  await assert.rejects(refreshOidc({
+    credential: existing, now: () => INITIAL,
+    retry: { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0 },
+    fetchImpl: async () => {
+      calls++;
+      return error("invalid_grant", 503);
+    },
+  }), { code: "invalid_grant" });
+  assert.equal(calls, 1);
 });

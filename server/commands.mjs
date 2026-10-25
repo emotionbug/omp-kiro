@@ -273,7 +273,6 @@ export function registerKiroCommands(pi, { transport = "acp", authFile, services
         pending.add(controller);
         const signal = AbortSignal.any([
           controller.signal,
-          AbortSignal.timeout(15_000),
           ...(ctx.signal ? [ctx.signal] : []),
         ]);
         let result;

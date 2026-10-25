@@ -1,7 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
-import { fetchWithRetry } from "./network.mjs";
+import { fetchWithRetry, isPreconnectNetworkError, isTlsError, isTransientResponse } from "./network.mjs";
 
 const AUTH = "https://prod.us-east-1.auth.desktop.kiro.dev";
 const PORTAL = "https://app.kiro.dev/signin";
@@ -58,41 +58,44 @@ function abortable(promise, signal) {
 }
 
 async function post(path, body, { signal, fetchImpl, requestTimeoutMs, retry }) {
-  const request = scope(signal, requestTimeoutMs, "Kiro authentication request timed out.");
+  if (!positive(requestTimeoutMs) || requestTimeoutMs > 300_000)
+    throw fail("Invalid authentication timeout.");
   try {
-    const response = await abortable(
-      fetchWithRetry(fetchImpl, `${AUTH}${path}`, {
-        method: "POST",
-        redirect: "error",
-        signal: request.signal,
-        headers: { "content-type": "application/json", "user-agent": "omp-kiro" },
-        body: JSON.stringify(body),
-      }, {
-        retry: path === "/refreshToken" ? retry : { maxAttempts: 1 },
-        // A dropped refresh response may already have rotated its credential.
-        // Retry explicit throttling/unavailability only, never ambiguous delivery.
-        retryNetwork: false,
-        retryStatus: (status) => status === 429 || status === 503,
-      }),
-      request.signal,
-    );
-    let result;
-    try {
-      result = await abortable(response.json(), request.signal);
-    } catch {
-      request.signal.throwIfAborted();
-      throw fail(`Kiro authentication returned invalid JSON (HTTP ${response.status}).`);
-    }
-    if (!result || typeof result !== "object" || Array.isArray(result))
-      throw fail("Kiro authentication returned an invalid response.");
-    return { response, result };
+    return await fetchWithRetry(fetchImpl, `${AUTH}${path}`, {
+      method: "POST",
+      redirect: "error",
+      signal,
+      headers: { "content-type": "application/json", "user-agent": "omp-kiro" },
+      body: JSON.stringify(body),
+    }, {
+      retry,
+      idleTimeoutMs: requestTimeoutMs,
+      // DNS/connect failures cannot have consumed this single-use credential.
+      // Once connected, a lost response or timeout must never replay it.
+      retryNetwork: (error, { responseReceived }) => !responseReceived && isPreconnectNetworkError(error),
+      retryStatus: (status, response) => path === "/refreshToken" && (status === 429 || status === 503) &&
+        isTransientResponse(status, response),
+      async consume(response) {
+        let result;
+        try {
+          result = await response.json();
+        } catch {
+          signal?.throwIfAborted();
+          throw fail(`Kiro authentication returned invalid JSON (HTTP ${response.status}).`);
+        }
+        if (!result || typeof result !== "object" || Array.isArray(result))
+          throw fail("Kiro authentication returned an invalid response.");
+        return { response, result };
+      },
+    });
   } catch (error) {
-    request.signal.throwIfAborted();
+    signal?.throwIfAborted();
     if (error instanceof SocialLoginError) throw error;
+    if (isTlsError(error))
+      throw fail("Kiro authentication TLS certificate verification failed; check the approved CA configuration.");
+    if (error.code === "ETIMEDOUT") throw fail("Kiro authentication request timed out.");
     // Never retain a fetch error/cause containing request URLs, codes or tokens.
     throw fail("Cannot reach Kiro authentication service.");
-  } finally {
-    request.close();
   }
 }
 

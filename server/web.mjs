@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { loadKiroAuth } from "./auth.mjs";
+import { loadKiroAuth, refreshExpiredKiroAuth } from "./auth.mjs";
 import { endpointFor } from "./http.mjs";
 import { fetchWithRetry, isTlsError } from "./network.mjs";
 
@@ -45,7 +45,7 @@ export function createKiroWebClient({
 } = {}) {
   async function request(method, params, signal) {
     signal?.throwIfAborted();
-    const auth = await authProvider({ signal, fetchImpl });
+    let auth = await authProvider({ signal, fetchImpl, retry });
     const id = randomUUID();
     const body = JSON.stringify({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) });
     try {
@@ -63,6 +63,10 @@ export function createKiroWebClient({
         body,
       }, {
         retry,
+        async prepareRequest(init) {
+          auth = await refreshExpiredKiroAuth(auth, { signal, fetchImpl, retry, authProvider });
+          return { ...init, headers: { ...init.headers, authorization: `Bearer ${auth.access_token}` } };
+        },
         async consume(response, touch) {
           if (!response.ok) {
             await response.body?.cancel().catch(() => {});

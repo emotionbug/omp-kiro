@@ -36,7 +36,7 @@ function streamKiro(model, context, options = {}, transport) {
         cwd: options.cwd ?? process.cwd(),
         signal: options.signal,
         sessionId: options.sessionId,
-        ...(transport === "http" ? { retry: { maxAttempts: 1 } } : {}),
+        ...(transport === "http" ? { continuePartial: true } : {}),
         onText(delta) {
           if (!delta) return;
           if (!text) {
@@ -69,8 +69,8 @@ function streamKiro(model, context, options = {}, transport) {
       stream.push({ type: "done", reason: message.stopReason, message });
     } catch (error) {
       message.stopReason = options.signal?.aborted ? "aborted" : "error";
-      // OMP owns generation recovery (including committed-text continuation).
-      // Preserve its recognized transient class without exposing URLs or credentials.
+      // Transient HTTP recovery/committed-text continuation stays inside the
+      // transport. Terminal errors remain sanitized for the host.
       message.errorMessage =
         transport === "http" && !options.signal?.aborted && isTransientNetworkError(error)
           ? "Kiro HTTP network error: The socket connection was closed unexpectedly before the response completed."

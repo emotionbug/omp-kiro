@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { loadKiroAuth } from "./auth.mjs";
+import { loadKiroAuth, refreshExpiredKiroAuth } from "./auth.mjs";
 import { decodeEventStream } from "./eventstream.mjs";
 import {
-  abortableRequest, fetchWithRetry, isTransientNetworkError, isTransientStatus,
+  abortableRequest, fetchWithRetry, isPermanentServiceError, isTransientNetworkError, isTransientStatus,
   requestScope, retryAfterMs, retryOperation,
 } from "./network.mjs";
 
@@ -176,6 +176,32 @@ function reportedUsage(tokens) {
   };
 }
 
+function isTransientHttpError(error) {
+  if (isTransientNetworkError(error)) return true;
+  if (!(error instanceof KiroHttpError)) return false;
+  if (isPermanentServiceError(error.code, error.message)) return false;
+  return isTransientStatus(error.status) ||
+    ["EmptyResponse", "InternalServerException", "ServiceUnavailableException", "ThrottlingException"]
+      .includes(error.code?.split("#").at(-1));
+}
+
+function continueHttpRequest(body, text) {
+  const state = body.conversationState;
+  const current = state.currentMessage.userInputMessage;
+  // Move the accepted input/results once. Never copy prior toolResults into a
+  // continuation, and never manufacture tool uses from a failed response.
+  state.history.push(state.currentMessage, { assistantResponseMessage: { content: text } });
+  const { toolResults: _completed, ...userInputMessageContext } = current.userInputMessageContext ?? {};
+  state.currentMessage = {
+    userInputMessage: {
+      content: "Continue your response exactly where it stopped. Do not repeat already provided text or completed tools.",
+      modelId: current.modelId,
+      origin: current.origin,
+      userInputMessageContext,
+    },
+  };
+}
+
 export function createHttpTransport({
   fetchImpl = (...args) => globalThis.fetch(...args),
   authProvider = loadKiroAuth,
@@ -184,15 +210,21 @@ export function createHttpTransport({
 } = {}) {
   return async function runHttpTurn({
     model, context, cwd, signal, onText = () => {}, sessionId, retry: turnRetry, onRestart,
+    continuePartial = false, onRetry,
   }) {
     signal?.throwIfAborted();
     const body = buildHttpRequest({ model, context, cwd, sessionId });
-    const auth = await authProvider({ signal, fetchImpl });
+    if (continuePartial && onRestart)
+      throw new KiroHttpError("Choose committed-text continuation or provisional-text restart, not both.");
+    const policy = turnRetry ?? retry;
+    let auth = await authProvider({ signal, fetchImpl, retry: policy });
     signal?.throwIfAborted();
     if (auth.profile_arn) body.profileArn = auth.profile_arn;
-    const requestBody = JSON.stringify(body);
-    let textCommitted = false;
+    let requestBody = JSON.stringify(body);
+    let attemptText = "";
     return retryOperation(async () => {
+      // Refresh can itself wait through an outage; do it outside socket timeout.
+      auth = await refreshExpiredKiroAuth(auth, { signal, fetchImpl, retry: policy, authProvider });
       const request = requestScope(signal, idleTimeoutMs);
       try {
       const response = await abortableRequest(() => fetchImpl(endpointFor(auth), {
@@ -246,7 +278,7 @@ export function createHttpTransport({
         if (kind !== "event") throw new KiroHttpError("Invalid Kiro event-stream message type.");
         if (event === "assistantResponseEvent") {
           if (typeof data.content === "string" && data.content) {
-            textCommitted = true;
+            attemptText += data.content;
             onText(data.content);
           }
         } else if (event === "toolUseEvent") {
@@ -272,7 +304,19 @@ export function createHttpTransport({
               throw new KiroHttpError("Invalid Kiro tool argument fragment.");
             call.input += data.input;
           }
-          if (data.stop) call.stopped = true;
+          if (data.stop) {
+            call.stopped = true;
+            if (!call.name) throw new KiroHttpError("Kiro returned an incomplete tool call.");
+            try {
+              call.arguments = JSON.parse(call.input || "{}");
+            } catch {
+              throw new KiroHttpError("Kiro returned invalid JSON tool arguments.");
+            }
+            if (!call.arguments || typeof call.arguments !== "object" || Array.isArray(call.arguments))
+              throw new KiroHttpError("Kiro tool arguments must be a JSON object.");
+            if (!context.tools?.some((tool) => tool.name === call.name))
+              throw new KiroHttpError("Kiro requested a tool not supplied by OMP.");
+          }
         } else if (event === "metadataEvent") {
           usage = reportedUsage(data.tokenUsage) ?? usage;
         } else if (event === "invalidStateEvent") {
@@ -289,17 +333,7 @@ export function createHttpTransport({
       const toolCalls = [...calls.values()].map((call) => {
         if (!call.stopped || !call.name)
           throw new KiroHttpError("Kiro returned an incomplete tool call.");
-        let args;
-        try {
-          args = JSON.parse(call.input || "{}");
-        } catch {
-          throw new KiroHttpError("Kiro returned invalid JSON tool arguments.");
-        }
-        if (!args || typeof args !== "object" || Array.isArray(args))
-          throw new KiroHttpError("Kiro tool arguments must be a JSON object.");
-        if (!context.tools?.some((tool) => tool.name === call.name))
-          throw new KiroHttpError("Kiro requested a tool not supplied by OMP.");
-        return { type: "toolCall", id: call.id, name: call.name, arguments: args };
+        return { type: "toolCall", id: call.id, name: call.name, arguments: call.arguments };
       });
       return {
         ...(toolCalls.length ? { toolCalls } : {}),
@@ -311,22 +345,19 @@ export function createHttpTransport({
       }
     }, {
       signal,
-      retry: turnRetry ?? retry,
+      retry: policy,
       shouldRetry(error) {
-        if (textCommitted)
-          return typeof onRestart === "function" && isTransientNetworkError(error);
-        if (isTransientNetworkError(error)) return true;
-        if (!(error instanceof KiroHttpError)) return false;
-        if (/quota|invalid|denied|unauthor|forbidden|permission|modelnotfound/i.test(error.code ?? ""))
-          return false;
-        return isTransientStatus(error.status) ||
-          ["EmptyResponse", "InternalServerException", "ServiceUnavailableException", "ThrottlingException"]
-            .includes(error.code?.split("#").at(-1));
+        if (attemptText && !continuePartial && typeof onRestart !== "function") return false;
+        return isTransientHttpError(error);
       },
       async onRetry(info) {
-        if (onRestart) await onRestart(info);
+        if (attemptText && continuePartial) {
+          continueHttpRequest(body, attemptText);
+          requestBody = JSON.stringify(body);
+        } else if (onRestart) await onRestart(info);
+        if (onRetry) await onRetry(info);
         signal?.throwIfAborted();
-        textCommitted = false;
+        attemptText = "";
       },
     });
   };
@@ -340,7 +371,7 @@ export async function discoverHttpModels({
   authProvider = loadKiroAuth,
   retry,
 } = {}) {
-  const auth = await authProvider({ signal, fetchImpl });
+  let auth = await authProvider({ signal, fetchImpl, retry });
   const models = [];
   const seenTokens = new Set();
   let nextToken;
@@ -365,6 +396,10 @@ export async function discoverHttpModels({
       body: JSON.stringify(input),
     }, {
       retry,
+      async prepareRequest(init) {
+        auth = await refreshExpiredKiroAuth(auth, { signal, fetchImpl, retry, authProvider });
+        return { ...init, headers: { ...init.headers, authorization: `Bearer ${auth.access_token}` } };
+      },
       async consume(response) {
         if (!response.ok) {
           await response.body?.cancel();

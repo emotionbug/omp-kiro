@@ -7,6 +7,7 @@ export interface KiroHttpProviderOptions {
   fetchImpl?: typeof fetch;
   authProvider?: typeof loadKiroAuth;
   transportFactory?: typeof createHttpTransport;
+  retry?: { maxAttempts?: number | null; baseDelayMs?: number; maxDelayMs?: number };
 }
 
 export function createKiroHttpProvider(options?: KiroHttpProviderOptions): ProviderRegistration;

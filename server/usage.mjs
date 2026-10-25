@@ -1,4 +1,4 @@
-import { loadKiroAuth } from "./auth.mjs";
+import { loadKiroAuth, refreshExpiredKiroAuth } from "./auth.mjs";
 import { fetchWithRetry, isTransientNetworkError } from "./network.mjs";
 
 const messages = {
@@ -241,18 +241,20 @@ export async function fetchKiroUsage({
   fetchImpl = globalThis.fetch,
   authFile,
   authProvider = loadKiroAuth,
-  timeoutMs = 15_000,
+  timeoutMs,
   now = Date.now,
   retry,
 } = {}) {
   const timer = new AbortController();
-  const timeout = setTimeout(() => timer.abort(), timeoutMs);
+  // An explicit caller deadline remains supported; default outage recovery has
+  // no total deadline that could expire before its first 30-second retry.
+  const timeout = timeoutMs === undefined ? undefined : setTimeout(() => timer.abort(), timeoutMs);
   const requestSignal = signal ? AbortSignal.any([signal, timer.signal]) : timer.signal;
   try {
     let auth;
     try {
       auth = await abortable(
-        () => authProvider({ authFile, signal: requestSignal, fetchImpl }),
+        () => authProvider({ authFile, signal: requestSignal, fetchImpl, retry }),
         requestSignal,
       );
     } catch {
@@ -287,6 +289,12 @@ export async function fetchKiroUsage({
           redirect: "error",
         }, {
           retry,
+          async prepareRequest(init) {
+            auth = await refreshExpiredKiroAuth(auth, {
+              signal: requestSignal, fetchImpl, authFile, retry, authProvider, now,
+            });
+            return { ...init, headers: { ...init.headers, authorization: `Bearer ${auth.access_token}` } };
+          },
           async consume(response) {
             if (!response.ok) {
               // Never parse/forward bodies that can echo credentials or identities.

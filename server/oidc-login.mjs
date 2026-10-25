@@ -1,5 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { fetchWithRetry } from "./network.mjs";
+import { fetchWithRetry, isPreconnectNetworkError, isTlsError, isTransientResponse } from "./network.mjs";
 
 const BUILDER_START_URL = "https://view.awsapps.com/start";
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
@@ -140,32 +140,37 @@ async function post(base, path, body, opts, deadline = Infinity) {
   const remaining = deadline - opts.now();
   if (remaining <= 0)
     throw new OidcLoginError("expired_token", "Device authorization expired; start login again.");
-  const timeout = AbortSignal.timeout(Math.max(1, Math.min(opts.requestTimeoutMs, remaining)));
-  const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
+  const expiry = Number.isFinite(remaining) ? AbortSignal.timeout(Math.max(1, remaining)) : undefined;
+  const signal = expiry && opts.signal ? AbortSignal.any([opts.signal, expiry]) : expiry ?? opts.signal;
   try {
-    const response = await fetchWithRetry(opts.fetchImpl, base + path, {
+    const responseData = await fetchWithRetry(opts.fetchImpl, base + path, {
       method: "POST",
       redirect: "error",
       signal,
       headers: { "content-type": "application/json", "user-agent": "omp-kiro" },
       body: JSON.stringify(body),
     }, {
-      retry: body.grantType === "refresh_token" ? opts.retry : { maxAttempts: 1 },
-      // Never replay a potentially consumed authorization code/device token or
-      // a refresh whose response was lost after credential rotation.
-      retryNetwork: false,
-      retryStatus: (status) => status === 429 || status === 503,
+      retry: opts.retry,
+      idleTimeoutMs: Math.min(opts.requestTimeoutMs, remaining),
+      // Only proven pre-connect failures or explicit rejection are replay-safe.
+      retryNetwork: (error, { responseReceived }) => !responseReceived && isPreconnectNetworkError(error),
+      retryStatus: (status, response) => body.grantType === "refresh_token" && (status === 429 || status === 503) &&
+        isTransientResponse(status, response),
+      async consume(response) {
+        let result;
+        try {
+          result = await response.json();
+        } catch {
+          signal?.throwIfAborted();
+          throw invalid("OIDC returned invalid JSON.");
+        }
+        opts.signal?.throwIfAborted();
+        if (!result || typeof result !== "object" || Array.isArray(result))
+          throw invalid("OIDC returned an invalid response.");
+        return { response, result };
+      },
     });
-    let result;
-    try {
-      result = await response.json();
-    } catch {
-      if (signal.aborted) throw signal.reason;
-      throw invalid("OIDC returned invalid JSON.");
-    }
-    opts.signal?.throwIfAborted();
-    if (!result || typeof result !== "object" || Array.isArray(result))
-      throw invalid("OIDC returned an invalid response.");
+    const { response, result } = responseData;
     if (!response.ok) {
       const known = new Map([
         ["authorization_pending", "authorization_pending"],
@@ -186,7 +191,7 @@ async function post(base, path, body, opts, deadline = Infinity) {
       const type = typeof result.__type === "string" ? result.__type.split("#").at(-1) : undefined;
       const code =
         known.get(result.error ?? type) ??
-        (response.status >= 500 || response.status === 429
+        (response.status === 503 || response.status === 429
           ? "temporarily_unavailable"
           : "request_failed");
       throw new OidcLoginError(code, `OIDC request failed (${code}, HTTP ${response.status}).`);
@@ -195,7 +200,11 @@ async function post(base, path, body, opts, deadline = Infinity) {
   } catch (error) {
     opts.signal?.throwIfAborted();
     if (error instanceof OidcLoginError) throw error;
-    if (timeout.aborted) throw new OidcLoginError("request_timeout", "OIDC request timed out.");
+    if (isTlsError(error))
+      throw new OidcLoginError("tls_error", "OIDC TLS certificate verification failed; check the approved CA configuration.");
+    if (expiry?.aborted)
+      throw new OidcLoginError("expired_token", "Device authorization expired; start login again.");
+    if (error.code === "ETIMEDOUT") throw new OidcLoginError("request_timeout", "OIDC request timed out.");
     throw new OidcLoginError(
       "network_error",
       "Cannot reach AWS SSO OIDC; check network/proxy connectivity.",
@@ -371,7 +380,9 @@ export async function loginDevice({
         interval += 5000;
         continue;
       }
-      if (["network_error", "request_timeout", "temporarily_unavailable"].includes(error.code)) {
+      // Pending/explicit safe service rejection can be polled again; a lost
+      // token response or timeout may already have consumed the device code.
+      if (error.code === "temporarily_unavailable") {
         interval = Math.min(interval * 2, 3600000);
         continue;
       }

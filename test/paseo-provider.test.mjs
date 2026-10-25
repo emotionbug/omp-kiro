@@ -61,6 +61,7 @@ async function harness(t, generation, overrides = {}) {
   const provider = createKiroHttpProvider({
     stateDir: path.join(root, "state"),
     transportFactory: createHttpTransport,
+    retry: { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0 },
     authProvider: async ({ authFile }) => {
       authFiles.push(authFile);
       return auth;
@@ -123,7 +124,6 @@ async function harness(t, generation, overrides = {}) {
     env: {},
     mcpServers: {},
     model: "model-a",
-    mode: "full",
     settings: {},
     persist: true,
   };
@@ -256,6 +256,30 @@ test("direct HTTP writes a real workspace file, returns actual results, streams 
   );
 });
 
+test("new sessions default to full access and execute real writes and commands without approval", async (t) => {
+  const command = `${JSON.stringify(process.execPath)} -e "require('fs').appendFileSync('default-access.txt','+command')"`;
+  const h = await harness(t, (body, count) => {
+    if (count === 1)
+      return toolResponse("write_file", { path: "default-access.txt", content: "written" }, "default-write");
+    const results = body.conversationState.currentMessage.userInputMessage.userInputMessageContext.toolResults;
+    assert.equal(results[0].status, "success");
+    if (count === 2) return toolResponse("run_command", { command }, "default-command");
+    return textResponse("Executed with default full access");
+  });
+  await h.connection.send({ type: "catalog", requestId: "default-policy" });
+  const catalog = await h.waitFor((event) => event.type === "catalog" && event.requestId === "default-policy");
+  assert.equal(catalog.catalog.defaultMode, "full");
+  await h.open();
+  const configuration = await h.waitFor((event) => event.type === "session.config" && event.sessionId === "session");
+  assert.equal(configuration.config.mode, "full");
+  assert.equal((await h.terminal(await h.prompt())).state, "completed");
+  assert.equal(await fs.readFile(path.join(h.cwd, "default-access.txt"), "utf8"), "written+command");
+  assert.equal(h.events.filter((event) => event.type === "session.permission").length, 0);
+  assert.deepEqual(h.events.filter((event) => event.type === "timeline.item" &&
+    event.item.type === "tool_call" && event.item.status === "completed")
+    .map((event) => event.item.callId), ["default-write", "default-command"]);
+});
+
 test("ask denial does not write, exact approval runs once, and plan rejects writes without approval", async (t) => {
   let phase = 0;
   const h = await harness(t, (body, count) =>
@@ -266,6 +290,8 @@ test("ask denial does not write, exact approval runs once, and plan rejects writ
   await h.open({ mode: "ask" });
   const denied = await h.prompt();
   const permission = await h.waitFor((event) => event.type === "session.permission");
+  await assert.rejects(fs.stat(path.join(h.cwd, "allowed.txt")), { code: "ENOENT" });
+  assert.equal(h.requests.length, 1, "explicit ask blocks before executing the write");
   await h.connection.send({
     type: "session.permission",
     sessionId: "session",
@@ -283,6 +309,8 @@ test("ask denial does not write, exact approval runs once, and plan rejects writ
   const second = await h.waitFor(
     (event) => event.type === "session.permission" && event.request.id !== permission.request.id,
   );
+  await assert.rejects(fs.stat(path.join(h.cwd, "allowed.txt")), { code: "ENOENT" });
+  assert.equal(h.requests.length, 3, "the second ask remains blocked until approval");
   await h.connection.send({
     type: "session.permission",
     sessionId: "session",

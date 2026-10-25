@@ -10,6 +10,7 @@ import {
   loadKiroAuth,
   logoutKiroAuth,
   readAuthSnapshot,
+  refreshExpiredKiroAuth,
   readKiroAuth,
   saveKiroAuth,
 } from "../server/auth.mjs";
@@ -292,4 +293,61 @@ test("pre-aborted loading never creates storage", async (t) => {
     (error) => error === controller.signal.reason,
   );
   await assert.rejects(stat(f.authFile), { code: "ENOENT" });
+});
+
+test("a canceled waiter does not wait for or cancel another request's pending refresh", async (t) => {
+  const f = await fixture(t);
+  const ready = Promise.withResolvers(), started = Promise.withResolvers();
+  let calls = 0;
+  const options = {
+    authFile: f.authFile, now,
+    fetchImpl: async () => {
+      calls++;
+      started.resolve();
+      await ready.promise;
+      return Response.json({ accessToken: "fixture-new-access", expiresIn: 3600 });
+    },
+  };
+  const owner = loadKiroAuth(options);
+  await started.promise;
+  const controller = new AbortController(), reason = new Error("waiter canceled");
+  const waiter = loadKiroAuth({ ...options, signal: controller.signal });
+  const rejected = assert.rejects(waiter, (error) => error === reason);
+  await new Promise(setImmediate);
+  controller.abort(reason);
+  try {
+    await rejected;
+    assert.equal(calls, 1);
+  } finally {
+    ready.resolve();
+    await owner;
+  }
+});
+
+test("refresh cannot change the selected account profile or persist the changed identity", async (t) => {
+  const f = await fixture(t);
+  await assert.rejects(loadKiroAuth({
+    authFile: f.authFile, now,
+    fetchImpl: async () => Response.json({
+      accessToken: "fixture-new-access", expiresIn: 3600,
+      profileArn: "arn:aws:codewhisperer:eu-central-1:987:profile/other",
+    }),
+  }), /profile changed/);
+  assert.deepEqual(await f.read(), original);
+});
+
+test("an outage cannot silently adopt an independent login without a profile ARN", async (t) => {
+  const previous = { ...original };
+  delete previous.profile_arn;
+  const f = await fixture(t, previous);
+  const replacement = {
+    ...previous, access_token: "other-account-access", refresh_token: "other-account-refresh",
+    expires_at: "2026-02-01T00:00:00Z",
+  };
+  await f.replace(replacement);
+  await assert.rejects(refreshExpiredKiroAuth(previous, {
+    authFile: f.authFile, now,
+    fetchImpl: async () => assert.fail("must not refresh the independent login"),
+  }), /login or region changed/);
+  assert.deepEqual(await f.read(), replacement);
 });

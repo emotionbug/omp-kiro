@@ -2,13 +2,41 @@ import { setTimeout as delay } from "node:timers/promises";
 
 const transientStatuses = new Set([408, 429, 500, 502, 503, 504]);
 const transientCodes = new Set([
-  "ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "EPIPE", "ETIMEDOUT", "EAI_AGAIN",
-  "ENETDOWN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT",
-  "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT",
-  "ConnectionRefused", "FailedToOpenSocket", "ETIMEOUT", "ConnectionClosed",
+  "ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "EPIPE", "ETIMEDOUT", "EAI_AGAIN", "ENOTFOUND",
+  "ENETDOWN", "ENETRESET", "ENETUNREACH", "EHOSTDOWN", "EHOSTUNREACH",
+  "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT",
+  "ConnectionRefused", "FailedToOpenSocket", "DNSLookupFailed", "ETIMEOUT", "ConnectionClosed",
+]);
+
+// Only these failures establish that no connection accepted a single-use token.
+const preconnectCodes = new Set([
+  "ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ENETDOWN", "ENETUNREACH", "EHOSTDOWN", "EHOSTUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT", "ConnectionRefused", "FailedToOpenSocket", "DNSLookupFailed",
 ]);
 
 export const isTransientStatus = (status) => transientStatuses.has(status);
+
+export function isPermanentServiceError(code, message = "") {
+  return /quota|usage[_-]?limit[_-]?exceeded|credit|payment|invalid|denied|unauthor|forbidden|permission|modelnotfound|serialization|validation|malformed/i.test(code ?? "") ||
+    /quota|monthly.*limit|insufficient.*credit|payment required/i.test(message);
+}
+
+export async function isTransientResponse(status, response) {
+  if (!isTransientStatus(status)) return false;
+  if (isPermanentServiceError(response.headers.get("x-amzn-errortype"))) return false;
+  let data;
+  try {
+    data = await response.clone().json();
+  } catch (error) {
+    // Plain-text temporary HTTP responses are common. A lost body, unlike an
+    // invalid JSON body on an explicit rejection, is not proof of safe delivery.
+    if (!(error instanceof SyntaxError)) throw error;
+  }
+  return !isPermanentServiceError(
+    data?.__type ?? data?.code ?? (typeof data?.error === "string" ? data.error : data?.error?.code),
+    data?.message ?? data?.Message ?? data?.error_description ?? "",
+  );
+}
 
 export function isTlsError(error) {
   const visited = new Set();
@@ -34,6 +62,19 @@ export function isTransientNetworkError(error) {
   return transient || (error instanceof TypeError && !error.cause && error.message === "fetch failed");
 }
 
+export function isPreconnectNetworkError(error) {
+  if (!isTransientNetworkError(error)) return false;
+  const visited = new Set();
+  let preconnect = false;
+  for (let cause = error; cause && !visited.has(cause); cause = cause.cause) {
+    visited.add(cause);
+    if (preconnectCodes.has(cause.code) || (cause.code === "ETIMEDOUT" && cause.syscall === "connect"))
+      preconnect = true;
+    else if (transientCodes.has(cause.code)) return false;
+  }
+  return preconnect;
+}
+
 export function retryAfterMs(headers, now = Date.now()) {
   const value = headers?.get("retry-after");
   if (!value) return undefined;
@@ -51,10 +92,15 @@ function bounded(value, fallback, min, max) {
 }
 
 export function retryPolicy(options = {}, env = process.env) {
+  const attempts = options.maxAttempts !== undefined ? options.maxAttempts : env.OMP_KIRO_HTTP_MAX_ATTEMPTS;
+  // null is the public unbounded-until-abort policy, not a very large budget.
+  const maxAttempts = attempts == null || attempts === "" || attempts === "unlimited"
+    ? null
+    : bounded(attempts, null, 1, 5);
   return {
-    maxAttempts: bounded(options.maxAttempts ?? env.OMP_KIRO_HTTP_MAX_ATTEMPTS, 3, 1, 5),
-    baseDelayMs: bounded(options.baseDelayMs ?? env.OMP_KIRO_HTTP_RETRY_BASE_MS, 500, 0, 30_000),
-    maxDelayMs: bounded(options.maxDelayMs ?? env.OMP_KIRO_HTTP_RETRY_MAX_MS, 10_000, 0, 30_000),
+    maxAttempts,
+    baseDelayMs: bounded(options.baseDelayMs ?? env.OMP_KIRO_HTTP_RETRY_BASE_MS, 30_000, 0, 30_000),
+    maxDelayMs: bounded(options.maxDelayMs ?? env.OMP_KIRO_HTTP_RETRY_MAX_MS, 30_000, 0, 30_000),
   };
 }
 
@@ -90,8 +136,8 @@ export async function abortableRequest(operation, signal) {
   }
 }
 
-// Call only around a replay-safe boundary. Never wrap a host tool execution or
-// an entire multi-tool turn. The caller closes this gate after publishing output.
+// Call only around a replay-safe boundary, never a host tool execution or an
+// entire multi-tool turn. Published output requires explicit continuation/reset.
 export async function retryOperation(operation, {
   signal, retry, shouldRetry = isTransientNetworkError, onRetry,
 } = {}) {
@@ -102,11 +148,13 @@ export async function retryOperation(operation, {
       return await operation();
     } catch (error) {
       signal?.throwIfAborted();
-      if (attempt >= policy.maxAttempts || !shouldRetry(error)) throw error;
+      if ((policy.maxAttempts !== null && attempt >= policy.maxAttempts) || !shouldRetry(error)) throw error;
       const after = error.retryAfterMs ?? retryAfterMs(error.response?.headers);
-      // Do not retry earlier than Retry-After, nor wait beyond our finite cap.
-      if (after !== undefined && (!Number.isFinite(after) || after > policy.maxDelayMs)) throw error;
-      const wait = Math.max(after ?? 0, Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (attempt - 1)));
+      if (after !== undefined && (!Number.isFinite(after) || after < 0)) throw error;
+      // Retry-After is a lower bound, even beyond the configured backoff cap.
+      const backoff = policy.baseDelayMs === 0
+        ? 0 : Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** Math.min(attempt - 1, 30));
+      const wait = Math.max(after ?? 0, backoff);
       await error.response?.body?.cancel().catch(() => {});
       signal?.throwIfAborted();
       if (onRetry) {
@@ -116,7 +164,12 @@ export async function retryOperation(operation, {
         signal?.throwIfAborted();
       }
       try {
-        await delay(wait, undefined, { signal });
+        // Node timers overflow above 2^31-1 ms; preserve long server deadlines.
+        for (let remaining = wait; remaining > 0;) {
+          const chunk = Math.min(remaining, 2_147_483_647);
+          await delay(chunk, undefined, { signal });
+          remaining -= chunk;
+        }
       } catch (error) {
         signal?.throwIfAborted();
         throw error;
@@ -126,17 +179,22 @@ export async function retryOperation(operation, {
 }
 
 export async function fetchWithRetry(fetchImpl, url, init, {
-  retry, retryNetwork = true, consume = (response) => response, retryStatus = isTransientStatus, idleTimeoutMs,
+  retry, retryNetwork = true, consume = (response) => response, retryStatus = isTransientResponse, idleTimeoutMs,
+  prepareRequest = (request) => request,
 } = {}) {
+  let responseReceived = false;
   try {
     return await retryOperation(async () => {
+      responseReceived = false;
+      const prepared = await prepareRequest(init);
       const request = requestScope(init.signal, idleTimeoutMs);
       try {
         const response = await abortableRequest(
-          () => fetchImpl(url, { ...init, signal: request.signal }), request.signal,
+          () => fetchImpl(url, { ...prepared, signal: request.signal }), request.signal,
         );
+        responseReceived = true;
         request.touch();
-        if (retryStatus(response.status)) {
+        if (await abortableRequest(() => retryStatus(response.status, response), request.signal)) {
           const error = new Error("Temporary Kiro HTTP failure");
           error.response = response;
           throw error;
@@ -148,7 +206,9 @@ export async function fetchWithRetry(fetchImpl, url, init, {
     }, {
       signal: init.signal,
       retry,
-      shouldRetry: (error) => Boolean(error.response) || (retryNetwork && isTransientNetworkError(error)),
+      shouldRetry: (error) => Boolean(error.response) ||
+        (typeof retryNetwork === "function"
+          ? retryNetwork(error, { responseReceived }) : retryNetwork && isTransientNetworkError(error)),
     });
   } catch (error) {
     if (error.response) return consume(error.response);

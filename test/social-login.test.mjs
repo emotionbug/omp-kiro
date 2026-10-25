@@ -466,3 +466,72 @@ test("a single-use social authorization code is never automatically exchanged tw
   }), SocialLoginError);
   assert.equal(calls, 1);
 });
+
+test("social refresh waits through a long DNS outage at the default 30-second cadence", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const bodies = [];
+  const pending = refreshSocial({
+    credential: { kind: "social", provider: "google", refresh_token: token.refreshToken },
+    now: () => time,
+    fetchImpl: async (_url, init) => {
+      bodies.push(init.body);
+      if (bodies.length <= 4) throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("private DNS"), { code: "EAI_AGAIN" }),
+      });
+      return Response.json(token);
+    },
+  });
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    await new Promise(setImmediate);
+    assert.equal(bodies.length, attempt);
+    t.mock.timers.tick(30_000);
+  }
+  assert.equal((await pending).access_token, token.accessToken);
+  assert.equal(bodies.length, 5);
+  assert.equal(new Set(bodies).size, 1);
+});
+
+test("authorization-code exchange retries only before connection, never after an ambiguous drop", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const bodies = [];
+  const pending = loginSocial({
+    mode: "manual", now: () => time, onInstructions() {},
+    requestCallback: async (instructions) => callback(instructions),
+    fetchImpl: async (_url, init) => {
+      bodies.push(init.body);
+      if (bodies.length === 1) throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("private"), { code: "ECONNREFUSED" }),
+      });
+      return Response.json(token);
+    },
+  });
+  await new Promise(setImmediate);
+  assert.equal(bodies.length, 1);
+  t.mock.timers.tick(30_000);
+  assert.equal((await pending).access_token, token.accessToken);
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0], bodies[1]);
+  let calls = 0;
+  await assert.rejects(loginSocial({
+    mode: "manual", onInstructions() {},
+    requestCallback: async (instructions) => callback(instructions),
+    fetchImpl: async () => {
+      calls++;
+      throw Object.assign(new Error(token.refreshToken), { code: "ECONNRESET" });
+    },
+  }), (failure) => failure instanceof SocialLoginError && !failure.message.includes(token.refreshToken));
+  assert.equal(calls, 1);
+});
+
+test("social refresh does not hide permanent credential rejection behind HTTP 503", async () => {
+  let calls = 0;
+  await assert.rejects(refreshSocial({
+    credential: { kind: "social", provider: "google", refresh_token: token.refreshToken },
+    retry: { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0 },
+    fetchImpl: async () => {
+      calls++;
+      return Response.json({ error: "invalid_grant", message: token.refreshToken }, { status: 503 });
+    },
+  }), (error) => error instanceof SocialLoginError && !error.message.includes(token.refreshToken));
+  assert.equal(calls, 1);
+});

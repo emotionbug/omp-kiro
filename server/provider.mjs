@@ -48,7 +48,7 @@ const MAX_TEXT = 1024 * 1024;
 
 /**
  * Direct Paseo provider. All execution stays in this plugin; no OMP/Kiro executable is launched.
- * @param {{stateDir?:string,fetchImpl?:typeof fetch,authProvider?:typeof loadKiroAuth,transportFactory?:typeof createHttpTransport}} [options]
+ * @param {{stateDir?:string,fetchImpl?:typeof fetch,authProvider?:typeof loadKiroAuth,transportFactory?:typeof createHttpTransport,retry?:{maxAttempts?:number|null,baseDelayMs?:number,maxDelayMs?:number}}} [options]
  * @returns {import('@getpaseo/plugin/server/provider').ProviderRegistration}
  */
 export function createKiroHttpProvider(options = {}) {
@@ -107,6 +107,7 @@ function createConnection(request, options) {
     const models = await discoverHttpModels({
       signal,
       fetchImpl: options.fetchImpl,
+      retry: options.retry,
       authProvider: (params) => (options.authProvider ?? loadKiroAuth)({ ...params, authFile }),
     });
     return models.map((model) => ({
@@ -269,7 +270,7 @@ function createConnection(request, options) {
               type: "notification",
               id: `network-retry:${turnId}:${step}`,
               level: "warning",
-              message: `Kiro connection interrupted; retrying the same model (${attempt}/${maxAttempts}).`,
+              message: `Kiro connection interrupted; retrying the same model (attempt ${attempt}${maxAttempts === null ? ", until canceled" : `/${maxAttempts}`}).`,
             });
           },
           onText: (fragment) => {
@@ -479,7 +480,7 @@ function createConnection(request, options) {
       filename,
       config,
       model: config.model,
-      mode: config.mode ?? "ask",
+      mode: config.mode ?? "full",
       messages: [],
       timeline: [],
       models: [],
@@ -497,6 +498,7 @@ function createConnection(request, options) {
       configuring: false,
       transport: (options.transportFactory ?? createHttpTransport)({
         fetchImpl: options.fetchImpl,
+        retry: options.retry,
         authProvider,
       }),
     };
@@ -522,6 +524,7 @@ function createConnection(request, options) {
       const discover = await discoverHttpModels({
         signal: controller.signal,
         fetchImpl: options.fetchImpl,
+        retry: options.retry,
         authProvider,
       });
       session.models = discover.map((model) => ({
@@ -532,7 +535,7 @@ function createConnection(request, options) {
       session.mcp = await connectMcpTools(config, { signal: controller.signal });
       session.tools = [
         ...createWorkspaceTools(config),
-        createKiroSearchTool({ fetchImpl: options.fetchImpl, authProvider }),
+        createKiroSearchTool({ fetchImpl: options.fetchImpl, authProvider, retry: options.retry }),
         ...session.mcp.tools,
       ];
       controller.signal.throwIfAborted();
@@ -622,7 +625,7 @@ function createConnection(request, options) {
         catalog: {
           models: await catalog(env, lifetime.signal),
           modes: MODES,
-          defaultMode: "ask",
+          defaultMode: "full",
           thinkingOptions: [],
         },
       });
@@ -690,9 +693,9 @@ function createConnection(request, options) {
                   signal: controller.signal,
                   services: {
                     discoverHttpModels: (params) =>
-                      discoverHttpModels({ ...params, fetchImpl: options.fetchImpl }),
+                      discoverHttpModels({ ...params, fetchImpl: options.fetchImpl, retry: options.retry }),
                     fetchKiroUsage: (params) =>
-                      fetchKiroUsage({ ...params, fetchImpl: options.fetchImpl }),
+                      fetchKiroUsage({ ...params, fetchImpl: options.fetchImpl, retry: options.retry }),
                   },
                 });
               controller.signal.throwIfAborted();
