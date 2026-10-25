@@ -1,5 +1,5 @@
 import { loadKiroAuth, refreshExpiredKiroAuth } from "./auth.mjs";
-import { fetchWithRetry, isTransientNetworkError } from "./network.mjs";
+import { defaultFetch, fetchWithRetry, isTransientNetworkError } from "./network.mjs";
 
 const messages = {
   AUTH_REQUIRED: "Kiro usage requires a managed login; run omp-kiro login.",
@@ -238,7 +238,7 @@ function abortable(operation, signal) {
  */
 export async function fetchKiroUsage({
   signal,
-  fetchImpl = globalThis.fetch,
+  fetchImpl = defaultFetch,
   authFile,
   authProvider = loadKiroAuth,
   timeoutMs,

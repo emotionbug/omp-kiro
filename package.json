@@ -1,6 +1,6 @@
 {
   "name": "omp-kiro",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "Kiro ACP/HTTP model providers for OMP and a native Paseo HTTP coding agent with account usage.",
   "keywords": [
     "extension",

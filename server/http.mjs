@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { loadKiroAuth, refreshExpiredKiroAuth } from "./auth.mjs";
 import { decodeEventStream } from "./eventstream.mjs";
 import {
-  abortableRequest, fetchWithRetry, isPermanentServiceError, isTransientNetworkError, isTransientStatus,
+  abortableRequest, defaultFetch, fetchWithRetry, isPermanentServiceError, isTransientNetworkError, isTransientStatus,
   requestScope, retryAfterMs, retryOperation,
 } from "./network.mjs";
 
@@ -203,7 +203,7 @@ function continueHttpRequest(body, text) {
 }
 
 export function createHttpTransport({
-  fetchImpl = (...args) => globalThis.fetch(...args),
+  fetchImpl = defaultFetch,
   authProvider = loadKiroAuth,
   retry,
   idleTimeoutMs,
@@ -367,7 +367,7 @@ export const runHttpTurn = createHttpTransport();
 
 export async function discoverHttpModels({
   signal,
-  fetchImpl = (...args) => globalThis.fetch(...args),
+  fetchImpl = defaultFetch,
   authProvider = loadKiroAuth,
   retry,
 } = {}) {

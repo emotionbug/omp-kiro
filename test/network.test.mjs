@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdtemp, mkdir, readFile, rm, truncate, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { createServer as createTlsServer } from "node:https";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { rootCertificates } from "node:tls";
 import { test } from "node:test";
+import { promisify } from "node:util";
 import {
-  fetchWithRetry, isPreconnectNetworkError, isTransientNetworkError, isTransientStatus,
+  defaultFetch, fetchWithRetry, isPreconnectNetworkError, isTlsError, isTransientNetworkError, isTransientStatus,
   retryAfterMs, retryOperation, retryPolicy,
 } from "../server/network.mjs";
 
@@ -156,4 +164,136 @@ test("temporary rate limits are not mistaken for permanent quota rejection", asy
   }, "https://fixture.invalid", {}, { retry: fast });
   assert.equal(calls, 2);
   assert.deepEqual(await result.json(), { recovered: true });
+});
+
+async function caBoundaryFixture(t) {
+  const directory = await mkdtemp(join(tmpdir(), "omp-kiro-ca-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const previous = process.env.NODE_EXTRA_CA_CERTS;
+  t.after(() => {
+    if (previous === undefined) delete process.env.NODE_EXTRA_CA_CERTS;
+    else process.env.NODE_EXTRA_CA_CERTS = previous;
+  });
+  let requests = 0;
+  const server = createServer((_request, response) => {
+    requests++;
+    response.end("unexpected request");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve, reject) =>
+    server.close((error) => error ? reject(error) : resolve())));
+  return {
+    directory,
+    url: `http://127.0.0.1:${server.address().port}/`,
+    requests: () => requests,
+  };
+}
+
+test("Bun rejects unreadable or malformed approved CA bundles without sending a request", {
+  skip: !process.versions.bun,
+}, async (t) => {
+  const fixture = await caBoundaryFixture(t);
+  const invalid = [
+    ["empty", ""],
+    ["text", "private-malformed-certificate-payload"],
+    ["utf8", Buffer.from([0xff])],
+    ["der", "-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n"],
+    ["mixed", `${rootCertificates[0]}\nprivate-trailing-payload`],
+  ];
+  for (const [name, contents] of invalid)
+    await writeFile(join(fixture.directory, name), contents);
+  await mkdir(join(fixture.directory, "directory"));
+  const oversized = join(fixture.directory, "oversized");
+  await writeFile(oversized, "");
+  await truncate(oversized, 4 * 1024 * 1024 + 1);
+  for (const name of ["missing", "directory", "oversized", ...invalid.map(([name]) => name)]) {
+    const path = join(fixture.directory, name);
+    process.env.NODE_EXTRA_CA_CERTS = path;
+    await assert.rejects(defaultFetch(fixture.url), (error) => {
+      assert.equal(error.code, "KIRO_TLS_CA_INVALID");
+      assert.equal(error.cause, undefined);
+      assert.equal(error.message.includes(path), false);
+      assert.equal(error.message.includes("private-"), false);
+      assert.equal(isTransientNetworkError(error), false);
+      return true;
+    });
+  }
+  assert.equal(fixture.requests(), 0);
+});
+
+test("Bun preserves caller abort before and during approved CA loading without sending a request", {
+  skip: !process.versions.bun,
+}, async (t) => {
+  const fixture = await caBoundaryFixture(t);
+  process.env.NODE_EXTRA_CA_CERTS = join(fixture.directory, "missing");
+  const stopped = new AbortController();
+  const reason = new Error("caller stopped CA loading");
+  stopped.abort(reason);
+  await assert.rejects(defaultFetch(fixture.url, { signal: stopped.signal }), (error) => error === reason);
+  const valid = join(fixture.directory, "approved.pem");
+  await writeFile(valid, rootCertificates[0]);
+  process.env.NODE_EXTRA_CA_CERTS = valid;
+  const controller = new AbortController();
+  const pending = defaultFetch(new Request(fixture.url, { signal: controller.signal }));
+  controller.abort(reason);
+  await assert.rejects(pending, (error) => error === reason);
+  assert.equal(fixture.requests(), 0);
+});
+
+test("Bun trusts the approved CA but rejects untrusted chains and mismatched hostnames", {
+  skip: !process.versions.bun,
+}, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-kiro-tls-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const previous = process.env.NODE_EXTRA_CA_CERTS;
+  t.after(() => {
+    if (previous === undefined) delete process.env.NODE_EXTRA_CA_CERTS;
+    else process.env.NODE_EXTRA_CA_CERTS = previous;
+  });
+  const run = promisify(execFile);
+  await run("openssl", [
+    "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+    "-subj", "/CN=Kiro CA boundary fixture",
+    "-addext", "basicConstraints=critical,CA:TRUE",
+    "-keyout", "ca.key", "-out", "ca.pem",
+  ], { cwd: directory });
+  await run("openssl", [
+    "req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=127.0.0.1",
+    "-keyout", "leaf.key", "-out", "leaf.csr",
+  ], { cwd: directory });
+  await writeFile(join(directory, "leaf.ext"),
+    "subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n");
+  await run("openssl", [
+    "x509", "-req", "-in", "leaf.csr", "-CA", "ca.pem", "-CAkey", "ca.key",
+    "-CAcreateserial", "-days", "1", "-extfile", "leaf.ext", "-out", "leaf.pem",
+  ], { cwd: directory });
+  let requests = 0;
+  const server = createTlsServer({
+    key: await readFile(join(directory, "leaf.key")),
+    cert: await readFile(join(directory, "leaf.pem")),
+  }, (_request, response) => {
+    requests++;
+    response.end("approved TLS reached the service");
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, resolve);
+  });
+  t.after(() => new Promise((resolve, reject) =>
+    server.close((error) => error ? reject(error) : resolve())));
+  const port = server.address().port;
+  const init = { proxy: false };
+  const wrongCa = join(directory, "unrelated.pem");
+  await writeFile(wrongCa, rootCertificates[0]);
+  process.env.NODE_EXTRA_CA_CERTS = wrongCa;
+  await assert.rejects(defaultFetch(`https://127.0.0.1:${port}/`, init), (error) =>
+    isTlsError(error) && !isTransientNetworkError(error));
+  assert.equal(requests, 0, "An untrusted service received an HTTP request");
+  process.env.NODE_EXTRA_CA_CERTS = join(directory, "ca.pem");
+  const response = await defaultFetch(`https://127.0.0.1:${port}/`, init);
+  assert.equal(await response.text(), "approved TLS reached the service");
+  assert.equal(requests, 1);
+  await assert.rejects(defaultFetch(`https://127.0.0.2:${port}/`, init), (error) =>
+    isTlsError(error) && !isTransientNetworkError(error));
+  assert.equal(requests, 1, "A mismatched hostname received an HTTP request");
 });

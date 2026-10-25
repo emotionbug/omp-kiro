@@ -1,5 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { fetchWithRetry, isPreconnectNetworkError, isTlsError, isTransientResponse } from "./network.mjs";
+import { defaultFetch, fetchWithRetry, isPreconnectNetworkError, isTlsError, isTransientResponse } from "./network.mjs";
 
 const BUILDER_START_URL = "https://view.awsapps.com/start";
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
@@ -121,7 +121,7 @@ function seconds(value, max) {
 
 function options({
   signal,
-  fetchImpl = globalThis.fetch,
+  fetchImpl = defaultFetch,
   now = Date.now,
   requestTimeoutMs = 30000,
 }) {

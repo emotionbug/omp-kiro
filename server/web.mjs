@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { loadKiroAuth, refreshExpiredKiroAuth } from "./auth.mjs";
 import { endpointFor } from "./http.mjs";
-import { fetchWithRetry, isTlsError } from "./network.mjs";
+import { defaultFetch, fetchWithRetry, isTlsError } from "./network.mjs";
 
 const MAX_RESPONSE = 1024 * 1024;
 export class KiroWebError extends Error {
@@ -39,7 +39,7 @@ async function responseJson(response, touch) {
 }
 
 export function createKiroWebClient({
-  fetchImpl = (...args) => globalThis.fetch(...args),
+  fetchImpl = defaultFetch,
   authProvider = loadKiroAuth,
   retry,
 } = {}) {

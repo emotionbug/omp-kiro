@@ -4,11 +4,12 @@ import { isAbsolute } from "node:path";
 import { z } from "zod";
 import { authFilePath, getKiroAuthStatus, readKiroAuth } from "./auth.mjs";
 import { fetchKiroUsage, KiroUsageError } from "./usage.mjs";
+import { defaultFetch } from "./network.mjs";
 
 const inputSchema = z.object({ authFile: z.string().refine(isAbsolute) }).strict();
 
 /** @returns {import("@getpaseo/plugin/server/usage").UsageSourceRegistration} */
-export function createKiroUsageSource({ fetchImpl = globalThis.fetch, now = Date.now } = {}) {
+export function createKiroUsageSource({ fetchImpl = defaultFetch, now = Date.now } = {}) {
   return {
     id: "kiro",
     label: "Kiro HTTP",

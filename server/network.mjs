@@ -1,4 +1,84 @@
+import { X509Certificate } from "node:crypto";
+import { open } from "node:fs/promises";
+import { rootCertificates } from "node:tls";
 import timers from "node:timers/promises";
+
+const MAX_CA_BYTES = 4 * 1024 * 1024;
+let approvedCaPath;
+let approvedTls;
+
+function invalidCa() {
+  return Object.assign(new Error(
+    "Kiro TLS CA configuration is unreadable or malformed; check NODE_EXTRA_CA_CERTS.",
+  ), { code: "KIRO_TLS_CA_INVALID" });
+}
+
+async function readApprovedTls(file) {
+  try {
+    const handle = await open(file, "r");
+    let pem;
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size === 0 || stat.size > MAX_CA_BYTES) throw invalidCa();
+      // Match the bounded catalog-reader convention, including a growth sentinel.
+      const bytes = Buffer.alloc(stat.size + 1);
+      let length = 0;
+      while (length < bytes.length) {
+        const { bytesRead } = await handle.read(bytes, length, bytes.length - length, null);
+        if (!bytesRead) break;
+        length += bytesRead;
+      }
+      if (length !== stat.size) throw invalidCa();
+      pem = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, length));
+    } finally {
+      await handle.close();
+    }
+    let end = 0;
+    let count = 0;
+    const certificates = /-----BEGIN CERTIFICATE-----([A-Za-z0-9+/=\s]+)-----END CERTIFICATE-----/g;
+    for (const match of pem.matchAll(certificates)) {
+      if (pem.slice(end, match.index).trim()) throw invalidCa();
+      const encoded = match[1].replace(/\s/g, "");
+      const der = Buffer.from(encoded, "base64");
+      if (der.toString("base64") !== encoded || !new X509Certificate(der).raw.equals(der))
+        throw invalidCa();
+      count++;
+      end = match.index + match[0].length;
+    }
+    if (!count || pem.slice(end).trim()) throw invalidCa();
+    // Bun's explicit ca replaces its defaults: keep Mozilla roots as well.
+    return { ca: [...rootCertificates, pem], rejectUnauthorized: true };
+  } catch {
+    // Never attach filesystem/OpenSSL causes: they may contain paths or PEM data.
+    throw invalidCa();
+  }
+}
+
+async function fetchWithApprovedCa(url, init, file) {
+  const signal = init?.signal ?? (url instanceof Request ? url.signal : undefined);
+  signal?.throwIfAborted();
+  // The package writes immutable, hash-named bundles. Keep only the current
+  // path's promise (including failures), sharing parsing across concurrent calls.
+  if (approvedCaPath !== file) {
+    approvedCaPath = file;
+    approvedTls = readApprovedTls(file);
+    // A cancelled waiter must not leave a later shared-load rejection unhandled.
+    approvedTls.catch(() => {});
+  }
+  const pending = approvedTls;
+  const tls = signal
+    ? await abortableRequest(() => pending, signal)
+    : await pending;
+  signal?.throwIfAborted();
+  return globalThis.fetch(url, { ...init, tls });
+}
+
+/** Only Bun needs an explicit CA option; Node keeps its native startup CA policy. */
+export function defaultFetch(url, init) {
+  if (!process.versions.bun || !process.env.NODE_EXTRA_CA_CERTS)
+    return globalThis.fetch(url, init);
+  return fetchWithApprovedCa(url, init, process.env.NODE_EXTRA_CA_CERTS);
+}
 
 const transientStatuses = new Set([408, 429, 500, 502, 503, 504]);
 const transientCodes = new Set([

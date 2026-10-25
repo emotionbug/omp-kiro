@@ -1,7 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
-import { fetchWithRetry, isPreconnectNetworkError, isTlsError, isTransientResponse } from "./network.mjs";
+import { defaultFetch, fetchWithRetry, isPreconnectNetworkError, isTlsError, isTransientResponse } from "./network.mjs";
 
 const AUTH = "https://prod.us-east-1.auth.desktop.kiro.dev";
 const PORTAL = "https://app.kiro.dev/signin";
@@ -135,7 +135,7 @@ function credentials(result, provider, now, previous) {
 export async function refreshSocial({
   credential,
   signal,
-  fetchImpl = globalThis.fetch,
+  fetchImpl = defaultFetch,
   now = Date.now,
   requestTimeoutMs = 30_000,
   retry,
@@ -449,7 +449,7 @@ export async function loginSocial({
   port,
   timeoutMs = 600_000,
   requestTimeoutMs = 30_000,
-  fetchImpl = globalThis.fetch,
+  fetchImpl = defaultFetch,
   now = Date.now,
   sleep = (ms, { signal }) => delay(ms, undefined, { signal }),
 } = {}) {

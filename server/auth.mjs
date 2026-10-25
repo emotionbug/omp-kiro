@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { refreshSocial } from "./social-login.mjs";
 import { refreshOidc } from "./oidc-login.mjs";
-import { abortableRequest } from "./network.mjs";
+import { abortableRequest, defaultFetch } from "./network.mjs";
 
 const refreshing = new Map();
 
@@ -202,7 +202,7 @@ export async function getKiroAuthStatus({ authFile = authFilePath(), now = Date.
 
 export async function loadKiroAuth({
   signal,
-  fetchImpl = globalThis.fetch,
+  fetchImpl = defaultFetch,
   authFile = authFilePath(),
   now = Date.now,
   retry,
