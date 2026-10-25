@@ -1,4 +1,5 @@
 import { loadKiroAuth } from "./auth.mjs";
+import { fetchWithRetry, isTransientNetworkError } from "./network.mjs";
 
 const messages = {
   AUTH_REQUIRED: "Kiro usage requires a managed login; run omp-kiro login.",
@@ -242,6 +243,7 @@ export async function fetchKiroUsage({
   authProvider = loadKiroAuth,
   timeoutMs = 15_000,
   now = Date.now,
+  retry,
 } = {}) {
   const timer = new AbortController();
   const timeout = setTimeout(() => timer.abort(), timeoutMs);
@@ -266,9 +268,9 @@ export async function fetchKiroUsage({
     if (Date.parse(auth.expires_at) <= now()) fail("AUTH_EXPIRED");
     const region = auth.profile_arn?.split(":")[3] || "us-east-1";
     if (!["us-east-1", "eu-central-1"].includes(region)) fail("UNSUPPORTED_REGION");
-    const response = await abortable(
+    const payload = await abortable(
       () =>
-        fetchImpl(`https://management.${region}.kiro.dev/`, {
+        fetchWithRetry(fetchImpl, `https://management.${region}.kiro.dev/`, {
           method: "POST",
           headers: {
             authorization: `Bearer ${auth.access_token}`,
@@ -283,27 +285,27 @@ export async function fetchKiroUsage({
           }),
           signal: requestSignal,
           redirect: "error",
+        }, {
+          retry,
+          async consume(response) {
+            if (!response.ok) {
+              // Never parse/forward bodies that can echo credentials or identities.
+              await response.body?.cancel().catch(() => {});
+              throw new KiroUsageError(response.status === 429 ? "RATE_LIMITED" : "HTTP_ERROR", {
+                status: response.status,
+              });
+            }
+            try {
+              return await abortable(() => response.json(), requestSignal);
+            } catch (error) {
+              requestSignal.throwIfAborted();
+              if (isTransientNetworkError(error)) throw error;
+              fail();
+            }
+          },
         }),
       requestSignal,
     );
-    if (!response.ok) {
-      // Do not parse/forward error bodies: they may echo tokens or identities.
-      try {
-        await abortable(() => response.body?.cancel(), requestSignal);
-      } catch {
-        /* Preserve the status unless cancelled. */
-      }
-      throw new KiroUsageError(response.status === 429 ? "RATE_LIMITED" : "HTTP_ERROR", {
-        status: response.status,
-      });
-    }
-    let payload;
-    try {
-      payload = await abortable(() => response.json(), requestSignal);
-    } catch {
-      requestSignal.throwIfAborted();
-      fail();
-    }
     return normalizeUsage(payload, now());
   } catch (error) {
     if (signal?.aborted) throw new KiroUsageError("CANCELLED");

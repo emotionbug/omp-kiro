@@ -43,6 +43,7 @@ const options = (value, extra = {}) => ({
   now: () => NOW,
   authProvider: async () => auth,
   fetchImpl: async () => Response.json(value),
+  retry: { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 1000 },
   ...extra,
 });
 const expectCode = (code, status) => (error) => {
@@ -497,5 +498,58 @@ test("explicit managed auth store is used without changing environment or valid 
     assert.equal(process.env.OMP_KIRO_AUTH_FILE, originalEnv);
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("usage transient status and interrupted JSON recover without rotating credentials", async () => {
+  let authReads = 0;
+  const bodies = [];
+  const report = await fetchKiroUsage(options(payload(), {
+    authProvider: async () => { authReads++; return auth; },
+    fetchImpl: async (_url, init) => {
+      bodies.push(init.body);
+      if (bodies.length === 1)
+        return new Response(null, { status: 503, headers: { "retry-after": "0" } });
+      if (bodies.length === 2) {
+        return new Response(new ReadableStream({
+          start(controller) {
+            controller.error(Object.assign(new TypeError("terminated"), {
+              cause: Object.assign(new Error("reset"), { code: "ECONNRESET" }),
+            }));
+          },
+        }));
+      }
+      return Response.json(payload());
+    },
+  }));
+  assert.equal(report.status, "available");
+  assert.equal(authReads, 1);
+  assert.equal(bodies.length, 3);
+  assert.equal(bodies[0], bodies[1]);
+  assert.equal(bodies[1], bodies[2]);
+});
+
+test("usage cancellation during retry backoff is terminal and redacted", async () => {
+  const controller = new AbortController();
+  let calls = 0;
+  await assert.rejects(fetchKiroUsage(options(payload(), {
+    signal: controller.signal,
+    retry: { maxAttempts: 3, baseDelayMs: 1000, maxDelayMs: 1000 },
+    fetchImpl: async () => {
+      calls++;
+      setTimeout(() => controller.abort(new Error(auth.access_token)), 0);
+      return new Response(null, { status: 503, headers: { "retry-after": "1" } });
+    },
+  })), expectCode("CANCELLED"));
+  assert.equal(calls, 1);
+});
+
+test("usage retry exhaustion is finite and permission failures are not retried", async () => {
+  for (const [status, expected] of [[503, 3], [401, 1], [403, 1]]) {
+    let calls = 0;
+    await assert.rejects(fetchKiroUsage(options(null, {
+      fetchImpl: async () => { calls++; return new Response(null, { status }); },
+    })), expectCode("HTTP_ERROR", status));
+    assert.equal(calls, expected);
   }
 });

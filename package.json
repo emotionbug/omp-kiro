@@ -1,6 +1,6 @@
 {
   "name": "omp-kiro",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Kiro ACP/HTTP model providers for OMP and a native Paseo HTTP coding agent with account usage.",
   "keywords": [
     "extension",
@@ -36,7 +36,7 @@
   ],
   "type": "module",
   "scripts": {
-    "check": "node --check index.js && node --check setup.mjs && node --check auth-cli.mjs && node --check server/bridge.mjs && node --check server/auth.mjs && node --check server/http.mjs && node --check server/eventstream.mjs && node --check server/social-login.mjs && node --check server/oidc-login.mjs && node --check server/usage.mjs && node --check server/commands.mjs && node --check server/provider.mjs && node --check server/usage-source.mjs && node --check server/tools.mjs && node --check server/mcp.mjs",
+    "check": "node --check index.js && node --check setup.mjs && node --check auth-cli.mjs && node --check server/bridge.mjs && node --check server/auth.mjs && node --check server/http.mjs && node --check server/network.mjs && node --check server/web.mjs && node --check server/eventstream.mjs && node --check server/social-login.mjs && node --check server/oidc-login.mjs && node --check server/usage.mjs && node --check server/commands.mjs && node --check server/provider.mjs && node --check server/usage-source.mjs && node --check server/tools.mjs && node --check server/mcp.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint index.js index.server.ts *.mjs server test",
     "test": "node --test test/*.test.mjs",

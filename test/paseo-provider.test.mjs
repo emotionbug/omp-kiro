@@ -913,3 +913,87 @@ test("query user rows retain optimistic IDs across restoration without entering 
     "completed",
   );
 });
+
+test("native HTTP restarts provisional output without executing buffered tools twice", async (t) => {
+  let brokenStream;
+  const command = `${JSON.stringify(process.execPath)} -e "require('fs').appendFileSync('retry-count.txt','x')"`;
+  const h = await harness(t, (_body, count) => {
+    if (count === 1) {
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            brokenStream = controller;
+            controller.enqueue(frame("assistantResponseEvent", { content: "provisional output" }));
+            controller.enqueue(
+              frame("toolUseEvent", {
+                toolUseId: "discarded-call",
+                name: "run_command",
+                input: JSON.stringify({ command }),
+                stop: true,
+              }),
+            );
+          },
+        }),
+      );
+    }
+    if (count === 2) return toolResponse("run_command", { command }, "successful-call");
+    return textResponse("Recovered without repeating the command");
+  });
+  const opened = await h.open();
+  const turn = await h.prompt("Run the command once");
+  await h.waitFor(
+    (event) =>
+      event.type === "timeline.item" &&
+      event.item.type === "assistant_message" &&
+      event.item.text === "provisional output",
+  );
+  brokenStream.error(Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }));
+  assert.equal((await h.terminal(turn)).state, "completed");
+  assert.equal(await fs.readFile(path.join(h.cwd, "retry-count.txt"), "utf8"), "x");
+  assert.equal(h.requests.length, 3);
+  assert.deepEqual(h.requests[1], h.requests[0], "restart preserves the model and logical request");
+  assert.ok(
+    h.requests.every(
+      (request) => request.conversationState.currentMessage.userInputMessage.modelId === "model-a",
+    ),
+  );
+  const executed = h.events.filter(
+    (event) =>
+      event.type === "timeline.item" &&
+      event.item.type === "tool_call" &&
+      event.item.status === "completed",
+  );
+  assert.deepEqual(executed.map((event) => event.item.callId), ["successful-call"]);
+  const key = opened.persistence.data.nativeSessionId;
+  const saved = JSON.parse(await fs.readFile(path.join(h.root, "state", `${key}.json`), "utf8"));
+  assert.ok(!JSON.stringify(saved).includes("provisional output"));
+  assert.ok(!JSON.stringify(saved).includes("discarded-call"));
+});
+
+test("Paseo plan mode executes managed Kiro search and returns source attribution to the model", async (t) => {
+  const result = { results: [{ title: "Kiro docs", url: "https://kiro.dev/docs/", snippet: "Public documentation", maxVerbatimWordLimit: 30 }] };
+  const h = await harness(t, (body) => {
+    if (body.method === "tools/call") {
+      assert.equal(body.params.name, "web_search");
+      assert.equal(body.params.arguments.query, "Kiro documentation");
+      return Response.json({
+        jsonrpc: "2.0", id: body.id,
+        result: { content: [{ type: "text", text: JSON.stringify(result) }] },
+      });
+    }
+    const returned = body.conversationState.currentMessage.userInputMessage.userInputMessageContext.toolResults;
+    if (returned?.length) {
+      assert.equal(returned[0].status, "success");
+      assert.deepEqual(JSON.parse(returned[0].content[0].text), result);
+      return textResponse("Found the original documentation source");
+    }
+    return toolResponse("web_search", { query: "Kiro documentation" }, "search-one");
+  });
+  await h.open({ mode: "plan" });
+  assert.equal((await h.terminal(await h.prompt("Search Kiro documentation"))).state, "completed");
+  assert.equal(h.requests.filter((body) => body.method === "tools/call").length, 1);
+  assert.equal(h.events.filter((event) => event.type === "session.permission").length, 0);
+  assert.ok(h.events.some((event) =>
+    event.type === "timeline.item" && event.item.type === "tool_call" &&
+    event.item.callId === "search-one" && event.item.status === "completed"));
+});

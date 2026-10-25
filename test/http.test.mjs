@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { createServer } from "node:http";
 import { buildHttpRequest, createHttpTransport, discoverHttpModels } from "../server/http.mjs";
 import { crc32, decodeEventStream } from "../server/eventstream.mjs";
 
@@ -377,4 +378,297 @@ test("catalog uses direct metadata, preserves reported limits and follows pagina
     { id: "one", name: "One", contextWindow: 200000 },
     { id: "two", name: "Two", maxTokens: 8000 },
   ]);
+});
+
+const fastRetry = { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 1000 };
+const disconnected = () => Object.assign(new TypeError("terminated"), {
+  cause: Object.assign(new Error("socket disconnected"), { code: "UND_ERR_SOCKET" }),
+});
+
+function interruptedResponse(frames = []) {
+  let sent = false;
+  return new Response(new ReadableStream({
+    pull(controller) {
+      if (!sent && frames.length) {
+        sent = true;
+        controller.enqueue(Buffer.concat(frames));
+      } else controller.error(disconnected());
+    },
+  }));
+}
+
+test("a real transient socket drop recovers the identical model, body and session", async (t) => {
+  const requests = [];
+  const server = createServer(async (request, reply) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    requests.push(Buffer.concat(chunks).toString());
+    reply.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" });
+    if (requests.length === 1) {
+      reply.write(frame("metadataEvent", {}));
+      setTimeout(() => reply.destroy(), 10);
+    } else reply.end(frame("assistantResponseEvent", { content: "Recovered" }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise((resolve) => server.close(resolve));
+  });
+  const text = [];
+  const run = createHttpTransport({
+    authProvider: async () => auth,
+    retry: fastRetry,
+    fetchImpl: (_url, init) => fetch(`http://127.0.0.1:${server.address().port}/`, init),
+  });
+  await run({ model: "selected-only", sessionId: "stable-session", context, onText: (s) => text.push(s) });
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0], requests[1]);
+  assert.equal(
+    JSON.parse(requests[1]).conversationState.currentMessage.userInputMessage.modelId,
+    "selected-only",
+  );
+  assert.deepEqual(text, ["Recovered"]);
+});
+
+test("buffered tools from a failed attempt are never executed or duplicated", async () => {
+  let attempts = 0;
+  const run = createHttpTransport({
+    authProvider: async () => auth,
+    retry: fastRetry,
+    fetchImpl: async () => {
+      attempts++;
+      const tool = frame("toolUseEvent", {
+        toolUseId: "call", name: "read", input: '{"path":"a"}', stop: true,
+      });
+      return attempts === 1 ? interruptedResponse([tool]) : response([tool]);
+    },
+  });
+  let executed = 0;
+  const outcome = await run({ model: "selected-only", context });
+  for (const call of outcome.toolCalls) {
+    assert.equal(call.id, "call");
+    executed++;
+  }
+  assert.equal(attempts, 2);
+  assert.equal(executed, 1);
+});
+
+test("partial text disconnect remains an error for host continuation, never a success or replay", async () => {
+  let attempts = 0;
+  const text = [];
+  const run = createHttpTransport({
+    authProvider: async () => auth,
+    retry: fastRetry,
+    fetchImpl: async () => {
+      attempts++;
+      return interruptedResponse([
+        frame("assistantResponseEvent", { content: "Committed" }),
+        frame("toolUseEvent", { toolUseId: "call", name: "read", input: '{"path":' }),
+      ]);
+    },
+  });
+  await assert.rejects(
+    run({ model: "selected-only", context, onText: (s) => text.push(s) }),
+    (error) => error.cause?.code === "UND_ERR_SOCKET",
+  );
+  assert.deepEqual(text, ["Committed"]);
+  assert.equal(attempts, 1);
+});
+
+test("cancellation during Retry-After backoff sends no further generation request", async () => {
+  const controller = new AbortController();
+  const reason = new Error("cancelled during backoff");
+  let attempts = 0;
+  const run = createHttpTransport({
+    authProvider: async () => auth,
+    retry: { maxAttempts: 3, baseDelayMs: 1000, maxDelayMs: 2000 },
+    fetchImpl: async () => {
+      attempts++;
+      setTimeout(() => controller.abort(reason), 0);
+      return Response.json({ message: "Try later" }, { status: 503, headers: { "retry-after": "1" } });
+    },
+  });
+  await assert.rejects(
+    run({ model: "selected-only", context, signal: controller.signal }),
+    (error) => error === reason,
+  );
+  assert.equal(attempts, 1);
+});
+
+test("nonretryable HTTP, model, TLS, CRC and incomplete tool failures do not loop", async () => {
+  const corrupt = frame("assistantResponseEvent", { content: "bad" });
+  corrupt[corrupt.length - 5] ^= 1;
+  const tls = Object.assign(new TypeError("fetch failed"), {
+    cause: Object.assign(new Error("trust failed"), { code: "CERT_HAS_EXPIRED" }),
+  });
+  for (const fixture of [
+    () => Response.json({ message: "Unauthorized" }, { status: 401 }),
+    () => Response.json({ message: "Forbidden" }, { status: 403 }),
+    () => Response.json({ __type: "InvalidModelException" }, { status: 503 }),
+    () => { throw tls; },
+    () => response([corrupt]),
+    () => response([frame("toolUseEvent", { toolUseId: "call", name: "read", input: '{"path":' })]),
+  ]) {
+    let attempts = 0;
+    const run = createHttpTransport({
+      authProvider: async () => auth,
+      retry: fastRetry,
+      fetchImpl: async () => { attempts++; return fixture(); },
+    });
+    await assert.rejects(run({ model: "selected-only", context }));
+    assert.equal(attempts, 1);
+  }
+});
+
+test("host-owned generation retries can be disabled independently of catalog recovery", async () => {
+  let generationAttempts = 0;
+  const run = createHttpTransport({
+    authProvider: async () => auth,
+    retry: fastRetry,
+    fetchImpl: async () => { generationAttempts++; throw disconnected(); },
+  });
+  await assert.rejects(run({ model: "selected-only", context, retry: { maxAttempts: 1 } }));
+  assert.equal(generationAttempts, 1);
+  const bodies = [];
+  const models = await discoverHttpModels({
+    authProvider: async () => auth,
+    retry: fastRetry,
+    fetchImpl: async (_url, init) => {
+      bodies.push(init.body);
+      if (bodies.length === 1) return Response.json({ models: [{ modelId: "one" }], nextToken: "page2" });
+      if (bodies.length === 2) return interruptedResponse();
+      return Response.json({ models: [{ modelId: "two" }] });
+    },
+  });
+  assert.deepEqual(models.map((model) => model.id), ["one", "two"]);
+  assert.equal(bodies.length, 3);
+  assert.equal(bodies[1], bodies[2]);
+});
+
+test("temporary HTTP and framed service rejections recover within one finite attempt budget", async () => {
+  const bodies = [];
+  const run = createHttpTransport({
+    authProvider: async () => auth,
+    retry: fastRetry,
+    fetchImpl: async (_url, init) => {
+      bodies.push(init.body);
+      if (bodies.length === 1)
+        return Response.json({ __type: "ServiceUnavailableException" }, {
+          status: 503, headers: { "retry-after": "0" },
+        });
+      if (bodies.length === 2)
+        return response([frame("InternalServerException", { message: "Temporary service failure" }, "exception")]);
+      return response([frame("assistantResponseEvent", { content: "Recovered" })]);
+    },
+  });
+  const text = [];
+  await run({ model: "selected-only", context, onText: (s) => text.push(s) });
+  assert.equal(bodies.length, 3);
+  assert.equal(new Set(bodies).size, 1);
+  assert.deepEqual(text, ["Recovered"]);
+});
+
+test("native provisional text can explicitly reset before same-request recovery", async () => {
+  const bodies = [];
+  const restarts = [];
+  let displayed = "";
+  const run = createHttpTransport({
+    authProvider: async () => auth,
+    retry: fastRetry,
+    fetchImpl: async (_url, init) => {
+      bodies.push(init.body);
+      return bodies.length === 1
+        ? interruptedResponse([
+          frame("assistantResponseEvent", { content: "discard me" }),
+          frame("toolUseEvent", { toolUseId: "discarded", name: "read", input: "{}" }),
+        ])
+        : response([
+          frame("assistantResponseEvent", { content: "Recovered" }),
+          frame("toolUseEvent", { toolUseId: "final", name: "read", input: "{}", stop: true }),
+        ]);
+    },
+  });
+  const outcome = await run({
+    model: "selected-only",
+    context,
+    onText: (text) => { displayed += text; },
+    onRestart(info) { restarts.push(info); displayed = ""; },
+  });
+  assert.equal(displayed, "Recovered");
+  assert.deepEqual(restarts, [{ attempt: 2, maxAttempts: 3, delayMs: 0 }]);
+  assert.equal(bodies[0], bodies[1]);
+  assert.deepEqual(outcome.toolCalls.map((call) => call.id), ["final"]);
+});
+
+test("restart callback failure or cancellation prevents any replay", async () => {
+  for (const abort of [false, true]) {
+    const controller = new AbortController();
+    const reason = new Error("restart stopped");
+    let calls = 0;
+    const run = createHttpTransport({
+      authProvider: async () => auth,
+      retry: fastRetry,
+      fetchImpl: async () => {
+        calls++;
+        return interruptedResponse([frame("assistantResponseEvent", { content: "provisional" })]);
+      },
+    });
+    await assert.rejects(run({
+      model: "selected-only", context, signal: controller.signal,
+      onRestart() {
+        if (abort) controller.abort(reason);
+        else throw reason;
+      },
+    }), (error) => error === reason);
+    assert.equal(calls, 1);
+  }
+});
+
+test("silent connect and response blackholes time out and recover before output", async () => {
+  for (const stage of ["connect", "body"]) {
+    let calls = 0;
+    let cancelled = false;
+    const run = createHttpTransport({
+      authProvider: async () => auth,
+      retry: fastRetry,
+      idleTimeoutMs: 20,
+      fetchImpl: async () => {
+        calls++;
+        if (calls > 1) return response([frame("assistantResponseEvent", { content: "Recovered" })]);
+        if (stage === "connect") return new Promise(() => {});
+        return new Response(new ReadableStream({ cancel() { cancelled = true; } }));
+      },
+    });
+    const text = [];
+    await run({ model: "selected-only", context, onText: (s) => text.push(s) });
+    assert.equal(calls, 2);
+    assert.deepEqual(text, ["Recovered"]);
+    if (stage === "body") assert.equal(cancelled, true);
+  }
+});
+
+test("generation idle timeout resets on bytes rather than imposing a total deadline", async () => {
+  let timer;
+  const run = createHttpTransport({
+    authProvider: async () => auth,
+    retry: fastRetry,
+    idleTimeoutMs: 60,
+    fetchImpl: async () => new Response(new ReadableStream({
+      start(controller) {
+        let chunks = 0;
+        timer = setInterval(() => {
+          controller.enqueue(frame("assistantResponseEvent", { content: "a" }));
+          if (++chunks === 6) { clearInterval(timer); controller.close(); }
+        }, 20);
+      },
+      cancel() { clearInterval(timer); },
+    })),
+  });
+  const text = [];
+  try {
+    await run({ model: "selected-only", context, onText: (s) => text.push(s) });
+    assert.equal(text.join(""), "aaaaaa");
+  } finally {
+    clearInterval(timer);
+  }
 });

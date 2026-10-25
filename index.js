@@ -2,6 +2,8 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import { closeSession, discoverModels, runTurn } from "./server/bridge.mjs";
 import { discoverHttpModels, runHttpTurn } from "./server/http.mjs";
 import { registerKiroCommands } from "./server/commands.mjs";
+import { isTransientNetworkError, isTlsError } from "./server/network.mjs";
+import { registerKiroWebSearch } from "./server/web.mjs";
 
 function streamKiro(model, context, options = {}, transport) {
   const stream = new AssistantMessageEventStream();
@@ -34,6 +36,7 @@ function streamKiro(model, context, options = {}, transport) {
         cwd: options.cwd ?? process.cwd(),
         signal: options.signal,
         sessionId: options.sessionId,
+        ...(transport === "http" ? { retry: { maxAttempts: 1 } } : {}),
         onText(delta) {
           if (!delta) return;
           if (!text) {
@@ -66,7 +69,18 @@ function streamKiro(model, context, options = {}, transport) {
       stream.push({ type: "done", reason: message.stopReason, message });
     } catch (error) {
       message.stopReason = options.signal?.aborted ? "aborted" : "error";
-      message.errorMessage = error instanceof Error ? error.message : String(error);
+      // OMP owns generation recovery (including committed-text continuation).
+      // Preserve its recognized transient class without exposing URLs or credentials.
+      message.errorMessage =
+        transport === "http" && !options.signal?.aborted && isTransientNetworkError(error)
+          ? "Kiro HTTP network error: The socket connection was closed unexpectedly before the response completed."
+          : transport === "http" && isTlsError(error)
+            ? "Kiro TLS certificate verification failed; check the approved CA configuration."
+            : error instanceof Error
+              ? error.message
+              : String(error);
+      if (transport === "http" && Number.isFinite(error?.retryAfterMs) && error.retryAfterMs >= 0)
+        message.errorMessage += ` retry-after-ms=${Math.ceil(error.retryAfterMs)}`;
       stream.push({ type: "error", reason: message.stopReason, error: message });
     } finally {
       stream.end();
@@ -109,5 +123,6 @@ export default function kiroExtension(pi) {
       }));
     },
   });
+  if (transport === "http") registerKiroWebSearch(pi);
   registerKiroCommands(pi, { transport });
 }

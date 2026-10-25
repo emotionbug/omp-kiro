@@ -1,4 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
+import { fetchWithRetry } from "./network.mjs";
 
 const BUILDER_START_URL = "https://view.awsapps.com/start";
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
@@ -142,12 +143,18 @@ async function post(base, path, body, opts, deadline = Infinity) {
   const timeout = AbortSignal.timeout(Math.max(1, Math.min(opts.requestTimeoutMs, remaining)));
   const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
   try {
-    const response = await opts.fetchImpl(base + path, {
+    const response = await fetchWithRetry(opts.fetchImpl, base + path, {
       method: "POST",
       redirect: "error",
       signal,
       headers: { "content-type": "application/json", "user-agent": "omp-kiro" },
       body: JSON.stringify(body),
+    }, {
+      retry: body.grantType === "refresh_token" ? opts.retry : { maxAttempts: 1 },
+      // Never replay a potentially consumed authorization code/device token or
+      // a refresh whose response was lost after credential rotation.
+      retryNetwork: false,
+      retryStatus: (status) => status === 429 || status === 503,
     });
     let result;
     try {
@@ -373,8 +380,9 @@ export async function loginDevice({
   }
 }
 
-export async function refreshOidc({ credential, signal, fetchImpl, now, requestTimeoutMs } = {}) {
+export async function refreshOidc({ credential, signal, fetchImpl, now, requestTimeoutMs, retry } = {}) {
   const opts = options({ signal, fetchImpl, now, requestTimeoutMs });
+  opts.retry = retry;
   if (
     credential?.kind !== "oidc" ||
     !["builder-id", "identity-center"].includes(credential.provider) ||

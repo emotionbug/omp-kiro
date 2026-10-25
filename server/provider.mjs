@@ -13,6 +13,7 @@ import { getKiroCommands, executeKiroQuery } from "./commands.mjs";
 import { fetchKiroUsage } from "./usage.mjs";
 import { createWorkspaceTools } from "./tools.mjs";
 import { connectMcpTools } from "./mcp.mjs";
+import { createKiroSearchTool } from "./web.mjs";
 
 const CAPABILITIES = [
   "prompt.message",
@@ -258,6 +259,18 @@ function createConnection(request, options) {
               description,
               parameters,
             })),
+          },
+          onRestart: ({ attempt, maxAttempts }) => {
+            signal.throwIfAborted();
+            // No tools from this provisional response execute until transport succeeds.
+            responseText = "";
+            item(session, { type: "assistant_message", id: messageId, messageId, text: "" });
+            item(session, {
+              type: "notification",
+              id: `network-retry:${turnId}:${step}`,
+              level: "warning",
+              message: `Kiro connection interrupted; retrying the same model (${attempt}/${maxAttempts}).`,
+            });
           },
           onText: (fragment) => {
             signal.throwIfAborted();
@@ -517,7 +530,11 @@ function createConnection(request, options) {
         ...(model.contextWindow ? { contextWindowMaxTokens: model.contextWindow } : {}),
       }));
       session.mcp = await connectMcpTools(config, { signal: controller.signal });
-      session.tools = [...createWorkspaceTools(config), ...session.mcp.tools];
+      session.tools = [
+        ...createWorkspaceTools(config),
+        createKiroSearchTool({ fetchImpl: options.fetchImpl, authProvider }),
+        ...session.mcp.tools,
+      ];
       controller.signal.throwIfAborted();
       await save(session);
       session.ready = true;

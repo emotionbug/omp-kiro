@@ -450,3 +450,45 @@ test("optional registration expiry remains absent instead of inventing an expiry
   const credential = await loginDevice(f.options);
   assert.equal(Object.hasOwn(credential, "registration_expires_at"), false);
 });
+
+test("OIDC refresh retries explicit unavailability but never replays a lost rotating response", async () => {
+  const f = fixture([
+    new Response("temporarily unavailable", { status: 503, headers: { "retry-after": "0" } }),
+    issued,
+  ]);
+  const value = await refreshOidc({
+    ...f.options,
+    credential: existing,
+    retry: { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0 },
+  });
+  assert.equal(value.access_token, issued.accessToken);
+  assert.equal(f.requests.length, 2);
+  assert.deepEqual(f.requests[0].body, f.requests[1].body);
+  let calls = 0;
+  await assert.rejects(refreshOidc({
+    credential: existing,
+    now: () => INITIAL,
+    retry: { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0 },
+    fetchImpl: async () => {
+      calls++;
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("reset"), { code: "ECONNRESET" }),
+      });
+    },
+  }), { code: "network_error" });
+  assert.equal(calls, 1);
+});
+
+test("OIDC device-code exchange remains owned by polling, without nested transport retries", async () => {
+  const f = fixture([
+    registration,
+    device,
+    error("temporarily_unavailable", 503),
+    issued,
+  ]);
+  const credential = await loginDevice(f.options);
+  assert.equal(credential.access_token, issued.accessToken);
+  assert.equal(f.requests.length, 4);
+  assert.equal(f.requests.filter((request) => request.url.endsWith("/token")).length, 2);
+  assert.deepEqual(f.sleeps, [1000, 2000]);
+});

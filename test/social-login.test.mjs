@@ -421,3 +421,48 @@ test("network timeout and pre-aborted login stop without credentials or invocati
     /request timed out/,
   );
 });
+
+test("refresh retries explicit temporary rejection with identical credential, not ambiguous disconnects", async () => {
+  const credential = { kind: "social", provider: "google", refresh_token: token.refreshToken };
+  const bodies = [];
+  const refreshed = await refreshSocial({
+    credential,
+    now: () => time,
+    retry: { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0 },
+    fetchImpl: async (_url, init) => {
+      bodies.push(init.body);
+      if (bodies.length === 1)
+        return new Response("temporarily unavailable", { status: 503, headers: { "retry-after": "0" } });
+      return Response.json(token);
+    },
+  });
+  assert.equal(refreshed.access_token, token.accessToken);
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0], bodies[1]);
+  let calls = 0;
+  await assert.rejects(refreshSocial({
+    credential,
+    retry: { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0 },
+    fetchImpl: async () => {
+      calls++;
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error(token.refreshToken), { code: "ECONNRESET" }),
+      });
+    },
+  }), (error) => error instanceof SocialLoginError && !error.message.includes(token.refreshToken));
+  assert.equal(calls, 1);
+});
+
+test("a single-use social authorization code is never automatically exchanged twice", async () => {
+  let calls = 0;
+  await assert.rejects(loginSocial({
+    mode: "manual",
+    onInstructions() {},
+    requestCallback: async (instructions) => callback(instructions),
+    fetchImpl: async () => {
+      calls++;
+      return Response.json({ message: "Temporary rejection" }, { status: 503 });
+    },
+  }), SocialLoginError);
+  assert.equal(calls, 1);
+});

@@ -45,7 +45,7 @@ function decodeHeaders(bytes) {
 }
 
 // AWS/Smithy event-stream: 12-byte prelude, typed headers, payload, CRC32.
-export async function* decodeEventStream(body, signal) {
+export async function* decodeEventStream(body, signal, onChunk = () => {}) {
   if (!body) throw new Error("Kiro returned an empty event stream");
   const reader = body.getReader();
   let pending = Buffer.alloc(0);
@@ -60,6 +60,7 @@ export async function* decodeEventStream(body, signal) {
       const { done, value } = await reader.read();
       signal?.throwIfAborted();
       if (done) break;
+      onChunk();
       const bytes = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
       pending = pending.length ? Buffer.concat([pending, bytes]) : bytes;
       while (pending.length >= 12) {
@@ -92,6 +93,11 @@ export async function* decodeEventStream(body, signal) {
     }
     if (pending.length) throw new Error("Truncated AWS event stream");
     complete = true;
+  } catch (error) {
+    // Fetch may reject its pending read with AbortError before cancel() settles.
+    // Preserve the scope's timeout reason (or the caller's cancellation reason).
+    signal?.throwIfAborted();
+    throw error;
   } finally {
     signal?.removeEventListener("abort", abort);
     if (!complete) await reader.cancel().catch(() => {});

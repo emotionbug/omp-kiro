@@ -1,6 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
+import { fetchWithRetry } from "./network.mjs";
 
 const AUTH = "https://prod.us-east-1.auth.desktop.kiro.dev";
 const PORTAL = "https://app.kiro.dev/signin";
@@ -56,16 +57,22 @@ function abortable(promise, signal) {
   });
 }
 
-async function post(path, body, { signal, fetchImpl, requestTimeoutMs }) {
+async function post(path, body, { signal, fetchImpl, requestTimeoutMs, retry }) {
   const request = scope(signal, requestTimeoutMs, "Kiro authentication request timed out.");
   try {
     const response = await abortable(
-      fetchImpl(`${AUTH}${path}`, {
+      fetchWithRetry(fetchImpl, `${AUTH}${path}`, {
         method: "POST",
         redirect: "error",
         signal: request.signal,
         headers: { "content-type": "application/json", "user-agent": "omp-kiro" },
         body: JSON.stringify(body),
+      }, {
+        retry: path === "/refreshToken" ? retry : { maxAttempts: 1 },
+        // A dropped refresh response may already have rotated its credential.
+        // Retry explicit throttling/unavailability only, never ambiguous delivery.
+        retryNetwork: false,
+        retryStatus: (status) => status === 429 || status === 503,
       }),
       request.signal,
     );
@@ -128,6 +135,7 @@ export async function refreshSocial({
   fetchImpl = globalThis.fetch,
   now = Date.now,
   requestTimeoutMs = 30_000,
+  retry,
 } = {}) {
   providerName(credential?.provider);
   if (credential.kind !== "social" || !requiredString(credential.refresh_token))
@@ -137,7 +145,7 @@ export async function refreshSocial({
     {
       refreshToken: credential.refresh_token,
     },
-    { signal, fetchImpl, requestTimeoutMs },
+    { signal, fetchImpl, requestTimeoutMs, retry },
   );
   if (!response.ok)
     throw fail(`Kiro credential refresh failed (HTTP ${response.status}); sign in again.`);

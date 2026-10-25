@@ -41,6 +41,7 @@ Current artifact-backed routing:
 | Account quota  | `https://management.us-east-1.kiro.dev/`                    | `AmazonCodeWhispererService.GetUsageLimits`, `KIRO_CLI`, `resourceType: AGENTIC_REQUEST`       |
 | Generation     | `https://runtime.us-east-1.kiro.dev/`                       | `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`, native user origin `KIRO_CLI` |
 | Social refresh | `https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken` | JSON refresh request                                                                           |
+| Backend search | `https://runtime.us-east-1.kiro.dev/mcp`                   | InvokeMCP JSON-RPC `tools/list` / `tools/call`, remote tool `web_search`                      |
 
 The artifact also contains EU Central management/runtime counterparts. That region is statically supported, not runtime exercised here. Other profile regions fail explicitly.
 
@@ -53,6 +54,23 @@ Key evidence:
 - Independent comparison of the actual exported ACP and HTTP implementations: `ev_028b099c76f813cbb73de386e256c9bb50da5c2d690f08ea025d9b8a7bb33451`; `acpCount=22`, `httpCount=22`, identical sorted IDs, both set differences empty, exit 0.
 
 The capture's executable digest binds the caller's Node harness, and process trees are sampled. Network packets were not captured; authenticated request/status/schema observations came from the explicit harness. These limitations do not imply generation was exercised.
+
+## Managed backend search and retry boundaries
+
+Live REA observation `ev_cdd8e8ace141aea7d01c57401c240620479781c4fd9a99f431c91bb148edef94` exercised the authenticated Kiro `/mcp` backend with no model-generation request. The process exited naturally with status 0 in about two seconds and returned ten real search results. `tools/list` advertised `web_search` only; no remote `web_fetch` was observed. This establishes a working backend search path for that account/environment, not arbitrary-URL full-page fetch, all account-policy branches, or Windows package qualification.
+
+Static canonical AWS SDK 1.0.45 schema evidence `ev_ce7668f08601a63eee8a88a2743928102734e20de3a8ce0b4a26947fcf9af55c` establishes that InvokeMCP's `profileArn` is bound to `x-amzn-kiro-profile-arn`, not a JSON body field. The client sends bearer authentication, that profile header when present, and JSON-RPC `tools/call` with `name: web_search` and `arguments: { query }`. This narrow wire-binding claim is not full SDK reconstruction.
+
+The implementation accepts 1–200 Unicode code points, caps each search response at 1 MiB, preserves source URLs/snippets and source-specific `maxVerbatimWordLimit`, and rejects malformed/mismatched RPC responses. HTTP requests go only to the supported regional Kiro runtime `/mcp`; redirects are disabled. Returned source URLs are data, never follow-up HTTP targets. There is no Exa/Brave/direct-website fallback or invented `web_fetch`. The target therefore needs approved Kiro runtime/auth connectivity (including any deployment proxy/gateway and trust roots), not direct connectivity to result websites. Other workspace/MCP tools are outside that client's network boundary.
+
+Public OMP 18.12.6 source was reviewed for the extension contract: `ToolDefinition` takes `parameters` and `execute(toolCallId, params, signal, onUpdate, ctx)` returning `content` plus `details`; the injected `pi.zod` facade supports `refine`, `describe`, and strict objects. The HTTP extension registers a single essential `web_search` with read approval. OMP's registry replaces same-named built-ins, rather than exposing two search tools; this implementation never calls the replaced native tool. Native Paseo marks search read-only, retaining Plan-mode access. Static contract review and controlled tests are not an actual new OMP-to-production search execution; JSON schema emission cannot encode the Unicode/blank refinement, so runtime validation remains authoritative.
+
+Retry ownership is deliberately split: the OMP adapter passes one generation attempt and leaves recovery/committed-text continuation to OMP. Native Paseo uses the bounded shared transport policy and an `onRestart` callback that clears provisional text. Tool calls remain buffered until an attempt completes and validates; no host tool execution or entire tool turn is wrapped in transport retry. The selected model and serialized logical request remain unchanged. A lost generation response may nevertheless represent already-billed upstream work; retry can produce another cloud charge, and no exactly-once inference claim is made.
+
+Metadata/search retries cover selected transient network failures and HTTP 408/429/500/502/503/504, subject to finite attempt/backoff/Retry-After limits. Native generation also recognizes selected service exceptions, but retries after published text require its explicit restart callback. TLS/certificate failures, cancellation, authentication/permission/quota rejection, malformed frames/JSON, and incomplete tools are not retried. Refresh only retries explicit 429/503, not a dropped response that might have rotated credentials; initiation and authorization-token acquisition are single-attempt.
+
+An event-stream clean EOF between valid frames is an unresolved transport edge: there is no authenticated terminal marker in this reconstruction. After at least one event and complete buffered tools it may be accepted as completion even if text is truncated; partial frames and stream exceptions are detected separately. Search responses must still form complete JSON. The current account's known exhausted generation quota prevented new live generation probes; it was not spent re-confirming that failure. Latest source changes await isolated CI, not local checks under severe memory pressure.
+
 
 ## Account quota and slash commands
 
@@ -109,6 +127,8 @@ Issuer region is not inference-runtime region. Enterprise approval, successful l
 ### Managed store, refresh, and migration
 
 The HTTP transport now uses a separate owner-only SQLite store. Login acquisition returns credentials in memory; only the parent storage layer persists them. No OS keychain or CLI installation is required. Compare-and-swap guards refresh and pending-login races; logout writes a tombstone so an older pending operation cannot restore credentials.
+
+The managed path is `$XDG_CONFIG_HOME/omp-kiro/auth.sqlite3`, defaulting to `~/.config/omp-kiro/auth.sqlite3` on both POSIX and Windows. An absolute `OMP_KIRO_AUTH_FILE` overrides it; login `--auth-file` and the later host must identify the same store. A portable package must supply its intended private path explicitly, not rely on implicit discovery beside its executable.
 
 CLI SQLite is now an explicit read-only social-import source, not an implicit runtime fallback. Original schema/field evidence remains relevant to import:
 

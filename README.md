@@ -11,6 +11,7 @@ HTTP authentication, model discovery, and generation do not require a Kiro execu
 - **Standalone authentication:** Node.js **22.13+**. Bun's SQLite is used inside OMP.
 - **ACP only:** an authenticated `kiro-cli` supporting HTTP MCP servers; developed with **Kiro CLI 2.28.0**.
 - Available Kiro account quota. This project does not bypass subscription limits.
+- Approved outbound HTTPS connectivity to Kiro runtime, management, and login services, directly or through the deployment's approved proxy/gateway and CA configuration. Search needs no direct access to external result websites.
 
 ## Install
 
@@ -96,6 +97,8 @@ This removes local browser-launch, callback-port, CLI installation, and keychain
 
 HTTP uses its own SQLite file at `$XDG_CONFIG_HOME/omp-kiro/auth.sqlite3`, or `~/.config/omp-kiro/auth.sqlite3` when XDG is unset. `OMP_KIRO_AUTH_FILE` must be an absolute path. Login's `--auth-file` selects a custom file; use the same file for later OMP/Paseo sessions.
 
+On Windows the unset-XDG default is `<user-home>/.config/omp-kiro/auth.sqlite3`, not a CLI/AppData credential path. For a portable deployment, set `OMP_KIRO_AUTH_FILE` to its private absolute store path for both login and the OMP/Paseo process. The plugin never discovers a portable package's sibling auth file implicitly.
+
 ```bash
 npx github:emotionbug/omp-kiro auth status --json
 npx github:emotionbug/omp-kiro auth logout
@@ -136,7 +139,7 @@ paseo usage --refresh --home "$HOME/.paseo"
 
 Select **Kiro HTTP** when creating an agent. Paseo model IDs are the live upstream IDs, such as `auto`; the `kiro-http/` prefix belongs to OMP model selectors, not the native Paseo model field. No static model list needs updating.
 
-The agent streams responses and executes workspace read/list/write/edit/shell tools and the MCP servers Paseo injects. **Ask** requests approval before changes, commands, and MCP calls; **Plan** permits workspace reads only; **Full access** executes without per-call approval. Exact MCP preapproval does not approve another server/tool or native filesystem commands. These modes are not an OS sandbox.
+The agent streams responses and executes workspace read/list/write/edit/shell tools, managed Kiro search, and the MCP servers Paseo injects. **Ask** requests approval before changes, commands, and MCP calls; **Plan** permits workspace reads and read-only Kiro search; **Full access** executes without per-call approval. Exact MCP preapproval does not approve another server/tool or native filesystem commands. These modes are not an OS sandbox.
 
 Native sessions persist owner-private history under `$XDG_STATE_HOME/omp-kiro/paseo`, defaulting to `~/.local/state/omp-kiro/paseo`. Restore replays stable message/tool IDs and command rows. Images, file attachments, steering, and OMP-specific compaction/subagent machinery are not implemented by the native provider.
 
@@ -198,7 +201,23 @@ Without an OMP session ID, the adapter uses a bounded short-lived session. Activ
 
 Generation uses the current Kiro runtime HTTPS endpoint; model discovery uses the management endpoint. OMP tools become native tool specifications, assistant tool uses, and actual tool results. OMP system-prompt arrays become a native system string; developer instructions are included there with role labels and original message positions because upstream has no separate developer-history variant.
 
-The transport decodes checksum-validated AWS event-stream frames, assembles interleaved tool argument fragments, and forwards text, reported usage, errors, and cancellation. It does not execute tools, retry generation, replace models, or fall back to ACP. OMP or the native Paseo provider performs approved tool execution. Region routing is restricted to the artifact-backed US East and EU Central Kiro endpoint families.
+The transport decodes checksum-validated AWS event-stream frames, assembles interleaved tool argument fragments, and forwards text, reported usage, errors, and cancellation. OMP or the native Paseo provider performs approved tool execution; the transport never executes tools, replaces the selected model, or falls back to ACP. Region routing is restricted to the artifact-backed US East and EU Central Kiro endpoint families.
+
+**Retry ownership:** the OMP extension makes one generation attempt per host invocation; OMP owns recovery and committed-text continuation. The native Paseo provider instead uses the shared bounded transport retry policy. Before retrying an interrupted native response, it replaces provisional text and discards buffered tool calls. Tools execute only after the successful response is decoded and validated; completed host tools and entire multi-tool turns are never replayed by the transport. Retries retain the exact model and logical request, not a new user prompt.
+
+Shared HTTP metadata/search calls retry selected transient network failures and HTTP 408/429/500/502/503/504. Defaults are three total attempts, 500 ms exponential backoff capped at 10 s, and a 45 s response-data timeout. `OMP_KIRO_HTTP_MAX_ATTEMPTS` accepts 1–5, `OMP_KIRO_HTTP_RETRY_BASE_MS` and `OMP_KIRO_HTTP_RETRY_MAX_MS` accept 0–30000, and `OMP_KIRO_HTTP_IDLE_TIMEOUT_MS` accepts 1–300000. Retry-After is honored only within the delay cap; a longer service delay fails instead of retrying early. OMP generation attempt count remains one regardless of this environment setting.
+
+Cancellation, TLS/certificate failures, authentication/permission failures, known quota rejection, malformed frames/JSON, and incomplete tool calls are not plugin-retryable. OAuth refresh retries only explicit HTTP 429/503, never an ambiguous lost response that might already have rotated credentials. Login initiation and token acquisition are single-attempt. **A generation request may already have been processed and charged before its response is lost; a retry can incur another cloud charge.** Neither buffering tools nor retaining a conversation ID establishes upstream exactly-once generation.
+
+**Clean EOF limitation:** an abrupt stream exception or partial frame is detected, but a clean EOF exactly between valid frames has no authenticated end-of-response marker in this reconstruction. If at least one event arrived and all buffered tools are complete, it can be accepted as completion even when text was cut short. No transparent retry or complete-answer guarantee is claimed for that case.
+
+### Managed backend web search
+
+In HTTP mode, the OMP extension registers one `web_search` override using the host's extension-tool contract; it does not delegate to OMP's native external search provider. The native Paseo provider exposes the same read-only search, including Plan mode. Queries contain 1–200 Unicode characters.
+
+The search client sends authenticated JSON-RPC `tools/call` requests for `web_search` to the selected Kiro runtime's `/mcp`, using the managed bearer login and the profile header. Returned source URLs, snippets, dates, and `maxVerbatimWordLimit` are retained. It does **not** open or fetch those URLs, follow redirects, or fall back to Exa, Brave, or direct website retrieval. This is backend search, **not arbitrary-URL full-page fetch**. The observed remote tool inventory advertised `web_search` only, not `web_fetch`; the plugin does not invent that capability. Account/organization web-tool policy can reject search independently of model catalog access.
+
+The target machine still needs approved Kiro service/proxy/gateway access and any login/refresh access its credentials require. Kiro's service performs the web search; external result websites need not be reachable from the search client. This restriction describes this search implementation, not a network sandbox for other host tools or user-configured MCP servers.
 
 ### Shared limits
 
@@ -219,11 +238,13 @@ npm run lint
 npm test
 ```
 
-The Node suite exercises child/HTTP handoffs, native workspace and real HTTP/stdio MCP effects, exact approval boundaries, restoration, cancellation/process cleanup, synthetic SQLite credentials, refresh races, event framing, and model routing. Tests do not use account prompt quota.
+The Node suite covers child/HTTP handoffs, native workspace and real HTTP/stdio MCP effects, exact approval boundaries, restoration, cancellation/process cleanup, synthetic SQLite credentials, refresh races, event framing, model routing, retry boundaries, and Kiro-only search requests that never fetch source URLs. Tests do not use account prompt quota.
 
 Actual OMP RPC verified command output, 22 live models, and a real session model change without generation. An isolated Paseo daemon loaded the directory plugin and exercised a controlled HTTP write/tool-result loop, denied writes, approved injected MCP, and restoration with identical provider items and all query user rows. The rendered usage surface uses the standard Paseo panel. Main-daemon native catalog and account usage were also checked without restarting it.
 
 Live independent Google/GitHub device initiation and pending polling, plus Builder ID registration/device initiation, succeeded without browser approval. The actual standalone CLI also obtained a live verification link with Kiro absent from its `PATH`, then cancelled cleanly without saving credentials. A controlled CLI-to-OMP smoke exercised approval responses, private persistence, refresh rotation, actual Bun consumption, and logout. Successful new production approval/token issuance, enterprise approval, and inference using newly issued credentials remain unverified; they require user approval and service entitlement.
+
+A live authenticated Kiro `/mcp` smoke completed naturally with ten real search results, preserving source attribution; its tool inventory exposed only `web_search`. That is live search evidence, not successful model generation, arbitrary-page fetch, or end-to-end Windows package qualification. The newest retry/search changes still require the isolated CI checks above; they were not run locally under the current memory constraint.
 
 **Real-provider generation remains unverified** because the account's monthly quota is known exhausted; it was not retried. The new generation payload's `systemPrompt` field/type is artifact-supported reconstruction, not captured live request acceptance. See [REA findings and evidence boundaries](docs/reverse-engineering.md).
 
