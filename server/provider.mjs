@@ -8,7 +8,8 @@ import {
   ProviderEventSchema,
 } from "@getpaseo/plugin/server/provider";
 import { createHttpTransport, discoverHttpModels } from "./http.mjs";
-import { authFilePath, loadKiroAuth } from "./auth.mjs";
+import { authFilePath, loadKiroAuth, readKiroAuth } from "./auth.mjs";
+import { readKiroModelCatalog } from "./model-catalog.mjs";
 import { getKiroCommands, executeKiroQuery } from "./commands.mjs";
 import { fetchKiroUsage } from "./usage.mjs";
 import { createWorkspaceTools } from "./tools.mjs";
@@ -102,14 +103,24 @@ function createConnection(request, options) {
     return promise;
   };
   const env = request.launch?.env ?? {};
-  const catalog = async (effectiveEnv, signal) => {
+  const catalogModels = async (effectiveEnv, signal, authProvider) => {
     const authFile = authFilePath(undefined, effectiveEnv);
-    const models = await discoverHttpModels({
+    if (effectiveEnv.OMP_KIRO_MODEL_CATALOG_FILE !== undefined) {
+      const auth = await readKiroAuth({ authFile, signal });
+      const models = await readKiroModelCatalog(effectiveEnv.OMP_KIRO_MODEL_CATALOG_FILE, { auth });
+      signal?.throwIfAborted();
+      return models;
+    }
+    return discoverHttpModels({
       signal,
       fetchImpl: options.fetchImpl,
       retry: options.retry,
-      authProvider: (params) => (options.authProvider ?? loadKiroAuth)({ ...params, authFile }),
+      authProvider: authProvider ??
+        ((params) => (options.authProvider ?? loadKiroAuth)({ ...params, authFile })),
     });
+  };
+  const catalog = async (effectiveEnv, signal) => {
+    const models = await catalogModels(effectiveEnv, signal);
     return models.map((model) => ({
       id: model.id,
       label: model.name,
@@ -521,17 +532,14 @@ function createConnection(request, options) {
         throw new Error("Unknown Kiro permission mode");
       const stat = await fs.stat(config.cwd);
       if (!stat.isDirectory()) throw new Error("Session workspace is not a directory");
-      const discover = await discoverHttpModels({
-        signal: controller.signal,
-        fetchImpl: options.fetchImpl,
-        retry: options.retry,
-        authProvider,
-      });
+      const discover = await catalogModels(config.env, controller.signal, authProvider);
       session.models = discover.map((model) => ({
         id: model.id,
         label: model.name,
         ...(model.contextWindow ? { contextWindowMaxTokens: model.contextWindow } : {}),
       }));
+      if (!session.models.some((model) => model.id === session.model))
+        throw new Error("Select an exact Kiro model ID from the account catalog");
       session.mcp = await connectMcpTools(config, { signal: controller.signal });
       session.tools = [
         ...createWorkspaceTools(config),
@@ -766,7 +774,7 @@ function createConnection(request, options) {
           changes.model !== undefined &&
           (!changes.model || !session.models.some((model) => model.id === changes.model))
         )
-          throw new Error("Select an exact live Kiro model ID");
+          throw new Error("Select an exact Kiro model ID from the account catalog");
         if (changes.mode !== undefined && !MODES.some((mode) => mode.id === changes.mode))
           throw new Error("Unknown Kiro permission mode");
         const previous = { model: session.model, mode: session.mode };

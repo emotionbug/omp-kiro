@@ -4,6 +4,8 @@ import { discoverHttpModels, runHttpTurn } from "./server/http.mjs";
 import { registerKiroCommands } from "./server/commands.mjs";
 import { isTransientNetworkError, isTlsError } from "./server/network.mjs";
 import { registerKiroWebSearch } from "./server/web.mjs";
+import { readKiroAuth } from "./server/auth.mjs";
+import { readKiroModelCatalog } from "./server/model-catalog.mjs";
 
 function streamKiro(model, context, options = {}, transport) {
   const stream = new AssistantMessageEventStream();
@@ -90,7 +92,20 @@ function streamKiro(model, context, options = {}, transport) {
   return stream;
 }
 
-export default function kiroExtension(pi) {
+function providerModels(models) {
+  return models.map(({ id, name, contextWindow, maxTokens }) => ({
+    id,
+    name: `Kiro · ${name}`,
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    // ACP omits numeric limits; HTTP uses advertised limits when supplied.
+    contextWindow: contextWindow ?? 128000,
+    maxTokens: maxTokens ?? 16000,
+  }));
+}
+
+export default async function kiroExtension(pi) {
   const transport = process.env.OMP_KIRO_TRANSPORT || "acp";
   if (transport !== "acp" && transport !== "http") {
     throw new Error("OMP_KIRO_TRANSPORT must be acp or http");
@@ -104,24 +119,22 @@ export default function kiroExtension(pi) {
   });
   pi.on("session_before_switch", (_event, ctx) => closeSession(ctx.sessionManager.getSessionId()));
   const provider = transport === "http" ? "kiro-http" : "kiro-cli";
+  const catalogFile = process.env.OMP_KIRO_MODEL_CATALOG_FILE;
+  const models = transport === "http" && catalogFile !== undefined
+    ? providerModels(await readKiroModelCatalog(catalogFile, { auth: await readKiroAuth() }))
+    : undefined;
   pi.registerProvider(provider, {
     baseUrl: "https://kiro-cli.invalid/",
     apiKey: "kiro-cli-managed-auth",
     api: `kiro-cli-${transport}`,
+    // A configured account snapshot is authoritative. Advertising a dynamic
+    // callback lets host offline refresh replace it with an empty dynamic set.
+    ...(models !== undefined ? { models } : {
+      async fetchDynamicModels() {
+        return providerModels(await (transport === "http" ? discoverHttpModels() : discoverModels()));
+      },
+    }),
     streamSimple: (model, context, options) => streamKiro(model, context, options, transport),
-    async fetchDynamicModels() {
-      const models = await (transport === "http" ? discoverHttpModels() : discoverModels());
-      return models.map(({ id, name, contextWindow, maxTokens }) => ({
-        id,
-        name: `Kiro · ${name}`,
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        // ACP omits numeric limits; HTTP uses advertised limits when supplied.
-        contextWindow: contextWindow ?? 128000,
-        maxTokens: maxTokens ?? 16000,
-      }));
-    },
   });
   if (transport === "http") registerKiroWebSearch(pi);
   registerKiroCommands(pi, { transport });

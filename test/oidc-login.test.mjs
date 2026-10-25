@@ -534,6 +534,6 @@ test("OIDC refresh reports a permanent grant failure immediately even when HTTP 
       calls++;
       return error("invalid_grant", 503);
     },
-  }), { code: "invalid_grant" });
+  }), { code: "login_expired" });
   assert.equal(calls, 1);
 });
