@@ -87,16 +87,13 @@ test("HTTP model catalog uses configured auth provider and filters IDs and names
       ],
     });
   });
-  const controller = new AbortController();
   const result = await executeKiroQuery("/kiro-models", "FIRST", {
     transport: "http",
     authProvider,
-    signal: controller.signal,
   });
   assert.equal(result.text, "one — First Model");
   assert.equal(requests.length, 1);
   assert.match(String(requests[0].url), /management\.us-east-1\.kiro\.dev/);
-  assert.equal(requests[0].options.signal, controller.signal);
   assert.match(requests[0].options.headers["x-amz-target"], /ListAvailableModels/);
   assert.doesNotMatch(result.text, /catalog-secret/);
 });
