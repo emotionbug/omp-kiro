@@ -1,4 +1,4 @@
-import { setTimeout as delay } from "node:timers/promises";
+import timers from "node:timers/promises";
 
 const transientStatuses = new Set([408, 429, 500, 502, 503, 504]);
 const transientCodes = new Set([
@@ -167,7 +167,7 @@ export async function retryOperation(operation, {
         // Node timers overflow above 2^31-1 ms; preserve long server deadlines.
         for (let remaining = wait; remaining > 0;) {
           const chunk = Math.min(remaining, 2_147_483_647);
-          await delay(chunk, undefined, { signal });
+          await timers.setTimeout(chunk, undefined, { signal });
           remaining -= chunk;
         }
       } catch (error) {

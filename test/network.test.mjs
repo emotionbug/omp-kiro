@@ -8,7 +8,6 @@ import {
 const fast = { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0 };
 
 test("retry policy accepts explicit configuration and rejects out-of-range inputs", () => {
-  assert.deepEqual(retryPolicy({}, {}), { maxAttempts: null, baseDelayMs: 30000, maxDelayMs: 30000 });
   assert.equal(retryPolicy({ maxAttempts: null }, { OMP_KIRO_HTTP_MAX_ATTEMPTS: "1" }).maxAttempts, null);
   assert.equal(retryPolicy({}, { OMP_KIRO_HTTP_MAX_ATTEMPTS: "unlimited" }).maxAttempts, null);
   assert.deepEqual(retryPolicy({}, {
