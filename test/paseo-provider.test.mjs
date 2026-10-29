@@ -1001,60 +1001,219 @@ test("query user rows retain optimistic IDs across restoration without entering 
   );
 });
 
-test("native HTTP restarts provisional output without executing buffered tools twice", async (t) => {
-  let brokenStream;
-  const command = `${JSON.stringify(process.execPath)} -e "require('fs').appendFileSync('retry-count.txt','x')"`;
-  const h = await harness(t, (_body, count) => {
-    if (count === 1) {
-      return new Response(
-        new ReadableStream({
-          start(controller) {
-            brokenStream = controller;
-            controller.enqueue(frame("assistantResponseEvent", { content: "provisional output" }));
-            controller.enqueue(
-              frame("toolUseEvent", {
-                toolUseId: "discarded-call",
-                name: "run_command",
-                input: JSON.stringify({ command }),
-                stop: true,
-              }),
-            );
-          },
+test("native HTTP continues accepted snapshots through a real disconnect without replaying tools", async (t) => {
+  const requests = [];
+  let brokenResponse;
+  const command = (text) =>
+    `${JSON.stringify(process.execPath)} -e "require('fs').appendFileSync('retry-count.txt','${text}')"`;
+  const server = createServer(async (request, response) => {
+    let bytes = "";
+    for await (const chunk of request) bytes += chunk;
+    requests.push(JSON.parse(bytes));
+    response.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" });
+    if (requests.length === 1) {
+      response.end(Buffer.concat([
+        frame("assistantResponseEvent", { content: "Working" }),
+        frame("toolUseEvent", {
+          toolUseId: "completed-call", name: "run_command",
+          input: JSON.stringify({ command: command("x") }), stop: true,
         }),
-      );
+      ]));
+    } else if (requests.length === 2) {
+      brokenResponse = response;
+      response.write(Buffer.concat([
+        frame("toolUseEvent", {
+          toolUseId: "discarded-call", name: "run_command",
+          input: JSON.stringify({ command: command("discarded") }), stop: true,
+        }),
+        frame("toolUseEvent", {
+          toolUseId: "fragmented-call", name: "run_command", input: '{"command":',
+        }),
+        // Seeing this snapshot proves the preceding buffered tool events were decoded.
+        frame("assistantResponseEvent", { content: "Accepted prefix " }),
+      ]));
+    } else if (requests.length === 3) {
+      response.end(Buffer.concat([
+        frame("assistantResponseEvent", { content: "and recovered" }),
+        frame("toolUseEvent", {
+          toolUseId: "recovery-call", name: "run_command",
+          input: JSON.stringify({ command: command("y") }), stop: true,
+        }),
+      ]));
+    } else {
+      response.end(frame("assistantResponseEvent", {
+        content: requests.length === 4 ? "Final answer" : "Resumed coherently",
+      }));
     }
-    if (count === 2) return toolResponse("run_command", { command }, "successful-call");
-    return textResponse("Recovered without repeating the command");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const h = await harness(t, () => {
+    throw new Error("Generation must use the real loopback HTTP server");
+  }, {
+    retry: { maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 1 },
+    fetchImpl: async (_url, init) => {
+      if (init.headers["x-amz-target"] === "KiroControlPlaneBearerService.ListAvailableModels")
+        return Response.json({ models: [{ modelId: "model-a", modelName: "Model A" }] });
+      assert.equal(
+        init.headers["x-amz-target"],
+        "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+      );
+      return fetch(`http://127.0.0.1:${server.address().port}/`, init);
+    },
   });
   const opened = await h.open();
-  const turn = await h.prompt("Run the command once");
+  const turn = await h.prompt("Run each accepted command once");
   await h.waitFor(
     (event) =>
       event.type === "timeline.item" &&
       event.item.type === "assistant_message" &&
-      event.item.text === "provisional output",
+      event.item.text === "Accepted prefix ",
   );
-  brokenStream.error(Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }));
-  assert.equal((await h.terminal(turn)).state, "completed");
   assert.equal(await fs.readFile(path.join(h.cwd, "retry-count.txt"), "utf8"), "x");
-  assert.equal(h.requests.length, 3);
-  assert.deepEqual(h.requests[1], h.requests[0], "restart preserves the model and logical request");
-  assert.ok(
-    h.requests.every(
-      (request) => request.conversationState.currentMessage.userInputMessage.modelId === "model-a",
-    ),
+  brokenResponse.destroy();
+  assert.equal((await h.terminal(turn)).state, "completed");
+  assert.equal(await fs.readFile(path.join(h.cwd, "retry-count.txt"), "utf8"), "xy");
+  assert.equal(requests.length, 4);
+
+  const wireMessages = (body) =>
+    [...body.conversationState.history, body.conversationState.currentMessage];
+  const wireResults = (body) => wireMessages(body).flatMap(
+    (message) => message.userInputMessage?.userInputMessageContext?.toolResults ?? [],
   );
-  const executed = h.events.filter(
-    (event) =>
-      event.type === "timeline.item" &&
-      event.item.type === "tool_call" &&
+  const wireCalls = (body) => wireMessages(body).flatMap(
+    (message) => message.assistantResponseMessage?.toolUses ?? [],
+  );
+  for (const body of requests) {
+    assert.equal(body.conversationState.conversationId, requests[0].conversationState.conversationId);
+    assert.equal(body.conversationState.currentMessage.userInputMessage.modelId, "model-a");
+    assert.equal(body.systemPrompt, requests[0].systemPrompt);
+    assert.ok(!JSON.stringify(body).includes("discarded-call"));
+    assert.ok(!JSON.stringify(body).includes("fragmented-call"));
+  }
+  const retry = requests[2];
+  assert.equal(
+    wireMessages(retry).filter(
+      (message) => message.assistantResponseMessage?.content === "Accepted prefix ",
+    ).length,
+    1,
+    "the retry wire carries the already accepted prefix exactly once",
+  );
+  assert.deepEqual(wireResults(retry).map((result) => result.toolUseId), ["completed-call"]);
+  assert.equal(wireResults(retry)[0].status, "success");
+  assert.deepEqual(wireCalls(retry).map((call) => call.toolUseId), ["completed-call"]);
+  assert.equal(
+    retry.conversationState.currentMessage.userInputMessage.userInputMessageContext.toolResults,
+    undefined,
+    "completed results move to history instead of being copied into the continuation",
+  );
+  assert.deepEqual(
+    retry.conversationState.history.slice(0, -1),
+    requests[1].conversationState.history.concat(requests[1].conversationState.currentMessage),
+  );
+  assert.deepEqual(
+    retry.conversationState.currentMessage.userInputMessage.userInputMessageContext.tools,
+    requests[1].conversationState.currentMessage.userInputMessage.userInputMessageContext.tools,
+  );
+  assert.deepEqual(
+    wireResults(requests[3]).map((result) => result.toolUseId),
+    ["completed-call", "recovery-call"],
+  );
+
+  const snapshots = h.events
+    .filter((event) => event.type === "timeline.item" && event.item.type === "assistant_message")
+    .map((event) => event.item);
+  assert.deepEqual(
+    snapshots.map((snapshot) => snapshot.text),
+    ["Working", "Accepted prefix ", "Accepted prefix and recovered", "Final answer"],
+  );
+  const displayed = new Map();
+  for (const snapshot of snapshots) {
+    const previous = displayed.get(snapshot.messageId) ?? "";
+    assert.ok(snapshot.text.startsWith(previous), "append-only consumers never need a retraction");
+    assert.ok(snapshot.text.length > previous.length, "retries emit no empty reset snapshot");
+    displayed.set(snapshot.messageId, previous + snapshot.text.slice(previous.length));
+  }
+  assert.equal(snapshots[1].messageId, snapshots[2].messageId);
+  assert.equal(displayed.get(snapshots[1].messageId), "Accepted prefix and recovered");
+  assert.equal(
+    h.events.filter((event) =>
+      event.type === "timeline.item" && event.item.type === "notification" &&
+      event.item.id.startsWith("network-retry:"),
+    ).length,
+    1,
+  );
+  assert.deepEqual(
+    h.events.filter((event) =>
+      event.type === "timeline.item" && event.item.type === "tool_call" &&
       event.item.status === "completed",
+    ).map((event) => event.item.callId),
+    ["completed-call", "recovery-call"],
   );
-  assert.deepEqual(executed.map((event) => event.item.callId), ["successful-call"]);
+  assert.equal(
+    h.events.filter((event) =>
+      event.type === "session.turn" && event.turnId === turn && event.state !== "started",
+    ).length,
+    1,
+  );
   const key = opened.persistence.data.nativeSessionId;
   const saved = JSON.parse(await fs.readFile(path.join(h.root, "state", `${key}.json`), "utf8"));
-  assert.ok(!JSON.stringify(saved).includes("provisional output"));
+  assert.equal(saved.model, "model-a");
+  assert.deepEqual(
+    saved.messages.filter((message) => message.role === "assistant")
+      .flatMap((message) => message.content.filter((part) => part.type === "text"))
+      .map((part) => part.text),
+    ["Working", "Accepted prefix and recovered", "Final answer"],
+  );
+  assert.deepEqual(
+    saved.messages.filter((message) => message.role === "toolResult")
+      .map((message) => message.toolCallId),
+    ["completed-call", "recovery-call"],
+  );
   assert.ok(!JSON.stringify(saved).includes("discarded-call"));
+  assert.ok(!JSON.stringify(saved).includes("fragmented-call"));
+  assert.ok(!JSON.stringify(saved).includes("Continue your response exactly"));
+  assert.deepEqual(
+    saved.timeline.filter((entry) => entry.type === "assistant_message")
+      .map((entry) => [entry.messageId, entry.text]),
+    [...displayed],
+  );
+  await h.connection.send({
+    type: "session.close", requestId: "close-recovered-session", sessionId: "session",
+  });
+  await h.waitFor((event) =>
+    event.type === "request.completed" && event.requestId === "close-recovered-session",
+  );
+  await h.open({ model: undefined, mode: undefined }, opened.persistence, "restored-recovery");
+  assert.deepEqual(
+    h.events.filter((event) =>
+      event.type === "timeline.item" && event.sessionId === "restored-recovery" &&
+      event.item.type === "assistant_message",
+    ).map((event) => [event.item.messageId, event.item.text]),
+    [...displayed],
+  );
+  assert.equal(
+    (await h.terminal(await h.prompt("Continue after reconnect", "restored-recovery"))).state,
+    "completed",
+  );
+  assert.equal(requests.length, 5);
+  const restored = requests[4];
+  assert.equal(restored.conversationState.conversationId, requests[0].conversationState.conversationId);
+  assert.equal(restored.conversationState.currentMessage.userInputMessage.modelId, "model-a");
+  assert.deepEqual(
+    wireResults(restored).map((result) => result.toolUseId),
+    ["completed-call", "recovery-call"],
+  );
+  assert.deepEqual(
+    wireMessages(restored).flatMap((message) =>
+      message.assistantResponseMessage ? [message.assistantResponseMessage.content] : [],
+    ),
+    ["Working", "Accepted prefix and recovered", "Final answer"],
+  );
+  assert.equal(await fs.readFile(path.join(h.cwd, "retry-count.txt"), "utf8"), "xy");
 });
 
 test("Paseo plan mode executes managed Kiro search and returns source attribution to the model", async (t) => {

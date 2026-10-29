@@ -272,11 +272,10 @@ function createConnection(request, options) {
               parameters,
             })),
           },
-          onRestart: ({ attempt, maxAttempts }) => {
+          // Paseo consumes append-only text deltas; accepted snapshots cannot be retracted.
+          continuePartial: true,
+          onRetry: ({ attempt, maxAttempts }) => {
             signal.throwIfAborted();
-            // No tools from this provisional response execute until transport succeeds.
-            responseText = "";
-            item(session, { type: "assistant_message", id: messageId, messageId, text: "" });
             item(session, {
               type: "notification",
               id: `network-retry:${turnId}:${step}`,
