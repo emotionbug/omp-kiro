@@ -280,6 +280,65 @@ test("new sessions default to full access and execute real writes and commands w
     .map((event) => event.item.callId), ["default-write", "default-command"]);
 });
 
+test("absolute Unicode tool paths through a workspace alias resolve to the same physical workspace", async (t) => {
+  let calls;
+  const h = await harness(t, (body, count) => {
+    if (count > 1) {
+      const results = body.conversationState.currentMessage.userInputMessage.userInputMessageContext.toolResults;
+      assert.equal(results[0].status, "success", results[0].content[0].text);
+    }
+    const call = calls[count - 1];
+    return call ? toolResponse(call[0], call[1], `alias-${count}`) : textResponse("Alias tools completed");
+  });
+  const alias = path.join(h.root, "workspace alias 작업");
+  // Junctions exercise actual Windows canonicalization without requiring symlink privileges.
+  await fs.symlink(h.cwd, alias, process.platform === "win32" ? "junction" : "dir");
+  const output = path.join(alias, "chain result 한글.txt");
+  assert.equal(await fs.realpath(alias), await fs.realpath(h.cwd));
+  assert.ok(path.relative(await fs.realpath(h.cwd), output).startsWith(`..${path.sep}`));
+  calls = [
+    ["write_file", { path: output, content: "original 한글" }],
+    ["read_file", { path: output }],
+    ["edit_file", { path: output, oldText: "original", newText: "updated" }],
+    ["list_directory", { path: alias }],
+  ];
+  await h.open({ cwd: alias });
+  assert.equal((await h.terminal(await h.prompt())).state, "completed");
+  assert.equal(await fs.readFile(path.join(h.cwd, "chain result 한글.txt"), "utf8"), "updated 한글");
+  assert.equal(h.events.filter((event) => event.type === "timeline.item" &&
+    event.item.type === "tool_call" && event.item.status === "completed").length, calls.length);
+  assert.equal(h.events.filter((event) => event.type === "session.permission").length, 0);
+});
+
+test("absolute aliases do not permit sibling paths, relative traversal, or escaping directory links", async (t) => {
+  let scenarios;
+  const h = await harness(t, (body, count) => {
+    if (count % 2 === 1)
+      return toolResponse("write_file", { path: scenarios[(count - 1) / 2], content: "must not write" }, `escape-${count}`);
+    const results = body.conversationState.currentMessage.userInputMessage.userInputMessageContext.toolResults;
+    assert.equal(results[0].status, "error");
+    assert.match(results[0].content[0].text, /Tool path (?:must stay within|resolves outside) the workspace/);
+    return textResponse("Escape rejected");
+  });
+  const outside = path.join(h.root, "workspace-other");
+  const alias = path.join(h.root, "workspace alias");
+  await fs.mkdir(outside);
+  const linkType = process.platform === "win32" ? "junction" : "dir";
+  await fs.symlink(h.cwd, alias, linkType);
+  await fs.symlink(outside, path.join(h.cwd, "escape"), linkType);
+  scenarios = [
+    path.join(outside, "absolute.txt"),
+    "../relative.txt",
+    path.join(alias, "escape", "linked.txt"),
+    "escape/relative-linked.txt",
+  ];
+  await h.open({ cwd: alias });
+  for (const name of scenarios)
+    assert.equal((await h.terminal(await h.prompt(name))).state, "completed");
+  assert.deepEqual(await fs.readdir(outside), []);
+  await assert.rejects(fs.stat(path.join(h.root, "relative.txt")), { code: "ENOENT" });
+});
+
 test("ask denial does not write, exact approval runs once, and plan rejects writes without approval", async (t) => {
   let phase = 0;
   const h = await harness(t, (body, count) =>

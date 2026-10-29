@@ -83,12 +83,16 @@ export async function stopProcess(child) {
 async function workspacePath(cwd, name, writing = false) {
   const root = await fs.realpath(cwd);
   const candidate = path.resolve(root, name);
-  const within = (value) =>
-    value === root ||
-    (!path.relative(root, value).startsWith(`..${path.sep}`) &&
-      path.relative(root, value) !== ".." &&
-      !path.isAbsolute(path.relative(root, value)));
-  if (!within(candidate)) throw new Error("Tool path must stay within the workspace");
+  const within = (value) => {
+    const relative = path.relative(root, value);
+    return relative === "" ||
+      (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+  };
+  // Absolute paths may spell this same workspace through a Windows short name
+  // or directory alias. Compare them only after realpath resolves that spelling.
+  // Relative traversal still fails before filesystem access, as before.
+  if (!path.isAbsolute(name) && !within(candidate))
+    throw new Error("Tool path must stay within the workspace");
   let resolved;
   try {
     resolved = await fs.realpath(candidate);
