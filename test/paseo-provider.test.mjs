@@ -795,11 +795,12 @@ test("native read/edit/list/command tools execute against the workspace and reta
 
 test("a fresh provider connection resumes durable history and native conversation context", async (t) => {
   const h = await harness(t, (body, count) => {
-    if (count === 2)
-      assert.equal(
-        body.conversationState.history[0].userInputMessage.content,
-        "persist across connections",
-      );
+    if (count === 2) {
+      const { history, currentMessage } = body.conversationState;
+      assert.ok(history[0].userInputMessage.content.endsWith("persist across connections"));
+      assert.equal(history[1].assistantResponseMessage.content, "stored assistant response");
+      assert.equal(currentMessage.userInputMessage.content, "continue");
+    }
     return textResponse(count === 1 ? "stored assistant response" : "resumed assistant response");
   });
   const opened = await h.open();
@@ -945,10 +946,9 @@ test("a closed MCP stdin becomes an open failure and cleans its child without un
 test("query user rows retain optimistic IDs across restoration without entering generation history", async (t) => {
   const h = await harness(t, (body) => {
     assert.deepEqual(body.conversationState.history, []);
-    assert.equal(
-      body.conversationState.currentMessage.userInputMessage.content,
-      "real generation after queries",
-    );
+    const content = body.conversationState.currentMessage.userInputMessage.content;
+    assert.ok(content.endsWith("real generation after queries"));
+    assert.ok(!content.includes("/kiro"), "local query commands stay outside generation input");
     return textResponse("restored context clean");
   });
   const opened = await h.open();

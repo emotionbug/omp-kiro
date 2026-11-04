@@ -115,6 +115,7 @@ test("system prompt arrays precede user input without changing host history", ()
   assert.equal(Object.hasOwn(body, "systemPrompt"), false);
   assert.deepEqual(body.conversationState.history, [], "no fabricated acknowledgement");
   const content = body.conversationState.currentMessage.userInputMessage.content;
+  assert.ok(content.indexOf("First instruction") >= 0);
   assert.ok(content.indexOf("First instruction") < content.indexOf("Second instruction"));
   assert.ok(content.indexOf("Second instruction") < content.indexOf("Hello"));
   assert.deepEqual(input, original);
@@ -142,6 +143,7 @@ test("developer instructions retain labels and order across a native tool handof
   assert.equal(Object.hasOwn(body, "systemPrompt"), false);
   const first = body.conversationState.history[0].userInputMessage.content;
   const current = body.conversationState.currentMessage.userInputMessage.content;
+  assert.ok(first.indexOf(context.systemPrompt) >= 0);
   assert.ok(first.indexOf(context.systemPrompt) < first.indexOf("Use relative paths."));
   assert.ok(first.indexOf("Use relative paths.") < first.indexOf("Read a"));
   assert.ok(!first.includes("Do not repeat the read."));
