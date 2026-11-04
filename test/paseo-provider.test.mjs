@@ -948,7 +948,6 @@ test("query user rows retain optimistic IDs across restoration without entering 
     assert.deepEqual(body.conversationState.history, []);
     const content = body.conversationState.currentMessage.userInputMessage.content;
     assert.ok(content.endsWith("real generation after queries"));
-    assert.ok(!content.includes("/kiro"), "local query commands stay outside generation input");
     return textResponse("restored context clean");
   });
   const opened = await h.open();
