@@ -88,9 +88,10 @@ test("native request preserves system, assistant tool uses and real parallel too
       ],
     },
   });
-  assert.equal(body.systemPrompt, "System instructions");
+  assert.equal(Object.hasOwn(body, "systemPrompt"), false);
+  assert.ok(body.conversationState.history[0].userInputMessage.content.includes(context.systemPrompt));
   assert.equal(body.conversationState.conversationId, "9ab9c10d-fd8d-4d76-b537-7cc0b6b9c5a0");
-  assert.equal(body.conversationState.history[0].userInputMessage.content, "Read both");
+  assert.ok(body.conversationState.history[0].userInputMessage.content.endsWith("Read both"));
   assert.equal(body.conversationState.history[1].assistantResponseMessage.toolUses.length, 2);
   const current = body.conversationState.currentMessage.userInputMessage;
   assert.deepEqual(current.userInputMessageContext.toolResults, [
@@ -104,26 +105,19 @@ test("native request preserves system, assistant tool uses and real parallel too
   assert.equal(current.userInputMessageContext.additionalContext[0].innerContext, "/work");
 });
 
-test("OMP system prompt arrays normalize into one native instruction string", () => {
+test("system prompt arrays precede user input without changing host history", () => {
   const input = {
     model: "model",
     context: { ...context, systemPrompt: ["First instruction", "Second instruction"] },
   };
-  assert.equal(buildHttpRequest(input).systemPrompt, "First instruction\n\nSecond instruction");
-  const withDeveloper = buildHttpRequest({
-    ...input,
-    context: {
-      ...input.context,
-      messages: [
-        { role: "developer", content: "Developer instruction" },
-        ...input.context.messages,
-      ],
-    },
-  });
-  assert.equal(
-    withDeveloper.systemPrompt,
-    "[System instructions]\nFirst instruction\n\nSecond instruction\n\n[Developer instructions at conversation message 1]\nDeveloper instruction",
-  );
+  const original = structuredClone(input);
+  const body = buildHttpRequest(input);
+  assert.equal(Object.hasOwn(body, "systemPrompt"), false);
+  assert.deepEqual(body.conversationState.history, [], "no fabricated acknowledgement");
+  const content = body.conversationState.currentMessage.userInputMessage.content;
+  assert.ok(content.indexOf("First instruction") < content.indexOf("Second instruction"));
+  assert.ok(content.indexOf("Second instruction") < content.indexOf("Hello"));
+  assert.deepEqual(input, original);
 });
 
 test("developer instructions retain labels and order across a native tool handoff", () => {
@@ -145,10 +139,13 @@ test("developer instructions retain labels and order across a native tool handof
     },
   };
   const body = buildHttpRequest(input);
-  assert.equal(
-    body.systemPrompt,
-    "[System instructions]\nSystem instructions\n\n[Developer instructions at conversation message 1]\nUse relative paths.\n\n[Developer instructions at conversation message 4]\nDo not repeat the read.",
-  );
+  assert.equal(Object.hasOwn(body, "systemPrompt"), false);
+  const first = body.conversationState.history[0].userInputMessage.content;
+  const current = body.conversationState.currentMessage.userInputMessage.content;
+  assert.ok(first.indexOf(context.systemPrompt) < first.indexOf("Use relative paths."));
+  assert.ok(first.indexOf("Use relative paths.") < first.indexOf("Read a"));
+  assert.ok(!first.includes("Do not repeat the read."));
+  assert.ok(current.includes("Do not repeat the read."));
   assert.equal(body.conversationState.history.length, 2);
   assert.equal(
     body.conversationState.currentMessage.userInputMessage.userInputMessageContext.toolResults[0]
@@ -167,6 +164,19 @@ test("developer instructions retain labels and order across a native tool handof
     buildHttpRequest({ ...input, sessionId: "different-worker" }).conversationState.conversationId,
     body.conversationState.conversationId,
   );
+});
+
+test("developer instructions cannot manufacture a turn after an assistant response", () => {
+  assert.throws(() => buildHttpRequest({
+    model: "model",
+    context: {
+      messages: [
+        { role: "user", content: "Original request" },
+        { role: "assistant", content: "Completed response" },
+        { role: "developer", content: "A later instruction" },
+      ],
+    },
+  }), /must end with a user message or actual tool results/);
 });
 
 test("framed text and interleaved tool fragments assemble native calls and reported usage", async () => {
@@ -664,7 +674,6 @@ test("OMP continuation survives repeated partial failures and preserves complete
   assert.deepEqual(bodies[5], bodies[6], "no-output outage retries the identical continuation body");
   for (const [index, body] of bodies.entries()) {
     assert.equal(body.profileArn, auth.profile_arn);
-    assert.equal(body.systemPrompt, bodies[0].systemPrompt);
     const state = body.conversationState;
     assert.equal(state.conversationId, bodies[0].conversationState.conversationId);
     const current = state.currentMessage.userInputMessage;
@@ -674,7 +683,8 @@ test("OMP continuation survives repeated partial failures and preserves complete
       bodies[0].conversationState.currentMessage.userInputMessage.userInputMessageContext.tools);
     const userInputs = [...state.history, state.currentMessage]
       .flatMap((message) => message.userInputMessage ? [message.userInputMessage] : []);
-    assert.equal(userInputs.filter((message) => message.content === "Hello").length, 1);
+    assert.equal(userInputs.filter((message) => message.content.endsWith("Hello")).length, 1);
+    assert.equal(userInputs.filter((message) => message.content.includes(context.systemPrompt)).length, 1);
     assert.equal(userInputs.flatMap((message) => message.userInputMessageContext?.toolResults ?? []).length, 1);
     assert.equal(state.history.flatMap((message) => message.assistantResponseMessage?.toolUses ?? []).length, 1);
     assert.ok(!JSON.stringify(body).includes("discard"), "buffered failed tools never become history");

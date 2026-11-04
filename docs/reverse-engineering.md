@@ -126,7 +126,7 @@ Live independent REA probe `ev_13ea00fbbca7a06c8bc0caca60a49794b232bb87b08b3bb19
 
 The exact current CLI clientName/scope vector was not recovered. The implementation uses the live-accepted `Kiro CLI` name and three historical public CodeWhisperer scopes. This proves service acceptance of initiation, **not exact equality with every current CLI registration request or enterprise entitlement**. Primary supplementation: [public Builder ID implementation](https://github.com/aws/amazon-q-developer-cli/blob/15cc8f3cd18c4272925ce1c7053268eedff1ea0a/crates/chat-cli/src/auth/builder_id.rs), [scope constants](https://github.com/aws/amazon-q-developer-cli/blob/15cc8f3cd18c4272925ce1c7053268eedff1ea0a/crates/chat-cli/src/auth/consts.rs), [AWS regional OIDC endpoints](https://docs.aws.amazon.com/general/latest/gr/sso.html#awsssooidcservice_service).
 
-Issuer region is not inference-runtime region. Enterprise approval, successful live OIDC issuance/refresh, and Kiro inference acceptance of newly issued OIDC credentials remain unexercised.
+Issuer region is not inference-runtime region. At this initial capture, enterprise approval, successful live OIDC issuance/refresh, and inference acceptance of newly issued OIDC credentials were unexercised. Subsequent Windows Identity Center profile and real-generation observations are recorded below.
 
 ### Managed store, refresh, and migration
 
@@ -162,9 +162,9 @@ The rendered standard Usage panel displayed the controlled Kiro Pro quota and fr
 
 ## Generation reconstruction and its limits
 
-The direct transport maps native conversation history, tool specifications, assistant tool uses, and actual tool results. It decodes AWS event-stream prelude/header/payload framing with both CRCs. System-prompt arrays normalize to a string. Developer instructions are labeled in that native instruction channel; this is not a claim that upstream has a distinct developer-history role.
+The direct transport maps native conversation history, tool specifications, assistant tool uses, and actual tool results. It decodes AWS event-stream prelude/header/payload framing with both CRCs. The original reconstruction normalized system-prompt arrays into a top-level string and placed labeled developer instructions there; the live 0.4.8 observations below supersede that instruction mapping.
 
-Current artifact `system_prompt`/`systemPrompt` observations support the new top-level field. Its precise serialization and server acceptance remain **artifact-supported inference**, not decompiled or captured generation-request evidence. Current generation endpoint/body acceptance, successful inference, and real generated event sequences were not exercised because the account's monthly quota is exhausted. No generation request was made to re-confirm that error.
+Artifact `system_prompt`/`systemPrompt` observations established field names, **not server acceptance or account feature availability**. At the original capture, successful inference and real generated event sequences were not exercised because that account's monthly quota was exhausted. No generation request was made to re-confirm that error. A different managed Identity Center login subsequently exposed the rejected field and enabled real generation verification below.
 
 The older public generated AWS SDK supplements native conversation/tool/event framing, not current endpoint/origin selection:
 
@@ -173,7 +173,7 @@ The older public generated AWS SDK supplements native conversation/tool/event fr
 - [User context/tool serialization](https://github.com/aws/amazon-q-developer-cli/blob/15cc8f3cd18c4272925ce1c7053268eedff1ea0a/crates/amzn-codewhisperer-streaming-client/src/protocol_serde/shape_user_input_message_context.rs)
 - [Event stream serialization](https://github.com/aws/amazon-q-developer-cli/blob/15cc8f3cd18c4272925ce1c7053268eedff1ea0a/crates/amzn-codewhisperer-streaming-client/src/event_stream_serde.rs)
 
-Controlled HTTP fixtures, synthetic SQLite credentials, and the actual Bun-hosted OMP plugin exercised native payload mapping, fragmented framed responses, actual OMP file writes, returning real tool results, follow-up output, and usage handling. This validates adapter integration, not the unexercised production generation boundary.
+Earlier controlled HTTP fixtures, synthetic SQLite credentials, and the actual Bun-hosted OMP plugin exercised native payload mapping, fragmented framed responses, actual OMP file writes, returning real tool results, follow-up output, and usage handling. Those observations establish adapter integration only; production generation evidence starts in the 0.4.8 section below.
 
 ## Windows IAM profile resolution (0.4.7)
 
@@ -186,3 +186,24 @@ The installed Windows x64 Kiro CLI reported version 2.35.1. REA bound its PE ima
 - After the shared authentication fix, the actual OMP 18.16.0 executable loaded the 0.4.7 extension with `OMP_KIRO_TRANSPORT` absent, ambient extensions disabled, and `OMP_KIRO_COMMAND` pointing to a deliberately nonexistent executable. It returned all 21 `kiro-http` models without invoking Kiro CLI. The selected profile is persisted with compare-and-swap for subsequent HTTP operations.
 
 Controlled regression cases cover unresolved OIDC metadata, one-time persistence, concurrent initialization, identical cross-process resolution, login/logout races, pagination and explicit profile selection, invalid catalogs, and retaining refresh rotation when profile discovery fails. No production generation, purchase, permission grant, CLI logout, or operational-daemon restart was performed.
+
+## Windows real-generation validation (0.4.8)
+
+The user reported HTTP 400 `com.amazon.kiro.runtimeservice#ValidationException: Improperly formed request` for `kiro-http/claude-opus-5.5`. Controlled live requests used the same managed Identity Center account and selected model, synthetic text only, and bounded cancellation:
+
+- A minimal direct HTTP prompt returned `PASEO_KIRO_HTTP_OK`.
+- Adding workspace context alone succeeded.
+- Adding a standard read-tool declaration alone succeeded.
+- Adding the top-level string `systemPrompt` alone returned the reported 400. This isolates that field for this account; it is not evidence that every account rejects it or that model discovery implies generation permission.
+
+The independent [native-context compatibility findings](https://firlab.app/kiro-provider/reference/protocol#_7-native-context-decision) also describe feature-gated `GenerateAssistantResponse.systemPrompt` support. That third-party report supplements, but does not replace, the live observations above.
+
+The shared request builder now retains system instructions once before the first supported user input and keeps labeled developer instructions at their original conversation positions. It does not discard instructions, manufacture an assistant acknowledgement, switch endpoint/model/account, retry a validation error, or fall back to ACP. This is legacy text projection, not a claim of upstream-enforced role priority. Tool approval remains enforced by the host.
+
+Actual installed OMP 18.16.0 verification used the default HTTP plugin with no transport environment setting, a deliberately nonexistent Kiro CLI command, and ephemeral sessions:
+
+1. A custom system-prompt run returned exactly `OMP_OPUS_55_HTTP_OK`.
+2. A run with the default OMP system prompt and default tool catalog returned exactly `OMP_DEFAULT_TOOLS_OK`.
+3. A default-system run with only the read tool enabled executed that real tool once against a temporary file containing an unpredictable marker. The first assistant response ended in `toolUse`; the next ended in `stop` with exactly the file's actual contents. Both responses reported `claude-opus-5.5`.
+
+Syntax, type, and lint checks passed. The HTTP/auth/catalog regression run passed 62 tests with one platform-specific private-file-mode check skipped on Windows. Regression coverage includes instruction ordering without host-history mutation, retained tool-use/result associations, instruction-only input rejection, and instructions retained once across repeated response continuations. No interactive login, native CLI account change, operational-daemon restart, or existing-session termination was performed.

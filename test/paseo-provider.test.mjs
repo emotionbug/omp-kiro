@@ -1090,7 +1090,6 @@ test("native HTTP continues accepted snapshots through a real disconnect without
   for (const body of requests) {
     assert.equal(body.conversationState.conversationId, requests[0].conversationState.conversationId);
     assert.equal(body.conversationState.currentMessage.userInputMessage.modelId, "model-a");
-    assert.equal(body.systemPrompt, requests[0].systemPrompt);
     assert.ok(!JSON.stringify(body).includes("discarded-call"));
     assert.ok(!JSON.stringify(body).includes("fragmented-call"));
   }

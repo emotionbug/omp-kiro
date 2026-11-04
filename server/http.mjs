@@ -54,24 +54,19 @@ function conversationId(sessionId) {
 
 export function buildHttpRequest({ model, context, cwd, sessionId }) {
   const messages = [];
-  const instructions = [];
   const systemPrompt = Array.isArray(context.systemPrompt)
     ? context.systemPrompt.join("\n\n")
     : context.systemPrompt;
-  if (systemPrompt) instructions.push(`[System instructions]\n${systemPrompt}`);
   const userMessage = (content = "") => ({ content, modelId: model, origin: "KIRO_CLI" });
   for (const [index, message] of context.messages.entries()) {
     const content = textContent(message);
-    if (message.role === "developer") {
-      // This service has no developer history variant; retain its priority and
-      // original position explicitly in the native instruction channel.
-      instructions.push(
-        `[Developer instructions at conversation message ${index + 1}]\n${content}`,
-      );
-    } else if (message.role === "user") {
+    if (message.role === "user" || message.role === "developer") {
+      const input = message.role === "developer"
+        ? `[Developer instructions at conversation message ${index + 1}]\n${content}`
+        : content;
       const previous = messages.at(-1)?.userInputMessage;
-      if (previous) previous.content += `${previous.content && content ? "\n\n" : ""}${content}`;
-      else messages.push({ userInputMessage: userMessage(content) });
+      if (previous) previous.content += `${previous.content && input ? "\n\n" : ""}${input}`;
+      else messages.push({ userInputMessage: userMessage(input) });
     } else if (message.role === "assistant") {
       const toolUses =
         typeof message.content === "string"
@@ -106,9 +101,17 @@ export function buildHttpRequest({ model, context, cwd, sessionId }) {
     }
   }
   const currentMessage = messages.pop();
-  if (!currentMessage?.userInputMessage)
+  const lastInput = context.messages.findLast((message) => message.role !== "developer");
+  if (!currentMessage?.userInputMessage || !["user", "toolResult"].includes(lastInput?.role))
     throw new KiroHttpError("Kiro HTTP turn must end with a user message or actual tool results.");
   const current = currentMessage.userInputMessage;
+  if (systemPrompt) {
+    // GenerateAssistantResponse rejects the feature-gated top-level systemPrompt
+    // for ordinary accounts. Preserve host instructions in supported user text,
+    // once before history, without inventing an assistant acknowledgement.
+    const firstInput = messages.find((message) => message.userInputMessage)?.userInputMessage ?? current;
+    firstInput.content = `[System instructions]\n${systemPrompt}\n\n${firstInput.content}`;
+  }
   current.userInputMessageContext ??= {};
   if (context.tools?.length) {
     current.userInputMessageContext.tools = context.tools.map((tool) => ({
@@ -135,13 +138,6 @@ export function buildHttpRequest({ model, context, cwd, sessionId }) {
       history: messages,
       currentMessage,
     },
-    ...(instructions.length
-      ? {
-          systemPrompt: context.messages.some((message) => message.role === "developer")
-            ? instructions.join("\n\n")
-            : systemPrompt,
-        }
-      : {}),
   };
 }
 
