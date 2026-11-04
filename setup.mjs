@@ -290,10 +290,10 @@ Existing settings, other providers, and model defaults are retained.`);
     ? absolutePath(values["omp-command"])
     : values["omp-command"];
   if (!ompCommand) throw new Error("--omp-command must name an executable.");
-  const env = { ...process.env };
+  const env = { ...process.env, OMP_KIRO_TRANSPORT: "acp" };
   const agentDir = values["omp-agent-dir"] || env.PI_CODING_AGENT_DIR;
   if (agentDir) env.PI_CODING_AGENT_DIR = absolutePath(agentDir);
-  const profileEnv = {};
+  const profileEnv = { OMP_KIRO_TRANSPORT: "acp" };
   for (const key of [
     "PI_CODING_AGENT_DIR",
     "OMP_PROFILE",

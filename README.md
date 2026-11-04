@@ -16,13 +16,13 @@ HTTP authentication, model discovery, and generation do not require a Kiro execu
 ## Install
 
 ```bash
-kiro-cli login
 omp install github:emotionbug/omp-kiro
-omp models kiro-cli
-omp --model kiro-cli/auto
+npx github:emotionbug/omp-kiro login --provider google
+omp models kiro-http
+omp --model kiro-http/auto
 ```
 
-For another model, select one returned by `omp models kiro-cli`, using the full `kiro-cli/<model-id>` selector. No API key or change to OMP's default model is required. Start a new OMP session after installing.
+HTTP is the plugin default: no Kiro CLI or `OMP_KIRO_TRANSPORT` setting is required. For another model, select one returned by `omp models kiro-http`, using the full `kiro-http/<model-id>` selector. No API key or change to OMP's default model is required. Start a new OMP session after installing.
 
 For development or the optional Paseo setup, use a local checkout instead:
 
@@ -33,32 +33,32 @@ omp install ./omp-kiro
 
 OMP links local packages, so keep that checkout in place. GitHub-spec installations do not depend on a local checkout.
 
-To use a non-default Kiro executable:
+For explicitly selected ACP, use a non-default Kiro executable:
 
 ```bash
-OMP_KIRO_COMMAND=/absolute/path/to/kiro-cli omp --model kiro-cli/auto
+OMP_KIRO_TRANSPORT=acp OMP_KIRO_COMMAND=/absolute/path/to/kiro-cli omp --model kiro-cli/auto
 ```
 
-This variable names one executable, not a shell command. Kiro authenticates using its own login. OMP/Paseo must run as the same OS user, with the Kiro executable available on `PATH` or through this variable.
+This variable names one executable, not a shell command. ACP uses the CLI's separate login. OMP/Paseo must run as the same OS user, with the Kiro executable available on `PATH` or through this variable. The default HTTP provider never invokes that executable.
 
 ## Choose a transport
 
-The default is `acp`: keep a Kiro process and ACP session for each OMP session, and return real OMP tool results through MCP.
+The default is `http`: authentication, model discovery, and generation use the managed HTTP login without a Kiro process. No environment variable or Paseo launch-environment change is needed.
 
 ```bash
-omp --model kiro-cli/auto
+omp --model kiro-http/auto
 ```
 
-Direct HTTP bypasses the CLI for authentication and generation. Sign in with the standalone command first:
+ACP is opt-in: it keeps a Kiro process and ACP session for each OMP session and returns real OMP tool results through MCP. Authenticate the CLI separately and explicitly select ACP:
 
 ```bash
-npx github:emotionbug/omp-kiro login --provider google
-OMP_KIRO_TRANSPORT=http omp --model kiro-http/auto
+kiro-cli login
+OMP_KIRO_TRANSPORT=acp omp --model kiro-cli/auto
 ```
 
 HTTP is an unofficial, version-dependent protocol. Selecting it does not fall back to ACP on errors and does not bypass account quota. Do not put bearer or refresh tokens in environment variables, OMP configuration, or this repository.
 
-`kiro-cli` and `kiro-http` have separate OMP catalog caches, but their live model ID sets match. Both use the current `KIRO_CLI` origin.
+`kiro-cli` and `kiro-http` have separate OMP catalog caches and authentication stores. Both use the current `KIRO_CLI` origin, but different accounts and enterprise policies can return different model sets. HTTP never falls back to the CLI's account or catalog.
 
 ## Independent HTTP authentication
 
@@ -92,6 +92,19 @@ npx github:emotionbug/omp-kiro login --provider google --flow manual
 Manual mode does not bind a local port. A browser on another host may show a connection error for its loopback redirect; copy that full address from its address bar. It contains a short-lived authorization code: do not share or log it. Both callback modes validate state, exact redirect/provider, and S256 PKCE before exchanging the code. Device mode needs no local callback at all.
 
 This removes local browser-launch, callback-port, CLI installation, and keychain dependencies. It does not bypass corporate network restrictions, TLS validation, disabled provider features, or organization approval policies. The user's original environment-specific CLI failure was not reproduced, so no particular cause is claimed.
+
+### IAM profile resolution
+
+Since 0.4.7, login and HTTP authentication resolve a missing Kiro profile through `ListAvailableProfiles` before requesting models or generation. A single assigned profile is selected and persisted automatically, including for older managed logins that lack `profile_arn`; another browser approval is not required while the login remains valid. The OIDC issuer region stays unchanged and is distinct from the Kiro region encoded in the selected profile ARN.
+
+Multiple profiles are never resolved by arbitrarily picking the first. The CLI reports the available profile ARNs; select one with:
+
+```bash
+npx github:emotionbug/omp-kiro auth profile
+npx github:emotionbug/omp-kiro auth profile --profile "$PROFILE_ARN"
+```
+
+`login --profile "$PROFILE_ARN"` also selects an assigned profile after authentication. Unassigned ARNs and empty catalogs fail explicitly. Profile persistence uses the same compare-and-swap guard as refresh, so lookup cannot overwrite a concurrent login/logout; identical resolution by another process is accepted. Successfully rotated refresh credentials are saved before profile discovery so a later discovery failure cannot discard the rotation. Usage-only reads remain read-only.
 
 ### Credential storage and migration
 

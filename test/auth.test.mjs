@@ -14,6 +14,7 @@ import {
   readKiroAuth,
   saveKiroAuth,
 } from "../server/auth.mjs";
+import { discoverHttpModels } from "../server/http.mjs";
 
 async function sqlite(path) {
   if (process.versions.bun) {
@@ -350,4 +351,146 @@ test("an outage cannot silently adopt an independent login without a profile ARN
     fetchImpl: async () => assert.fail("must not refresh the independent login"),
   }), /login or region changed/);
   assert.deepEqual(await f.read(), replacement);
+});
+
+function unresolvedOidc() {
+  const credential = {
+    ...original, kind: "oidc", provider: "identity-center", region: "ap-northeast-2",
+    client_id: "fixture-client", client_secret: "fixture-client-secret",
+    expires_at: "2026-01-02T00:00:00Z",
+  };
+  delete credential.profile_arn;
+  return credential;
+}
+const assignedProfile = original.profile_arn;
+
+test("IAM model discovery resolves and persists its Kiro profile independently of the SSO issuer region", async (t) => {
+  const f = await fixture(t, unresolvedOidc());
+  let profileCalls = 0;
+  const fetchImpl = async (url, request) => {
+    if (request.headers["x-amz-target"].endsWith(".ListAvailableProfiles")) {
+      profileCalls++;
+      assert.equal(url, "https://management.us-east-1.kiro.dev/");
+      return Response.json({ profiles: [{ arn: assignedProfile, profileName: "Team" }] });
+    }
+    const input = JSON.parse(request.body);
+    if (input.profileArn !== assignedProfile)
+      return Response.json({ message: "Invalid profileArn" }, { status: 400 });
+    return Response.json({ models: [
+      { modelId: "auto" }, { modelId: "claude-opus-5.5", tokenLimits: { maxInputTokens: 1000000 } },
+    ] });
+  };
+  const authProvider = (options) => loadKiroAuth({ ...options, authFile: f.authFile, now });
+  const options = { fetchImpl, authProvider };
+  assert.deepEqual((await discoverHttpModels(options)).map((m) => m.id), ["auto", "claude-opus-5.5"]);
+  assert.deepEqual((await discoverHttpModels(options)).map((m) => m.id), ["auto", "claude-opus-5.5"]);
+  assert.equal(profileCalls, 1);
+  assert.deepEqual(await f.read(), { ...unresolvedOidc(), profile_arn: assignedProfile });
+});
+
+test("parallel metadata requests share one initial profile lookup", async (t) => {
+  const f = await fixture(t, unresolvedOidc());
+  const started = Promise.withResolvers(), release = Promise.withResolvers();
+  let calls = 0;
+  const options = {
+    authFile: f.authFile, now,
+    fetchImpl: async () => {
+      calls++;
+      started.resolve();
+      await release.promise;
+      return Response.json({ profiles: [{ arn: assignedProfile }] });
+    },
+  };
+  const first = loadKiroAuth(options);
+  await started.promise;
+  const second = loadKiroAuth(options);
+  release.resolve();
+  const values = await Promise.all([first, second]);
+  assert.equal(calls, 1);
+  assert.deepEqual(values[0], values[1]);
+  assert.equal(values[0].profile_arn, assignedProfile);
+});
+
+test("an identical profile commit from another process is accepted without replacing it", async (t) => {
+  const credential = unresolvedOidc();
+  const resolved = { ...credential, profile_arn: assignedProfile };
+  const f = await fixture(t, credential);
+  const result = await loadKiroAuth({
+    authFile: f.authFile, now,
+    fetchImpl: async () => {
+      await f.replace(resolved);
+      return Response.json({ profiles: [{ arn: assignedProfile }] });
+    },
+  });
+  assert.deepEqual(result, resolved);
+  assert.deepEqual(await f.read(), resolved);
+});
+
+test("profile lookup cannot overwrite an independent login or resurrect a logout", async (t) => {
+  for (const logout of [false, true]) {
+    const f = await fixture(t, unresolvedOidc());
+    const replacement = { ...unresolvedOidc(), access_token: "independent-login" };
+    await assert.rejects(loadKiroAuth({
+      authFile: f.authFile, now,
+      fetchImpl: async () => {
+        if (logout) await logoutKiroAuth({ authFile: f.authFile });
+        else await f.replace(replacement);
+        return Response.json({ profiles: [{ arn: assignedProfile }] });
+      },
+    }), { code: "credential_changed" });
+    if (logout) assert.equal((await getKiroAuthStatus({ authFile: f.authFile })).loggedIn, false);
+    else assert.deepEqual(await f.read(), replacement);
+  }
+});
+
+test("multiple profiles require an assigned explicit selection and include later pages", async (t) => {
+  const credential = unresolvedOidc();
+  const other = "arn:aws:codewhisperer:eu-central-1:123456789012:profile/other";
+  const f = await fixture(t, credential);
+  const options = {
+    authFile: f.authFile, now,
+    fetchImpl: async (_url, request) => JSON.parse(request.body).nextToken
+      ? Response.json({ profiles: [{ arn: other, profileName: "Other team" }] })
+      : Response.json({ profiles: [{ arn: assignedProfile, profileName: "Team" }], nextToken: "page-two" }),
+  };
+  await assert.rejects(loadKiroAuth(options), (error) => {
+    assert.deepEqual(error.profiles.map((p) => p.arn), [assignedProfile, other]);
+    assert.ok(!JSON.stringify(error).includes(assignedProfile));
+    return error instanceof KiroAuthError;
+  });
+  assert.deepEqual(await f.read(), credential);
+  await assert.rejects(loadKiroAuth({ ...options, profileArn: `${other}-not-assigned` }), KiroAuthError);
+  assert.deepEqual(await f.read(), credential);
+  const selected = await loadKiroAuth({ ...options, profileArn: other });
+  assert.equal(selected.profile_arn, other);
+  assert.equal((await f.read()).profile_arn, other);
+});
+
+test("empty or cyclic profile catalogs do not mutate the managed login", async (t) => {
+  for (const response of [
+    { profiles: [] },
+    { profiles: [{ arn: assignedProfile }], nextToken: "same-page" },
+  ]) {
+    const credential = unresolvedOidc();
+    const f = await fixture(t, credential);
+    await assert.rejects(loadKiroAuth({
+      authFile: f.authFile, now, fetchImpl: async () => Response.json(response),
+    }), KiroAuthError);
+    assert.deepEqual(await f.read(), credential);
+  }
+});
+
+test("failed profile resolution retains a successfully rotated OIDC refresh credential", async (t) => {
+  const credential = { ...unresolvedOidc(), expires_at: original.expires_at };
+  const f = await fixture(t, credential);
+  await assert.rejects(loadKiroAuth({
+    authFile: f.authFile, now,
+    fetchImpl: async (url) => String(url).includes("oidc.ap-northeast-2.amazonaws.com")
+      ? Response.json({ accessToken: "rotated-access", refreshToken: "rotated-refresh", expiresIn: 3600 })
+      : Response.json({ profiles: [] }),
+  }), KiroAuthError);
+  const saved = await f.read();
+  assert.equal(saved.access_token, "rotated-access");
+  assert.equal(saved.refresh_token, "rotated-refresh");
+  assert.equal(saved.profile_arn, undefined);
 });

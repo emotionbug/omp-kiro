@@ -145,10 +145,10 @@ function registrationHost() {
   };
 }
 
-test("actual async OMP extension registers authoritative account models offline without a dynamic refresh callback", async (t) => {
+test("default OMP transport registers authoritative HTTP account models offline without CLI discovery", async (t) => {
   noNetwork(t);
   const f = await fixture(t);
-  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_TRANSPORT", undefined);
   setEnv(t, "OMP_KIRO_AUTH_FILE", f.authFile);
   setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", f.file);
   const h = registrationHost();

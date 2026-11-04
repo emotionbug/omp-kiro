@@ -19,7 +19,7 @@ function checkTransport(transport) {
     });
 }
 
-export function getKiroCommands({ transport = "acp" } = {}) {
+export function getKiroCommands({ transport = "http" } = {}) {
   checkTransport(transport);
   return [
     { name: "kiro", description: "Show Kiro commands and transport information", kind: "query" },
@@ -156,7 +156,7 @@ async function acpCatalog({ signal, services }) {
 export async function executeKiroQuery(
   name,
   args = "",
-  { transport = "acp", authFile, signal, authProvider, services = {} } = {},
+  { transport = "http", authFile, signal, authProvider, services = {} } = {},
 ) {
   checkTransport(transport);
   signal?.throwIfAborted();
@@ -258,7 +258,7 @@ export async function executeKiroQuery(
 }
 
 /** Register real host actions separately from the reusable read-only queries. */
-export function registerKiroCommands(pi, { transport = "acp", authFile, services = {} } = {}) {
+export function registerKiroCommands(pi, { transport = "http", authFile, services = {} } = {}) {
   const commands = getKiroCommands({ transport });
   const pending = new Set();
   for (const event of ["session_shutdown", "session_before_switch"])

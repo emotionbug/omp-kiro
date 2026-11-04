@@ -174,3 +174,15 @@ The older public generated AWS SDK supplements native conversation/tool/event fr
 - [Event stream serialization](https://github.com/aws/amazon-q-developer-cli/blob/15cc8f3cd18c4272925ce1c7053268eedff1ea0a/crates/amzn-codewhisperer-streaming-client/src/event_stream_serde.rs)
 
 Controlled HTTP fixtures, synthetic SQLite credentials, and the actual Bun-hosted OMP plugin exercised native payload mapping, fragmented framed responses, actual OMP file writes, returning real tool results, follow-up output, and usage handling. This validates adapter integration, not the unexercised production generation boundary.
+
+## Windows IAM profile resolution (0.4.7)
+
+The installed Windows x64 Kiro CLI reported version 2.35.1. REA bound its PE image with SHA-256 `6f8898ee80578e2a22848fe06fc109c6b0afd1ef48a555a103b05baec548abdc`. Native decompilation was unavailable because Ghidra was not configured; the following are ordinary process/API observations, not decompiled control-flow claims.
+
+- The CLI's non-secret identity metadata identified its existing Google login. An isolated ACP initialize/session-new handshake returned eight models and was closed without a generation prompt.
+- The separate managed Identity Center login had valid credentials issued in `ap-northeast-2`, but no `profile_arn`. The current management model request failed with HTTP 400 `ValidationException: Invalid profileArn`.
+- Authenticated `KiroControlPlaneBearerService.ListAvailableProfiles` at the current US East management endpoint, with `origin: KIRO_CLI`, returned HTTP 200 and one `profiles` row containing `arn` and `profileName`. No pagination token was returned. Credential and profile identifier values were excluded from diagnostics.
+- Using that assigned ARN in memory allowed the same Identity Center account to retrieve 21 model IDs, including the current Claude 5.5 and GPT 5.6 families. This separates the SSO issuer region from the Kiro service region and does not establish that the Google and enterprise accounts have identical entitlements.
+- After the shared authentication fix, the actual OMP 18.16.0 executable loaded the 0.4.7 extension with `OMP_KIRO_TRANSPORT` absent, ambient extensions disabled, and `OMP_KIRO_COMMAND` pointing to a deliberately nonexistent executable. It returned all 21 `kiro-http` models without invoking Kiro CLI. The selected profile is persisted with compare-and-swap for subsequent HTTP operations.
+
+Controlled regression cases cover unresolved OIDC metadata, one-time persistence, concurrent initialization, identical cross-process resolution, login/logout races, pagination and explicit profile selection, invalid catalogs, and retaining refresh rotation when profile discovery fails. No production generation, purchase, permission grant, CLI logout, or operational-daemon restart was performed.

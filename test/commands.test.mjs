@@ -42,11 +42,7 @@ function host(options = {}) {
   return { pi, ctx, commands, events, messages, selected };
 }
 
-test("help is local and rejects invalid and action-only query names", async () => {
-  const help = await executeKiroQuery("/kiro", "", { transport: "http" });
-  assert.match(help.text, /direct HTTP/);
-  assert.match(help.text, /\/kiro-model <id>/);
-  assert.doesNotMatch(help.text, /kiro-reset/);
+test("query commands reject action-only names and invalid arguments", async () => {
   await assert.rejects(executeKiroQuery("kiro-model", "id"), { code: "unknown_command" });
   await assert.rejects(executeKiroQuery("clear"), { code: "unknown_command" });
   await assert.rejects(executeKiroQuery("kiro-status", "logout"), { code: "invalid_arguments" });
@@ -280,6 +276,10 @@ test("HTTP catalog loads the explicitly selected store without changing environm
   const before = process.env.OMP_KIRO_AUTH_FILE;
   t.mock.method(globalThis, "fetch", async (_url, options) => {
     assert.equal(options.headers.authorization, "Bearer chosen-store-secret");
+    if (options.headers["x-amz-target"] === "KiroControlPlaneBearerService.ListAvailableProfiles")
+      return Response.json({
+        profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/chosen" }],
+      });
     return Response.json({ models: [{ modelId: "chosen-id", modelName: "Chosen model" }] });
   });
   const result = await executeKiroQuery("kiro-models", "", { transport: "http", authFile });

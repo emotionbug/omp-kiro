@@ -106,7 +106,7 @@ function providerModels(models) {
 }
 
 export default async function kiroExtension(pi) {
-  const transport = process.env.OMP_KIRO_TRANSPORT || "acp";
+  const transport = process.env.OMP_KIRO_TRANSPORT || "http";
   if (transport !== "acp" && transport !== "http") {
     throw new Error("OMP_KIRO_TRANSPORT must be acp or http");
   }

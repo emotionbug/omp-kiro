@@ -8,6 +8,7 @@ import {
   authFilePath,
   getKiroAuthStatus,
   importCliAuth,
+  loadKiroAuth,
   logoutKiroAuth,
   readAuthSnapshot,
   saveKiroAuth,
@@ -22,6 +23,7 @@ Commands:
   login                 Authenticate without invoking Kiro CLI
   auth status           Show non-secret local login status
   auth logout           Remove this plugin's active login (not CLI login)
+  auth profile          Resolve the HTTP profile; --profile selects an available ARN
   auth import-cli       Explicitly import an existing CLI social login
 
 Login options:
@@ -29,6 +31,7 @@ Login options:
   --flow <name>         device (default); social accounts also loopback or manual
   --start-url <url>     Identity Center start URL
   --region <region>     OIDC issuer region (default: us-east-1)
+  --profile <arn>       Select an assigned Kiro profile (login or auth profile)
   --timeout <seconds>   Overall deadline (default: 600)
 
 Storage options:
@@ -72,6 +75,7 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
       flow: { type: "string", default: "device" },
       "start-url": { type: "string" },
       region: { type: "string", default: "us-east-1" },
+      profile: { type: "string" },
       timeout: { type: "string", default: "600" },
       "auth-file": { type: "string" },
       database: { type: "string" },
@@ -84,12 +88,14 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
     return;
   }
   const command = positionals.join(" ");
-  if (!["login", "auth status", "auth logout", "auth import-cli"].includes(command))
+  if (!["login", "auth status", "auth logout", "auth import-cli", "auth profile"].includes(command))
     throw new Error("Unknown authentication command; use --help.");
   if (values.json && command !== "auth status")
     throw new Error("--json is supported only for auth status; credentials are never printed.");
   if (values.database && command !== "auth import-cli")
     throw new Error("--database is only a source for auth import-cli.");
+  if (values.profile && !["login", "auth profile"].includes(command))
+    throw new Error("--profile is supported only for login or auth profile.");
   const authFile = values["auth-file"] ? resolve(values["auth-file"]) : authFilePath();
   if (command === "auth status") {
     const status = await getKiroAuthStatus({ authFile });
@@ -123,6 +129,11 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
   timer.unref();
   try {
     const signal = controller.signal;
+    if (command === "auth profile") {
+      const credential = await loadKiroAuth({ authFile, signal, profileArn: values.profile });
+      console.log(`Selected Kiro profile: ${JSON.stringify(credential.profile_arn)}`);
+      return;
+    }
     if (command === "auth import-cli") {
       await importCliAuth({
         authFile,
@@ -164,9 +175,13 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
         "Unsupported provider; choose google, github, builder-id, or identity-center.",
       );
     await saveKiroAuth(credential, { authFile, expectedRaw, signal });
+    await loadKiroAuth({
+      authFile, signal, profileArn: values.profile,
+      expectedCredential: { ...credential, profile_arn: undefined },
+    });
     console.log(`Authenticated ${credential.provider}. Credentials saved to ${authFile}.`);
     console.log(`For this store, set OMP_KIRO_AUTH_FILE to ${authFile}.`);
-    console.log("Use: OMP_KIRO_TRANSPORT=http omp --model kiro-http/auto");
+    console.log("Use: omp --model kiro-http/auto");
   } finally {
     clearTimeout(timer);
     process.removeListener("SIGINT", abort);
@@ -182,6 +197,8 @@ const isEntrypoint =
 if (isEntrypoint) {
   runAuthCli().catch((error) => {
     console.error(`Kiro authentication failed: ${error.message}`);
+    if (error.profiles)
+      for (const profile of error.profiles) console.error(JSON.stringify(profile));
     process.exitCode = error.name === "AbortError" ? 130 : 1;
   });
 }
