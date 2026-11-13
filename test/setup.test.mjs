@@ -48,6 +48,57 @@ test("a new HTTP profile uses OMP and prefixed model IDs", () => {
   assert.deepEqual(profile.models, catalog.map((model) => ({ id: `kiro-http/${model.id}`, label: model.name })));
 });
 
+test("HTTP setup refreshes native effort choices while retaining a supported user default", () => {
+  const additionalModelRequestFieldsSchema = {
+    type: "object",
+    properties: {
+      output_config: { type: "object", properties: {
+        effort: { type: "string", enum: ["low", "high", "max"], default: "high" },
+      } },
+      thinking: { type: "object", properties: {
+        type: { type: "string", enum: ["adaptive", "disabled"] },
+      } },
+    },
+  };
+  const previous = {
+    extends: "omp",
+    env: { OMP_KIRO_TRANSPORT: "http" },
+    models: [{
+      id: "kiro-http/vendor.controlled",
+      label: "My model",
+      thinkingOptions: [{ id: "low", label: "Low" }, { id: "xhigh", label: "Old choice" }],
+      defaultThinkingOptionId: "low",
+    }],
+  };
+  const profile = prepareHttpProfile(previous, "/auth.sqlite3", {
+    catalog: [{ id: "vendor.controlled", name: "New name", additionalModelRequestFieldsSchema }],
+  });
+  const row = profile.models[0];
+  assert.deepEqual(row.thinkingOptions.map(({ id }) => id), ["auto", "off", "low", "high", "max"]);
+  assert.equal(row.defaultThinkingOptionId, "low");
+  assert.deepEqual(row.thinkingOptions.filter((option) => option.isDefault).map(({ id }) => id), ["low"]);
+  assert.equal(row.label, "My model");
+  assert.equal(previous.models[0].thinkingOptions[1].id, "xhigh");
+});
+
+test("HTTP setup removes stale effort choices when the catalog no longer advertises controls", () => {
+  const previous = {
+    extends: "omp",
+    env: { OMP_KIRO_TRANSPORT: "http" },
+    models: [{
+      id: "kiro-http/vendor.controlled",
+      label: "My model",
+      thinkingOptions: [{ id: "high", label: "High" }],
+      defaultThinkingOptionId: "high",
+    }],
+  };
+  const profile = prepareHttpProfile(previous, "/auth.sqlite3", {
+    catalog: [{ id: "vendor.controlled", name: "New name" }],
+  });
+  assert.equal(Object.hasOwn(profile.models[0], "thinkingOptions"), false);
+  assert.equal(Object.hasOwn(profile.models[0], "defaultThinkingOptionId"), false);
+});
+
 test("HTTP setup refuses direct-native profiles, other harnesses, and launch/environment conflicts", () => {
   for (const existing of [
     { enabled: true, label: "Native Kiro", env: { OMP_KIRO_AUTH_FILE: "/auth.sqlite3" } },

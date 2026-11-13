@@ -79,6 +79,33 @@ test("bounded account snapshot preserves exact rows and old metadata without aut
   assert.doesNotMatch(await readFile(f.file, "utf8"), /catalog-access-secret|catalog-refresh-secret|arn:aws/);
 });
 
+test("version one snapshots retain native schemas without synthesizing absent controls", async (t) => {
+  const f = await fixture(t);
+  const schema = {
+    type: "object",
+    properties: {
+      reasoning: { properties: { effort: { type: "string", enum: ["low", "high", "default"], default: "default" } } },
+    },
+    additionalProperties: false,
+  };
+  const rows = [
+    { ...models[0], additionalModelRequestFieldsSchema: schema },
+    { ...models[1], additionalModelRequestFieldsSchema: null },
+  ];
+  await writeFile(f.file, JSON.stringify({ ...f.snapshot, models: rows }));
+  assert.deepEqual(await readKiroModelCatalog(f.file, { auth }), [
+    rows[0], models[1],
+  ]);
+  for (const malformed of [[], "{}", false, { properties: [] }, {
+    properties: { output_config: { properties: { effort: { enum: ["high", 1] } } } },
+  }]) {
+    await writeFile(f.file, JSON.stringify({
+      ...f.snapshot, models: [{ ...models[0], additionalModelRequestFieldsSchema: malformed }],
+    }));
+    await assert.rejects(readKiroModelCatalog(f.file, { auth }), /malformed.*schema.*models\.cmd/);
+  }
+});
+
 test("profile-preserving token renewal is accepted but provider/profile/issuer changes are rejected", async (t) => {
   const f = await fixture(t);
   const renewed = { ...auth, access_token: "new-access", refresh_token: "new-refresh" };

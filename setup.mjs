@@ -9,6 +9,7 @@ import { isDeepStrictEqual, parseArgs } from "node:util";
 import { discoverModels } from "./server/bridge.mjs";
 import { discoverHttpModels } from "./server/http.mjs";
 import { authFilePath, loadKiroAuth } from "./server/auth.mjs";
+import { kiroThinkingConfig } from "./server/effort.mjs";
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
 
@@ -33,6 +34,27 @@ async function readConfig(path) {
     if (error.code === "ENOENT") return null;
     throw error;
   }
+}
+
+function profileModel(model, provider, previous) {
+  const row = previous ?? { id: `${provider}/${model.id}`, label: model.name };
+  if (provider !== "kiro-http") return row;
+  const { thinkingOptions: _options, defaultThinkingOptionId: _default, ...fields } = row;
+  const thinking = kiroThinkingConfig(model.additionalModelRequestFieldsSchema);
+  if (!thinking) return fields;
+  const levels = ["auto", ...(thinking.requiresEffort ? [] : ["off"]), ...thinking.efforts];
+  const defaultLevel = levels.includes(row.defaultThinkingOptionId)
+    ? row.defaultThinkingOptionId
+    : thinking.defaultLevel ?? "auto";
+  return {
+    ...fields,
+    thinkingOptions: levels.map((id) => ({
+      id,
+      label: id === "xhigh" ? "XHigh" : id[0].toUpperCase() + id.slice(1),
+      ...(id === defaultLevel ? { isDefault: true } : {}),
+    })),
+    defaultThinkingOptionId: defaultLevel,
+  };
 }
 
 function prepareProfile({ existingValue, profileId, command, profileEnv, catalog, provider, label }) {
@@ -63,7 +85,10 @@ function prepareProfile({ existingValue, profileId, command, profileEnv, catalog
   const models = [...(existing.models ?? [])];
   for (const model of catalog) {
     const id = `${provider}/${model.id}`;
-    if (!models.some((entry) => entry.id === id)) models.push({ id, label: model.name });
+    const index = models.findIndex((entry) => entry.id === id);
+    const row = profileModel(model, provider, index < 0 ? undefined : models[index]);
+    if (index < 0) models.push(row);
+    else models[index] = row;
   }
   return {
     extends: "omp",

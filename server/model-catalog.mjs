@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { open } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import { kiroThinkingConfig } from "./effort.mjs";
 
 const MAX_CATALOG_BYTES = 4 * 1024 * 1024;
 const REFRESH = "Refresh the account model catalog with models.cmd, then start again.";
@@ -75,11 +76,18 @@ export async function readKiroModelCatalog(file, { auth } = {}) {
   const ids = new Set();
   for (const model of data.models) {
     if (
-      !record(model) || !onlyKeys(model, ["id", "name", "contextWindow", "maxTokens"]) ||
+      !record(model) || !onlyKeys(model, ["id", "name", "contextWindow", "maxTokens", "additionalModelRequestFieldsSchema"]) ||
       !nonempty(model.id) || !nonempty(model.name) || ids.has(model.id) ||
       ["contextWindow", "maxTokens"].some((key) =>
         Object.hasOwn(model, key) && (!Number.isSafeInteger(model[key]) || model[key] <= 0))
     ) throw invalid("contains invalid or duplicate model metadata");
+    try {
+      kiroThinkingConfig(model.additionalModelRequestFieldsSchema);
+    } catch {
+      throw invalid("contains malformed model request fields schema metadata");
+    }
+    if (model.additionalModelRequestFieldsSchema === null)
+      delete model.additionalModelRequestFieldsSchema;
     ids.add(model.id);
   }
   if (data.accountId !== kiroCatalogAccountId(auth))

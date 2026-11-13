@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { loadKiroAuth, refreshExpiredKiroAuth } from "./auth.mjs";
 import { decodeEventStream } from "./eventstream.mjs";
+import { kiroEffortFields, kiroThinkingConfig } from "./effort.mjs";
 import {
   abortableRequest, defaultFetch, fetchWithRetry, isPermanentServiceError, isTransientNetworkError, isTransientStatus,
   requestScope, retryAfterMs, retryOperation,
@@ -52,7 +53,12 @@ function conversationId(sessionId) {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-export function buildHttpRequest({ model, context, cwd, sessionId }) {
+export function buildHttpRequest({
+  model, context, cwd, sessionId, modelRequestFieldsSchema, reasoning, disableReasoning, forceReasoningOff,
+}) {
+  const additionalModelRequestFields = kiroEffortFields(modelRequestFieldsSchema, {
+    reasoning, disableReasoning, forceReasoningOff,
+  });
   const messages = [];
   const systemPrompt = Array.isArray(context.systemPrompt)
     ? context.systemPrompt.join("\n\n")
@@ -132,6 +138,7 @@ export function buildHttpRequest({ model, context, cwd, sessionId }) {
     ];
   }
   return {
+    ...(additionalModelRequestFields === undefined ? {} : { additionalModelRequestFields }),
     conversationState: {
       conversationId: conversationId(sessionId),
       chatTriggerType: "MANUAL",
@@ -207,9 +214,12 @@ export function createHttpTransport({
   return async function runHttpTurn({
     model, context, cwd, signal, onText = () => {}, sessionId, retry: turnRetry, onRestart,
     continuePartial = false, onRetry,
+    modelRequestFieldsSchema, reasoning, disableReasoning, forceReasoningOff,
   }) {
     signal?.throwIfAborted();
-    const body = buildHttpRequest({ model, context, cwd, sessionId });
+    const body = buildHttpRequest({
+      model, context, cwd, sessionId, modelRequestFieldsSchema, reasoning, disableReasoning, forceReasoningOff,
+    });
     if (continuePartial && onRestart)
       throw new KiroHttpError("Choose committed-text continuation or provisional-text restart, not both.");
     const policy = turnRetry ?? retry;
@@ -413,11 +423,14 @@ export async function discoverHttpModels({
         throw new KiroHttpError("Kiro model catalog returned an invalid model ID.");
       const inputLimit = model.tokenLimits?.maxInputTokens;
       const outputLimit = model.tokenLimits?.maxOutputTokens;
+      const schema = model.additionalModelRequestFieldsSchema;
+      kiroThinkingConfig(schema);
       models.push({
         id: model.modelId,
         name: model.modelName || model.modelId,
         ...(Number.isFinite(inputLimit) && inputLimit > 0 ? { contextWindow: inputLimit } : {}),
         ...(Number.isFinite(outputLimit) && outputLimit > 0 ? { maxTokens: outputLimit } : {}),
+        ...(schema == null ? {} : { additionalModelRequestFieldsSchema: schema }),
       });
     }
     nextToken = data.nextToken;

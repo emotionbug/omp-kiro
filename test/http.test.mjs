@@ -20,6 +20,10 @@ const context = {
     },
   ],
 };
+const effortSchema = {
+  type: "object",
+  properties: { output_config: { properties: { effort: { enum: ["low", "high", "none"], default: "high" } } } },
+};
 
 function frame(event, data, kind = "event") {
   const header = (name, value) => {
@@ -179,6 +183,38 @@ test("developer instructions cannot manufacture a turn after an assistant respon
       ],
     },
   }), /must end with a user message or actual tool results/);
+});
+
+test("effort changes only native additional request fields, not instructions or history", () => {
+  const input = { model: "model", context, sessionId: "effort-session", modelRequestFieldsSchema: effortSchema };
+  const original = structuredClone(input);
+  const defaults = buildHttpRequest(input);
+  assert.equal(Object.hasOwn(defaults, "additionalModelRequestFields"), false);
+  const positive = buildHttpRequest({ ...input, reasoning: "high" });
+  assert.deepEqual(positive, {
+    ...defaults, additionalModelRequestFields: { output_config: { effort: "high" } },
+  });
+  assert.deepEqual(buildHttpRequest({ ...input, reasoning: "high", forceReasoningOff: true }), {
+    ...defaults, additionalModelRequestFields: { output_config: { effort: "none" } },
+  });
+  assert.deepEqual(input, original);
+});
+
+test("unsupported effort and native off fail before auth or generation", async () => {
+  let calls = 0;
+  const run = createHttpTransport({
+    authProvider: async () => { calls++; return auth; },
+    fetchImpl: async () => { calls++; throw new Error("must not send"); },
+  });
+  for (const options of [
+    { reasoning: "minimal", modelRequestFieldsSchema: effortSchema },
+    { reasoning: "high" },
+    { disableReasoning: true, modelRequestFieldsSchema: {
+      properties: { reasoning: { properties: { effort: { enum: ["high"] } } } },
+    } },
+  ]) await assert.rejects(run({ model: "model", context, ...options }), RangeError);
+  await assert.rejects(run({ model: "model", context, modelRequestFieldsSchema: [] }), TypeError);
+  assert.equal(calls, 0);
 });
 
 test("framed text and interleaved tool fragments assemble native calls and reported usage", async () => {
@@ -377,19 +413,36 @@ test("catalog uses direct metadata, preserves reported limits and follows pagina
       );
       if (calls++ === 0)
         return Response.json({
-          models: [{ modelId: "one", modelName: "One", tokenLimits: { maxInputTokens: 200000 } }],
+          models: [{
+            modelId: "one", modelName: "One", tokenLimits: { maxInputTokens: 200000 },
+            additionalModelRequestFieldsSchema: effortSchema,
+          }],
           nextToken: "next",
         });
       assert.equal(url.searchParams.get("nextToken"), "next");
       return Response.json({
-        models: [{ modelId: "two", modelName: "Two", tokenLimits: { maxOutputTokens: 8000 } }],
+        models: [{
+          modelId: "two", modelName: "Two", tokenLimits: { maxOutputTokens: 8000 },
+          additionalModelRequestFieldsSchema: null,
+        }],
       });
     },
   });
   assert.deepEqual(models, [
-    { id: "one", name: "One", contextWindow: 200000 },
+    { id: "one", name: "One", contextWindow: 200000, additionalModelRequestFieldsSchema: effortSchema },
     { id: "two", name: "Two", maxTokens: 8000 },
   ]);
+});
+
+test("discovery rejects malformed effort metadata rather than dropping it", async () => {
+  for (const schema of [[], "{}", 1, { properties: { reasoning: { properties: { effort: { enum: "high" } } } } }]) {
+    await assert.rejects(discoverHttpModels({
+      authProvider: async () => auth,
+      fetchImpl: async () => Response.json({
+        models: [{ modelId: "model", additionalModelRequestFieldsSchema: schema }],
+      }),
+    }), TypeError);
+  }
 });
 
 const fastRetry = { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 1000 };
@@ -432,9 +485,13 @@ test("a real transient socket drop recovers the identical model, body and sessio
     retry: fastRetry,
     fetchImpl: (_url, init) => fetch(`http://127.0.0.1:${server.address().port}/`, init),
   });
-  await run({ model: "selected-only", sessionId: "stable-session", context, onText: (s) => text.push(s) });
+  await run({
+    model: "selected-only", sessionId: "stable-session", context, onText: (s) => text.push(s),
+    modelRequestFieldsSchema: effortSchema, reasoning: "low",
+  });
   assert.equal(requests.length, 2);
   assert.equal(requests[0], requests[1]);
+  assert.deepEqual(JSON.parse(requests[1]).additionalModelRequestFields, { output_config: { effort: "low" } });
   assert.equal(
     JSON.parse(requests[1]).conversationState.currentMessage.userInputMessage.modelId,
     "selected-only",
@@ -670,12 +727,14 @@ test("OMP continuation survives repeated partial failures and preserves complete
   const outcome = await run({
     model: "unchanged-model", sessionId: "unchanged-session", cwd: "/workspace",
     context: completed, continuePartial: true, onText: (fragment) => text.push(fragment),
+    modelRequestFieldsSchema: effortSchema, reasoning: "high",
   });
   assert.equal(text.join(""), "part1 part2 part3 part4 part5 done");
   assert.equal(bodies.length, 7, "transport recovery is not limited by the host's three retries");
   assert.deepEqual(bodies[5], bodies[6], "no-output outage retries the identical continuation body");
   for (const [index, body] of bodies.entries()) {
     assert.equal(body.profileArn, auth.profile_arn);
+    assert.deepEqual(body.additionalModelRequestFields, { output_config: { effort: "high" } });
     const state = body.conversationState;
     assert.equal(state.conversationId, bodies[0].conversationState.conversationId);
     const current = state.currentMessage.userInputMessage;

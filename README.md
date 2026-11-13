@@ -60,6 +60,20 @@ HTTP is an unofficial, version-dependent protocol. Selecting it does not fall ba
 
 `kiro-cli` and `kiro-http` have separate OMP catalog caches and authentication stores. Both use the current `KIRO_CLI` origin, but different accounts and enterprise policies can return different model sets. HTTP never falls back to the CLI's account or catalog.
 
+## HTTP reasoning effort
+
+HTTP effort follows the selected model's native `additionalModelRequestFieldsSchema`, not a hardcoded model-name list. Models without a selectable effort schema expose no effort picker, even though the original Kiro CLI supports effort on other models. An internal `default` value is not offered as a level.
+
+When your account advertises the model and its effort controls, use OMP's `--thinking` option, for example:
+
+```bash
+omp --model kiro-http/claude-opus-4.7 --thinking high
+```
+
+The HTTP request uses the schema's actual `output_config.effort` or `reasoning.effort` under `additionalModelRequestFields`. Unsupported values are not emulated with prompts, token budgets, or another model. Off is sent only through an advertised `none` effort or `thinking.type: disabled`; a controllable model without an off form rejects an explicit off request. Unspecified transport effort retains native defaults; OMP's Auto remains OMP's per-turn policy.
+
+For existing managed Passession profiles, rerun [HTTP profile setup](#omp-http-profile-and-built-in-account-usage) and reload configuration to refresh effort options on existing model rows. Labels and supported user defaults are retained; stale unsupported choices are removed. Offline snapshots retain the native schema too and require the usual snapshot refresh/session reload. This support is HTTP-only; ACP behavior is unchanged.
+
 ## Independent HTTP authentication
 
 The standalone `omp-kiro` command does not invoke `kiro-cli`, read its credentials implicitly, launch an OS browser, or require an OS keychain. The default **device flow** prints an official verification link and user code. Open the link on any browser-capable device and approve it; the command polls until completion, expiry, denial, or Ctrl+C.
@@ -238,7 +252,7 @@ The Bun bundle must be a readable regular UTF-8 PEM file containing only certifi
 
 **Offline startup integration (0.4.3):** a packaged host can set the absolute `OMP_KIRO_MODEL_CATALOG_FILE` path to its real account snapshot written by `models.cmd`. Before registering HTTP models, the async OMP factory reads current managed auth **without refreshing it** and validates that snapshot. The configured snapshot is authoritative: OMP does not register a dynamic discovery callback, so host offline/background refresh cannot erase its account rows or initiate a detached live discovery. Run `models.cmd` and reload/restart the packaged OMP session to refresh registered metadata; `/kiro-models` remains an explicitly requested live query. With no explicit path, OMP retains live discovery. A bad, missing, or wrong-account configured snapshot fails closed and asks you to refresh `models.cmd`, never silently using live discovery or invented models.
 
-The shared `server/model-catalog.mjs` API exports `kiroCatalogAccountId(auth)` and `readKiroModelCatalog(file, { auth })`. The latter returns unchanged raw model rows from a bounded (4 MiB) JSON envelope `{version:1,fetchedAt,accountId,models:[{id,name,contextWindow?,maxTokens?}]}`. `accountId` is a SHA-256 binding to managed provider/auth kind, region, client registration, and profile ARN; without an ARN it conservatively binds the refresh token, or access token if no refresh token exists. No token is written to the catalog. Renewal under the same profile preserves the binding; no-profile refresh-token rotation requires a new snapshot. IDs, names, and advertised limits are preserved; unknown fields, malformed rows, duplicate IDs, and account mismatches are rejected. An empty account catalog stays empty.
+The shared `server/model-catalog.mjs` API exports `kiroCatalogAccountId(auth)` and `readKiroModelCatalog(file, { auth })`. The latter returns unchanged raw model rows from a bounded (4 MiB) JSON envelope `{version:1,fetchedAt,accountId,models:[{id,name,contextWindow?,maxTokens?,additionalModelRequestFieldsSchema?}]}`. `accountId` is a SHA-256 binding to managed provider/auth kind, region, client registration, and profile ARN; without an ARN it conservatively binds the refresh token, or access token if no refresh token exists. No token is written to the catalog. Renewal under the same profile preserves the binding; no-profile refresh-token rotation requires a new snapshot. IDs, names, advertised limits, and native capability schemas are preserved; unknown envelope/model-row fields, malformed rows, duplicate IDs, and account mismatches are rejected. An empty account catalog stays empty. Do not invent capability schemas to enable controls the account did not advertise.
 
 Snapshot age is not credential validity: genuine metadata has no synthetic TTL fallback, and expired managed auth can seed offline startup. Generation still loads/refreshes current managed credentials normally, retries only transient failures on the 30-second policy, and retains the account-change guard. The snapshot never supplies HTTP credentials or guarantees quota/model availability. Package login/logout/import must invalidate it and `models.cmd` must bind metadata to the same auth used for discovery. Hosts without a snapshot must keep readiness pending during transient live discovery outages, while retaining process-exit and caller-cancellation cleanup.
 
@@ -253,6 +267,7 @@ The target machine still needs approved Kiro service/proxy/gateway access and an
 ### Shared limits
 
 - **Text only:** images and unsupported content are rejected. Thinking blocks are not forwarded as conversation text.
+- **Reasoning output:** effort selection does not add native reasoning-event rendering or signed-reasoning history replay; those output/history behaviors remain unchanged.
 - **Usage:** unreported token/cost fields remain numeric defaults, not a claim of free usage. HTTP forwards token counts only when upstream reports them.
 - **Planning limits:** ACP supplies no numeric limits, so it uses conservative 128,000-token context and 16,000-token output metadata. HTTP uses the live advertised limits, with conservative defaults for missing fields.
 - **Trust:** these are unsandboxed host plugins. ACP launches Kiro; HTTP uses the separate managed credential store. The selected host owns tool permission decisions.

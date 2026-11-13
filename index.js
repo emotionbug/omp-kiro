@@ -6,8 +6,9 @@ import { isTransientNetworkError, isTlsError } from "./server/network.mjs";
 import { registerKiroWebSearch } from "./server/web.mjs";
 import { readKiroAuth } from "./server/auth.mjs";
 import { readKiroModelCatalog } from "./server/model-catalog.mjs";
+import { kiroThinkingConfig } from "./server/effort.mjs";
 
-function streamKiro(model, context, options = {}, transport) {
+function streamKiro(model, context, options = {}, transport, modelRequestFieldsSchema) {
   const stream = new AssistantMessageEventStream();
   const message = {
     role: "assistant",
@@ -38,7 +39,13 @@ function streamKiro(model, context, options = {}, transport) {
         cwd: options.cwd ?? process.cwd(),
         signal: options.signal,
         sessionId: options.sessionId,
-        ...(transport === "http" ? { continuePartial: true } : {}),
+        ...(transport === "http" ? {
+          continuePartial: true,
+          modelRequestFieldsSchema,
+          reasoning: options.reasoning,
+          disableReasoning: model.reasoning ? options.disableReasoning : undefined,
+          forceReasoningOff: options.forceReasoningOff,
+        } : {}),
         onText(delta) {
           if (!delta) return;
           if (!text) {
@@ -92,17 +99,21 @@ function streamKiro(model, context, options = {}, transport) {
   return stream;
 }
 
-function providerModels(models) {
-  return models.map(({ id, name, contextWindow, maxTokens }) => ({
-    id,
-    name: `Kiro · ${name}`,
-    reasoning: false,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    // ACP omits numeric limits; HTTP uses advertised limits when supplied.
-    contextWindow: contextWindow ?? 128000,
-    maxTokens: maxTokens ?? 16000,
-  }));
+function providerModels(models, transport) {
+  return models.map(({ id, name, contextWindow, maxTokens, additionalModelRequestFieldsSchema }) => {
+    const thinking = transport === "http" ? kiroThinkingConfig(additionalModelRequestFieldsSchema) : undefined;
+    return {
+      id,
+      name: `Kiro · ${name}`,
+      reasoning: Boolean(thinking),
+      ...(thinking ? { thinking } : {}),
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      // ACP omits numeric limits; HTTP uses advertised limits when supplied.
+      contextWindow: contextWindow ?? 128000,
+      maxTokens: maxTokens ?? 16000,
+    };
+  });
 }
 
 export default async function kiroExtension(pi) {
@@ -119,9 +130,19 @@ export default async function kiroExtension(pi) {
   });
   pi.on("session_before_switch", (_event, ctx) => closeSession(ctx.sessionManager.getSessionId()));
   const provider = transport === "http" ? "kiro-http" : "kiro-cli";
+  // OMP's public model object need not carry the native request schema.
+  const modelSchemas = new Map();
+  const rememberModels = (catalog) => {
+    modelSchemas.clear();
+    for (const model of catalog) {
+      if (transport === "http" && model.additionalModelRequestFieldsSchema !== undefined)
+        modelSchemas.set(model.id, model.additionalModelRequestFieldsSchema);
+    }
+    return providerModels(catalog, transport);
+  };
   const catalogFile = process.env.OMP_KIRO_MODEL_CATALOG_FILE;
   const models = transport === "http" && catalogFile !== undefined
-    ? providerModels(await readKiroModelCatalog(catalogFile, { auth: await readKiroAuth() }))
+    ? rememberModels(await readKiroModelCatalog(catalogFile, { auth: await readKiroAuth() }))
     : undefined;
   pi.registerProvider(provider, {
     baseUrl: "https://kiro-cli.invalid/",
@@ -131,10 +152,11 @@ export default async function kiroExtension(pi) {
     // callback lets host offline refresh replace it with an empty dynamic set.
     ...(models !== undefined ? { models } : {
       async fetchDynamicModels() {
-        return providerModels(await (transport === "http" ? discoverHttpModels() : discoverModels()));
+        return rememberModels(await (transport === "http" ? discoverHttpModels() : discoverModels()));
       },
     }),
-    streamSimple: (model, context, options) => streamKiro(model, context, options, transport),
+    streamSimple: (model, context, options) =>
+      streamKiro(model, context, options, transport, modelSchemas.get(model.id)),
   });
   if (transport === "http") registerKiroWebSearch(pi);
   registerKiroCommands(pi, { transport });
