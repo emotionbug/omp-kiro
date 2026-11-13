@@ -7,13 +7,22 @@ import { test } from "node:test";
 import { z } from "zod";
 import { readAuthSnapshot, saveKiroAuth } from "../server/auth.mjs";
 import { kiroCatalogAccountId, readKiroModelCatalog } from "../server/model-catalog.mjs";
+import { crc32 } from "../server/eventstream.mjs";
 
-// Only the unused stream constructor is substituted: registration executes the real
-// extension, auth store, bounded catalog reader, commands, and web-tool registration.
+// Replace only the host event-stream container. Catalog loading, HTTP request
+// construction, auth, and response decoding run through the real extension.
 register(`data:text/javascript,${encodeURIComponent(`
   export async function resolve(specifier, context, nextResolve) {
     if (specifier === "@oh-my-pi/pi-ai") return {
-      url: "data:text/javascript,export class AssistantMessageEventStream { constructor() { throw new Error('Registration test must not generate'); } }",
+      url: "data:text/javascript," + encodeURIComponent(\`
+        export class AssistantMessageEventStream {
+          events = [];
+          completion = Promise.withResolvers();
+          push(event) { this.events.push(event); }
+          end() { this.completion.resolve(this.events.at(-1)); }
+          result() { return this.completion.promise; }
+        }
+      \`),
       shortCircuit: true,
     };
     return nextResolve(specifier, context);
@@ -210,3 +219,164 @@ test("OMP configured wrong-account snapshot rejects before registration; no expl
   assert.equal(typeof h.providers[0].config.fetchDynamicModels, "function");
 });
 
+
+function textResponse() {
+  const headers = Buffer.concat([
+    [":message-type", "event"], [":event-type", "assistantResponseEvent"],
+  ].map(([name, value]) => {
+    const size = Buffer.alloc(2);
+    size.writeUInt16BE(Buffer.byteLength(value));
+    return Buffer.concat([Buffer.from([name.length]), Buffer.from(name), Buffer.from([7]), size, Buffer.from(value)]);
+  }));
+  const payload = Buffer.from(JSON.stringify({ content: "Kiro answer" }));
+  const bytes = Buffer.alloc(16 + headers.length + payload.length);
+  bytes.writeUInt32BE(bytes.length, 0);
+  bytes.writeUInt32BE(headers.length, 4);
+  bytes.writeUInt32BE(crc32(bytes.subarray(0, 8)), 8);
+  headers.copy(bytes, 12);
+  payload.copy(bytes, 12 + headers.length);
+  bytes.writeUInt32BE(crc32(bytes.subarray(0, -4)), bytes.length - 4);
+  return new Response(bytes);
+}
+
+const turnContext = { messages: [{ role: "user", content: "Say hello" }] };
+const cachedModel = { id: "cached", provider: "kiro-http", api: "kiro-cli-http", reasoning: true };
+const cachedSchema = {
+  properties: { reasoning: { properties: { effort: { enum: ["low", "high", "none"] } } } },
+};
+
+test("host cache hits recover native effort schemas in each new extension instance", async (t) => {
+  const f = await fixture(t, { ...auth, expires_at: "2999-01-01T00:00:00Z" });
+  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_AUTH_FILE", f.authFile);
+  setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", undefined);
+  let discoveries = 0;
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    if (new URL(url).hostname.startsWith("management.")) {
+      discoveries++;
+      return Response.json({ models: [
+        { modelId: "cached", additionalModelRequestFieldsSchema: cachedSchema },
+        { modelId: "plain" },
+      ] });
+    }
+    requests.push(JSON.parse(init.body));
+    return textResponse();
+  });
+  for (let instance = 1; instance <= 2; instance++) {
+    const h = registrationHost();
+    await kiroExtension(h.pi);
+    const { config } = h.providers[0];
+    assert.equal(discoveries, instance - 1, "registration stays lazy");
+    // OMP restored its own model cache, so fetchDynamicModels is never invoked.
+    for (const options of [{ reasoning: "high" }, { forceReasoningOff: true }]) {
+      const result = await config.streamSimple(cachedModel, turnContext, options).result();
+      assert.equal(result.type, "done");
+      assert.deepEqual(result.message.content, [{ type: "text", text: "Kiro answer" }]);
+    }
+    const plain = await config.streamSimple({ ...cachedModel, id: "plain", reasoning: false }, turnContext).result();
+    assert.equal(plain.type, "done");
+    assert.equal(discoveries, instance, "one catalog load also covers models without schemas");
+  }
+  assert.deepEqual(requests.map((request) => request.additionalModelRequestFields), [
+    { reasoning: { effort: "high" } }, { reasoning: { effort: "none" } }, undefined,
+    { reasoning: { effort: "high" } }, { reasoning: { effort: "none" } }, undefined,
+  ]);
+  for (const request of requests) {
+    assert.equal(request.conversationState.currentMessage.userInputMessage.content, "Say hello");
+    assert.deepEqual(request.conversationState.history, []);
+  }
+});
+
+test("snapshot effort generation uses its native schema without live model discovery", async (t) => {
+  const f = await fixture(t, { ...auth, expires_at: "2999-01-01T00:00:00Z" });
+  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_AUTH_FILE", f.authFile);
+  setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", f.file);
+  await writeFile(f.file, JSON.stringify({
+    ...f.snapshot,
+    models: [{ id: "cached", name: "Cached", additionalModelRequestFieldsSchema: cachedSchema }],
+  }));
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    assert.equal(new URL(url).hostname, "runtime.us-east-1.kiro.dev");
+    requests.push(JSON.parse(init.body).additionalModelRequestFields);
+    return textResponse();
+  });
+  const h = registrationHost();
+  await kiroExtension(h.pi);
+  const result = await h.providers[0].config.streamSimple(cachedModel, turnContext, { reasoning: "low" }).result();
+  assert.equal(result.type, "done");
+  assert.deepEqual(result.message.content, [{ type: "text", text: "Kiro answer" }]);
+  assert.deepEqual(requests, [{ reasoning: { effort: "low" } }]);
+});
+
+test("failed cache hydration rejects the turn before generation and can be retried", async (t) => {
+  const f = await fixture(t, { ...auth, expires_at: "2999-01-01T00:00:00Z" });
+  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_AUTH_FILE", f.authFile);
+  setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", undefined);
+  let discoveries = 0;
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    if (new URL(url).hostname.startsWith("management.")) {
+      if (++discoveries === 1) return new Response(null, { status: 403 });
+      return Response.json({ models: [{ modelId: "cached", additionalModelRequestFieldsSchema: cachedSchema }] });
+    }
+    requests.push(JSON.parse(init.body).additionalModelRequestFields);
+    return textResponse();
+  });
+  const h = registrationHost();
+  await kiroExtension(h.pi);
+  const { config } = h.providers[0];
+  const failure = await config.streamSimple(cachedModel, turnContext, { reasoning: "high" }).result();
+  assert.equal(failure.type, "error");
+  assert.match(failure.error.errorMessage, /model catalog failed \(HTTP 403\)/);
+  assert.deepEqual(requests, []);
+  const recovered = await config.streamSimple(cachedModel, turnContext, { reasoning: "high" }).result();
+  assert.equal(recovered.type, "done");
+  assert.deepEqual(requests, [{ reasoning: { effort: "high" } }]);
+  assert.equal(discoveries, 2);
+});
+
+test("cancelling one concurrent cache-hit turn leaves the shared schema load usable", async (t) => {
+  const f = await fixture(t, { ...auth, expires_at: "2999-01-01T00:00:00Z" });
+  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_AUTH_FILE", f.authFile);
+  setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", undefined);
+  const discovery = Promise.withResolvers();
+  const started = Promise.withResolvers();
+  let discoveries = 0;
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    if (new URL(url).hostname.startsWith("management.")) {
+      discoveries++;
+      started.resolve();
+      return discovery.promise;
+    }
+    requests.push(JSON.parse(init.body).additionalModelRequestFields);
+    return textResponse();
+  });
+  const h = registrationHost();
+  await kiroExtension(h.pi);
+  const { config } = h.providers[0];
+  const controller = new AbortController();
+  const cancelled = config.streamSimple(cachedModel, turnContext, {
+    reasoning: "high", signal: controller.signal,
+  });
+  const continuing = config.streamSimple(cachedModel, turnContext, { reasoning: "low" });
+  await started.promise;
+  controller.abort();
+  const aborted = await cancelled.result();
+  assert.equal(aborted.type, "error");
+  assert.equal(aborted.error.stopReason, "aborted");
+  assert.deepEqual(requests, []);
+  discovery.resolve(Response.json({
+    models: [{ modelId: "cached", additionalModelRequestFieldsSchema: cachedSchema }],
+  }));
+  const completed = await continuing.result();
+  assert.equal(completed.type, "done");
+  assert.deepEqual(completed.message.content, [{ type: "text", text: "Kiro answer" }]);
+  assert.deepEqual(requests, [{ reasoning: { effort: "low" } }]);
+  assert.equal(discoveries, 1);
+});

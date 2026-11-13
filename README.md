@@ -72,6 +72,10 @@ omp --model kiro-http/claude-opus-4.7 --thinking high
 
 The HTTP request uses the schema's actual `output_config.effort` or `reasoning.effort` under `additionalModelRequestFields`. Unsupported values are not emulated with prompts, token budgets, or another model. Off is sent only through an advertised `none` effort or `thinking.type: disabled`; a controllable model without an off form rejects an explicit off request. Unspecified transport effort retains native defaults; OMP's Auto remains OMP's per-turn policy.
 
+After upgrading from a version without effort support, OMP can still restore old model rows with `reasoning: false` from its persistent cache. Refresh the catalog with `omp models refresh kiro-http`, then start a new session (or reload the host's model list). `omp models kiro-http --json` should show the advertised `thinking` levels for supported models. A plugin upgrade alone does not invalidate OMP's model cache.
+
+On a host-cache hit, OMP may skip the plugin's model discovery callback entirely. The first HTTP turn then loads the native request schemas before building the request, sharing that load across concurrent turns and retaining it for the extension instance. Catalog failures stop the turn before generation rather than silently dropping effort. An explicit offline snapshot supplies these schemas without live model discovery.
+
 For existing managed Passession profiles, rerun [HTTP profile setup](#omp-http-profile-and-built-in-account-usage) and reload configuration to refresh effort options on existing model rows. Labels and supported user defaults are retained; stale unsupported choices are removed. Offline snapshots retain the native schema too and require the usual snapshot refresh/session reload. This support is HTTP-only; ACP behavior is unchanged.
 
 ## Independent HTTP authentication

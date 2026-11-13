@@ -2,13 +2,13 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import { closeSession, discoverModels, runTurn } from "./server/bridge.mjs";
 import { discoverHttpModels, runHttpTurn } from "./server/http.mjs";
 import { registerKiroCommands } from "./server/commands.mjs";
-import { isTransientNetworkError, isTlsError } from "./server/network.mjs";
+import { abortableRequest, isTransientNetworkError, isTlsError } from "./server/network.mjs";
 import { registerKiroWebSearch } from "./server/web.mjs";
 import { readKiroAuth } from "./server/auth.mjs";
 import { readKiroModelCatalog } from "./server/model-catalog.mjs";
 import { kiroThinkingConfig } from "./server/effort.mjs";
 
-function streamKiro(model, context, options = {}, transport, modelRequestFieldsSchema) {
+function streamKiro(model, context, options = {}, transport, resolveModelSchema) {
   const stream = new AssistantMessageEventStream();
   const message = {
     role: "assistant",
@@ -32,6 +32,10 @@ function streamKiro(model, context, options = {}, transport, modelRequestFieldsS
     let text;
     stream.push({ type: "start", partial: message });
     try {
+      options.signal?.throwIfAborted();
+      const modelRequestFieldsSchema = transport === "http"
+        ? await resolveModelSchema(model.id, options.signal)
+        : undefined;
       const runTransport = transport === "http" ? runHttpTurn : runTurn;
       const outcome = await runTransport({
         model: model.id,
@@ -132,13 +136,31 @@ export default async function kiroExtension(pi) {
   const provider = transport === "http" ? "kiro-http" : "kiro-cli";
   // OMP's public model object need not carry the native request schema.
   const modelSchemas = new Map();
+  let catalogLoaded = false;
+  let catalogFetch;
   const rememberModels = (catalog) => {
     modelSchemas.clear();
     for (const model of catalog) {
       if (transport === "http" && model.additionalModelRequestFieldsSchema !== undefined)
         modelSchemas.set(model.id, model.additionalModelRequestFieldsSchema);
     }
+    catalogLoaded = true;
     return providerModels(catalog, transport);
+  };
+  const fetchModels = () => {
+    catalogFetch ??= (transport === "http" ? discoverHttpModels() : discoverModels())
+      .then(rememberModels)
+      .finally(() => { catalogFetch = undefined; });
+    return catalogFetch;
+  };
+  const resolveModelSchema = async (id, signal) => {
+    // Host cache hits skip fetchDynamicModels, so public thinking metadata can
+    // exist without this process ever receiving the native request schema.
+    if (!catalogLoaded) {
+      if (signal) await abortableRequest(fetchModels, signal);
+      else await fetchModels();
+    }
+    return modelSchemas.get(id);
   };
   const catalogFile = process.env.OMP_KIRO_MODEL_CATALOG_FILE;
   const models = transport === "http" && catalogFile !== undefined
@@ -150,13 +172,9 @@ export default async function kiroExtension(pi) {
     api: `kiro-cli-${transport}`,
     // A configured account snapshot is authoritative. Advertising a dynamic
     // callback lets host offline refresh replace it with an empty dynamic set.
-    ...(models !== undefined ? { models } : {
-      async fetchDynamicModels() {
-        return rememberModels(await (transport === "http" ? discoverHttpModels() : discoverModels()));
-      },
-    }),
+    ...(models !== undefined ? { models } : { fetchDynamicModels: fetchModels }),
     streamSimple: (model, context, options) =>
-      streamKiro(model, context, options, transport, modelSchemas.get(model.id)),
+      streamKiro(model, context, options, transport, resolveModelSchema),
   });
   if (transport === "http") registerKiroWebSearch(pi);
   registerKiroCommands(pi, { transport });
