@@ -5,10 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { z } from "zod";
-import { PROVIDER_CAPABILITIES } from "@getpaseo/plugin/server/provider";
 import { readAuthSnapshot, saveKiroAuth } from "../server/auth.mjs";
 import { kiroCatalogAccountId, readKiroModelCatalog } from "../server/model-catalog.mjs";
-import { createKiroHttpProvider } from "../server/provider.mjs";
 
 // Only the unused stream constructor is substituted: registration executes the real
 // extension, auth store, bounded catalog reader, commands, and web-tool registration.
@@ -185,89 +183,3 @@ test("OMP configured wrong-account snapshot rejects before registration; no expl
   assert.equal(typeof h.providers[0].config.fetchDynamicModels, "function");
 });
 
-async function nativeConnection(t, f) {
-  let generationAuthCalls = 0;
-  const provider = createKiroHttpProvider({
-    stateDir: join(f.root, "state"),
-    authProvider: async () => {
-      generationAuthCalls++;
-      throw new Error("Current generation auth required; snapshot credentials are not usable");
-    },
-    fetchImpl: async () => { throw new Error("No network allowed during cached startup"); },
-  });
-  const connection = await provider.connect({
-    versions: [1], capabilities: PROVIDER_CAPABILITIES,
-    launch: { command: process.execPath, args: [], env: {
-      OMP_KIRO_AUTH_FILE: f.authFile, OMP_KIRO_MODEL_CATALOG_FILE: f.file,
-    } },
-  });
-  t.after(() => connection.close());
-  const events = [];
-  const pending = new Set();
-  connection.onEvent((event) => {
-    events.push(event);
-    for (const check of pending) check();
-  });
-  const waitFor = (predicate) => {
-    const found = events.find(predicate);
-    if (found) return Promise.resolve(found);
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { pending.delete(check); reject(new Error("Missing native event")); }, 5000);
-      const check = () => {
-        const result = events.find(predicate);
-        if (!result) return;
-        clearTimeout(timer);
-        pending.delete(check);
-        resolve(result);
-      };
-      pending.add(check);
-    });
-  };
-  return { connection, events, waitFor, generationAuthCalls: () => generationAuthCalls };
-}
-
-test("native catalog and session initialize offline from real metadata, then require current auth for generation", async (t) => {
-  noNetwork(t);
-  const f = await fixture(t);
-  const h = await nativeConnection(t, f);
-  await h.connection.send({ type: "catalog", requestId: "catalog" });
-  const catalog = await h.waitFor((e) => e.type === "catalog");
-  assert.deepEqual(catalog.catalog.models, [
-    { id: models[0].id, label: models[0].name, contextWindowMaxTokens: models[0].contextWindow },
-    { id: models[1].id, label: models[1].name },
-  ]);
-  assert.equal(catalog.catalog.defaultMode, "full");
-  await h.connection.send({
-    type: "session.open", requestId: "open", sessionId: "offline", history: "replay",
-    config: { cwd: f.root, env: {}, mcpServers: {}, model: models[0].id, settings: {}, persist: false },
-  });
-  await h.waitFor((e) => e.type === "session.ready" && e.requestId === "open");
-  assert.equal(h.generationAuthCalls(), 0);
-  const configuration = h.events.find((e) => e.type === "session.config");
-  assert.equal(configuration.config.model, models[0].id);
-  assert.equal(configuration.config.mode, "full");
-  await h.connection.send({
-    type: "session.prompt", sessionId: "offline",
-    prompt: { clientMessageId: "needs-auth", delivery: "auto", input: { type: "message", content: [{ type: "text", text: "Work" }] } },
-  });
-  const terminal = await h.waitFor((e) => e.type === "session.turn" && e.state === "failed");
-  assert.match(terminal.error.message, /Current generation auth required/);
-  assert.equal(h.generationAuthCalls(), 1);
-});
-
-test("native cached catalog rejects a switched account and startup rejects unadvertised model IDs", async (t) => {
-  noNetwork(t);
-  const f = await fixture(t);
-  const h = await nativeConnection(t, f);
-  await h.connection.send({
-    type: "session.open", requestId: "bad-model", sessionId: "bad-model", history: "replay",
-    config: { cwd: f.root, env: {}, mcpServers: {}, model: "invented", settings: {}, persist: false },
-  });
-  const invalid = await h.waitFor((e) => e.type === "request.failed" && e.requestId === "bad-model");
-  assert.match(invalid.error.message, /exact Kiro model ID/);
-  await saveKiroAuth({ ...auth, profile_arn: `${auth.profile_arn}-other` }, { authFile: f.authFile });
-  await h.connection.send({ type: "catalog", requestId: "wrong-account" });
-  const switched = await h.waitFor((e) => e.type === "request.failed" && e.requestId === "wrong-account");
-  assert.match(switched.error.message, /different managed account.*models\.cmd/);
-  assert.equal(h.generationAuthCalls(), 0);
-});

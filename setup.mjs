@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual, parseArgs } from "node:util";
+import { buildPaseoPlugin } from "./build-paseo.mjs";
 import { discoverModels } from "./server/bridge.mjs";
 import { discoverHttpModels } from "./server/http.mjs";
 import { authFilePath, loadKiroAuth } from "./server/auth.mjs";
@@ -35,21 +36,21 @@ async function readConfig(path) {
   }
 }
 
-async function prepareProfile({ existingValue, profileId, command, profileEnv }) {
-  const label = "Kiro (OMP)";
-  const provider = "kiro-cli";
+function prepareProfile({ existingValue, profileId, command, profileEnv, catalog, provider, label }) {
   const existing = object(existingValue, `agents.providers.${profileId}`);
+  const existingEnv = object(existing.env, `agents.providers.${profileId}.env`);
   if (
     existingValue !== undefined &&
     (existing.extends !== "omp" ||
-      existing.label !== label ||
-      (existing.command && JSON.stringify(existing.command) !== JSON.stringify(command)))
+      (provider === "kiro-http"
+        ? existingEnv.OMP_KIRO_TRANSPORT !== "http"
+        : existing.label !== label || (existingEnv.OMP_KIRO_TRANSPORT !== undefined && existingEnv.OMP_KIRO_TRANSPORT !== "acp")) ||
+      (existing.command && !isDeepStrictEqual(existing.command, command)))
   ) {
     throw new Error(
-      `Provider ${profileId} already has a different configuration. Choose another --profile; the existing provider was not changed.`,
+      `Provider ${profileId} already has a different configuration. Choose another --profile; the existing provider and its history were not changed.`,
     );
   }
-  const existingEnv = object(existing.env, `agents.providers.${profileId}.env`);
   for (const [key, value] of Object.entries(profileEnv)) {
     if (existingEnv[key] !== undefined && existingEnv[key] !== value) {
       throw new Error(
@@ -60,15 +61,12 @@ async function prepareProfile({ existingValue, profileId, command, profileEnv })
   if (existing.models !== undefined && !Array.isArray(existing.models)) {
     throw new Error(`agents.providers.${profileId}.models must be an array.`);
   }
-  const catalog = await discoverModels();
-  if (catalog.length === 0)
-    throw new Error("Kiro returned an empty model catalog; no configuration was changed.");
   const models = [...(existing.models ?? [])];
   for (const model of catalog) {
     const id = `${provider}/${model.id}`;
     if (!models.some((entry) => entry.id === id)) models.push({ id, label: model.name });
   }
-  const profile = {
+  return {
     extends: "omp",
     label,
     enabled: true,
@@ -79,7 +77,60 @@ async function prepareProfile({ existingValue, profileId, command, profileEnv })
       : {}),
     models,
   };
-  return { profile, catalog, provider };
+}
+
+export function prepareHttpProfile(existingValue, authFile, {
+  profileId = "kiro-omp-http",
+  command = ["omp"],
+  profileEnv = {},
+  catalog = [],
+} = {}) {
+  return prepareProfile({
+    existingValue,
+    profileId,
+    command,
+    profileEnv: { ...profileEnv, OMP_KIRO_TRANSPORT: "http", OMP_KIRO_AUTH_FILE: authFile },
+    catalog,
+    provider: "kiro-http",
+    label: "Kiro HTTP (OMP)",
+  });
+}
+
+export function prepareUsageInstall(config, enablePlugins = false) {
+  if (config.pluginsEnabled !== true && !enablePlugins) {
+    throw new Error(
+      "External Passession plugins are disabled. Re-run with --enable-plugins only if you trust unsandboxed plugin code to access this machine.",
+    );
+  }
+  const plugins = object(config.plugins, "plugins");
+  const installed = plugins["omp-kiro"];
+  if (installed !== undefined) {
+    object(installed, "plugins.omp-kiro");
+    if (
+      installed.source !== "directory" ||
+      typeof installed.path !== "string" ||
+      resolve(installed.path) !== packageDir
+    ) {
+      throw new Error(
+        "omp-kiro is installed from another source. Update that installation explicitly; no source or settings were replaced.",
+      );
+    }
+  }
+  return {
+    installed,
+    enableExisting: installed?.enabled === false && enablePlugins,
+    reloadExisting: installed !== undefined && installed.enabled !== false,
+  };
+}
+
+export function requireNativePaseoVersion(output) {
+  const match = /^paseo\s+(\d+)\.(\d+)\.(\d+)(?:\+[\w.-]+)?\s*$/i.exec(output.trim());
+  const version = match?.slice(1).map(Number);
+  if (!version || !(version[0] > 0 || version[1] > 13 || (version[1] === 13 && version[2] >= 13))) {
+    throw new Error(
+      "The native usage plugin requires Passession (paseo CLI and daemon) 0.13.13 or newer. Upgrade the host before setup; no configuration was changed.",
+    );
+  }
 }
 
 async function saveConfig({ configPath, original, next }) {
@@ -91,44 +142,12 @@ async function saveConfig({ configPath, original, next }) {
     const mode = original === null ? 0o600 : (await stat(configPath)).mode & 0o777;
     await writeFile(temporary, contents, { flag: "wx", mode });
     if ((await readConfig(configPath)) !== original) {
-      throw new Error("Paseo config changed during setup; rerun to merge its latest contents.");
+      throw new Error("Passession config changed during setup; rerun to merge its latest contents.");
     }
     await rename(temporary, configPath);
   } finally {
     await rm(temporary, { force: true });
   }
-}
-
-export function prepareHttpProfile(existingValue, authFile) {
-  const existing = object(existingValue, "agents.providers.kiro-http");
-  const env = object(existing.env, "agents.providers.kiro-http.env");
-  const legacy =
-    existing.extends === "omp" &&
-    existing.label === "Kiro (HTTP)" &&
-    env.OMP_KIRO_TRANSPORT === "http";
-  if (existing.extends !== undefined && !legacy) {
-    throw new Error(
-      "kiro-http is configured for another provider; no existing configuration was replaced.",
-    );
-  }
-  const next = {
-    ...existing,
-    enabled: existing.enabled ?? true,
-    env: { ...env, OMP_KIRO_AUTH_FILE: authFile },
-  };
-  if (legacy) {
-    for (const key of ["extends", "label", "command", "models"]) delete next[key];
-    for (const key of [
-      "OMP_KIRO_TRANSPORT",
-      "OMP_KIRO_COMMAND",
-      "PI_CODING_AGENT_DIR",
-      "OMP_PROFILE",
-      "PI_PROFILE",
-      "PI_CONFIG_DIR",
-    ])
-      delete next.env[key];
-  }
-  return { profile: next, legacy };
 }
 
 function paseo(command, args) {
@@ -141,91 +160,49 @@ function paseo(command, args) {
   return child.stdout;
 }
 
-async function installHttp({ values, configPath, config, providers }) {
-  if (values.profile !== undefined && values.profile !== "kiro-http")
-    throw new Error(
-      "The native HTTP provider ID is kiro-http; --profile selects only OMP profiles.",
-    );
-  if (config.pluginsEnabled !== true && !values["enable-plugins"])
-    throw new Error(
-      "External Paseo plugins are disabled. Re-run with --enable-plugins only if you trust unsandboxed plugin code to access this machine.",
-    );
+async function installUsage({ values, configPath, config, profileId, profile, previous }) {
   const command = values["paseo-command"];
   const home = dirname(configPath);
-  const previous = providers["kiro-http"];
-  const previousEnv = object(previous?.env, "agents.providers.kiro-http.env");
-  const authFile = authFilePath(
-    values["auth-file"] ? absolutePath(values["auth-file"]) : undefined,
-    { ...process.env, ...previousEnv },
-  );
-  const { profile, legacy } = prepareHttpProfile(previous, authFile);
-  if (legacy) {
-    const sessions = JSON.parse(
-      paseo(command, ["ls", "--all", "--global", "--json", "--home", home]),
-    );
-    if (!Array.isArray(sessions))
-      throw new Error("Cannot inspect existing Paseo sessions; no configuration was replaced.");
-    if (
-      sessions.some(
-        (session) => session.provider === "kiro-http" || session.provider?.startsWith("kiro-http/"),
-      )
-    )
-      throw new Error(
-        "Existing OMP-backed kiro-http sessions cannot resume as native HTTP sessions. Export and remove those sessions before switching; no session or profile was changed.",
-      );
-  }
-  const configuredPlugins = object(config.plugins, "plugins");
-  const installed = configuredPlugins["omp-kiro"];
-  if (installed && (installed.source !== "directory" || resolve(installed.path) !== packageDir))
-    throw new Error(
-      "omp-kiro is installed from another source. Update that installation explicitly; no source was replaced.",
-    );
-  const catalog = await discoverHttpModels({
-    authProvider: (options) => loadKiroAuth({ ...options, authFile }),
-  });
-  if (!catalog.length)
-    throw new Error("Kiro returned an empty model catalog; no configuration was changed.");
+  const { installed } = prepareUsageInstall(config, values["enable-plugins"]);
+  await buildPaseoPlugin();
   if (!installed) paseo(command, ["plugin", "install", packageDir, "--home", home, "--json"]);
   const original = await readConfig(configPath);
-  const latest = object(JSON.parse(original), "config.json");
+  const latest = object(original === null ? {} : JSON.parse(original), "config.json");
   const latestAgents = object(latest.agents, "agents");
   const latestProviders = object(latestAgents.providers, "agents.providers");
-  if (!isDeepStrictEqual(latestProviders["kiro-http"], previous))
-    throw new Error(
-      "The kiro-http provider changed during setup. Re-run to merge the latest settings.",
-    );
+  if (profileId && !isDeepStrictEqual(latestProviders[profileId], previous)) {
+    throw new Error(`The ${profileId} provider changed during setup. Re-run to merge the latest settings.`);
+  }
+  const plan = prepareUsageInstall(latest, values["enable-plugins"]);
+  if (!plan.installed) throw new Error("The plugin installation changed during setup; rerun setup.");
   await saveConfig({
     configPath,
     original,
     next: {
       ...latest,
-      pluginsEnabled: true,
-      agents: { ...latestAgents, providers: { ...latestProviders, "kiro-http": profile } },
+      ...(values["enable-plugins"] ? {
+        pluginsEnabled: true,
+        plugins: {
+          ...object(latest.plugins, "plugins"),
+          "omp-kiro": { ...plan.installed, enabled: true },
+        },
+      } : {}),
+      ...(profileId ? {
+        agents: { ...latestAgents, providers: { ...latestProviders, [profileId]: profile } },
+      } : {}),
     },
   });
   paseo(command, ["daemon", "reload", "--home", home, "--json"]);
-  if (installed)
-    paseo(command, [
-      "plugin",
-      installed.enabled === false ? "enable" : "reload",
-      "omp-kiro",
-      "--home",
-      home,
-      "--json",
-    ]);
-  console.log(
-    `Installed the native kiro-http provider and Kiro usage source (${catalog.length} live models).`,
-  );
-  console.log(`Auth store: ${authFile}. Credentials were not copied into Paseo configuration.`);
-  console.log("Select Kiro HTTP in Paseo; model IDs no longer include a kiro-http/ prefix.");
-  console.log(`Usage: paseo usage --refresh --home ${JSON.stringify(home)}`);
-  if (profile.enabled === false)
-    console.log(
-      "The existing provider remains disabled; enable agents.providers.kiro-http explicitly.",
-    );
-  console.log(
-    "Configuration reloaded without restarting the daemon. No OMP/Kiro process or model prompt was started.",
-  );
+  if (plan.enableExisting || (installed && plan.reloadExisting)) {
+    paseo(command, ["plugin", plan.enableExisting ? "enable" : "reload", "omp-kiro", "--home", home, "--json"]);
+  }
+  console.log("Installed the native Kiro account-usage source. OMP remains the coding-agent harness.");
+  if (plan.installed.enabled === false && !plan.enableExisting) {
+    console.log("The existing plugin remains disabled. To trust and enable it, rerun with --usage-only --enable-plugins.");
+  }
+  console.log(`Usage: paseo usage ls --refresh --home ${JSON.stringify(home)}`);
+  console.log("Global usage uses the daemon's OMP_KIRO_AUTH_FILE/XDG/HOME environment; session usage uses that OMP profile's environment. Align custom auth stores explicitly.");
+  console.log("Configuration/plugin reload only; setup did not restart the daemon or remove session history.");
 }
 
 export async function runSetup(argv = process.argv.slice(2)) {
@@ -237,6 +214,7 @@ export async function runSetup(argv = process.argv.slice(2)) {
       "omp-command": { type: "string", default: "omp" },
       profile: { type: "string" },
       http: { type: "boolean" },
+      "usage-only": { type: "boolean" },
       "paseo-command": { type: "string", default: "paseo" },
       "auth-file": { type: "string" },
       "enable-plugins": { type: "boolean" },
@@ -246,40 +224,59 @@ export async function runSetup(argv = process.argv.slice(2)) {
   if (values.help) {
     console.log(`Usage: node setup.mjs --paseo-home <directory> [options]
 
-  --paseo-home <directory>    Paseo config directory (or PASEO_HOME; required)
+  --paseo-home <directory>    Passession config directory (or PASEO_HOME; required)
   --omp-agent-dir <directory> OMP agent directory (or PI_CODING_AGENT_DIR)
   --omp-command <executable>  OMP executable, not shell arguments (default: omp)
-  --profile <id>             ACP/OMP provider ID (default: kiro-omp)
-  --http                     Install the native Paseo HTTP provider (no OMP/Kiro CLI)
-  --auth-file <path>          HTTP managed auth store (default: OMP_KIRO_AUTH_FILE)
-  --enable-plugins            Trust and enable unsandboxed external Paseo plugins
+  --profile <id>             OMP profile ID (default: kiro-omp / kiro-omp-http)
+  --http                     Set up OMP HTTP profile plus native account usage
+  --usage-only               Install only usage; no OMP install, discovery, or auth refresh
+  --auth-file <path>          HTTP profile's managed auth store
+  --enable-plugins           Trust unsandboxed plugins; enable global switch and this plugin
   --paseo-command <executable> Paseo CLI executable (default: paseo)
 
-Requires Node.js 22.13+. Native HTTP requires Paseo 0.13+ and managed Kiro login.
+Requires Node.js 22.13+. Native usage requires Passession 0.13.13+ and Rust 1.93+.
+HTTP profiles require OMP and managed Kiro login, not Kiro CLI.
 ACP requires OMP and an authenticated Kiro CLI login.
 OMP_KIRO_COMMAND selects the ACP executable. OMP_KIRO_TRANSPORT=http selects --http.
-Model discovery uses metadata only; no model prompt or daemon restart is sent.
-Existing settings, other providers, and model defaults are retained.`);
+Existing settings, disabled states, unrelated providers, and history are retained.
+No daemon restart is sent. Custom global usage auth must match the daemon environment.`);
     return;
   }
 
   const paseoHome = values["paseo-home"] || process.env.PASEO_HOME;
   if (!paseoHome) throw new Error("Pass --paseo-home <directory> or set PASEO_HOME explicitly.");
+  if (values["usage-only"] && (values.http || values.profile || values["auth-file"] || values["omp-agent-dir"])) {
+    throw new Error("--usage-only does not configure an OMP profile; omit --http, --profile, --auth-file, and --omp-agent-dir. Custom global auth follows the daemon environment.");
+  }
   const transport = values.http ? "http" : process.env.OMP_KIRO_TRANSPORT || "acp";
-  if (!["acp", "http"].includes(transport))
+  if (!values["usage-only"] && !["acp", "http"].includes(transport)) {
     throw new Error("OMP_KIRO_TRANSPORT must be acp or http.");
+  }
   const configPath = join(absolutePath(paseoHome), "config.json");
   const original = await readConfig(configPath);
   const config = object(original === null ? {} : JSON.parse(original), "config.json");
   const agents = object(config.agents, "agents");
   const providers = object(agents.providers, "agents.providers");
-  if (transport === "http") {
-    await installHttp({ values, configPath, config, providers });
+  const withUsage = values["usage-only"] || transport === "http";
+  if (withUsage) {
+    prepareUsageInstall(config, values["enable-plugins"]);
+    requireNativePaseoVersion(paseo(values["paseo-command"], ["--version"]));
+    const status = JSON.parse(paseo(values["paseo-command"], [
+      "daemon", "status", "--home", dirname(configPath), "--json",
+    ]));
+    if (typeof status.daemonVersion !== "string") {
+      throw new Error("Cannot verify the selected running daemon. Start Passession and rerun setup; no configuration was changed.");
+    }
+    requireNativePaseoVersion(`paseo ${status.daemonVersion}`);
+  }
+  if (values["usage-only"]) {
+    await installUsage({ values, configPath, config });
     return;
   }
-  if (values["auth-file"] || values["enable-plugins"])
-    throw new Error("--auth-file and --enable-plugins apply only to --http.");
-  const profileId = values.profile ?? "kiro-omp";
+  if (!withUsage && (values["auth-file"] || values["enable-plugins"])) {
+    throw new Error("--auth-file and --enable-plugins apply only to --http or --usage-only.");
+  }
+  const profileId = values.profile ?? (transport === "http" ? "kiro-omp-http" : "kiro-omp");
   if (
     !/^[a-z][a-z0-9-]*$/.test(profileId) ||
     ["claude", "codex", "copilot", "opencode", "pi", "omp"].includes(profileId)
@@ -290,58 +287,61 @@ Existing settings, other providers, and model defaults are retained.`);
     ? absolutePath(values["omp-command"])
     : values["omp-command"];
   if (!ompCommand) throw new Error("--omp-command must name an executable.");
-  const env = { ...process.env, OMP_KIRO_TRANSPORT: "acp" };
+  const previous = providers[profileId];
+  const previousEnv = object(previous?.env, `agents.providers.${profileId}.env`);
+  const env = { ...process.env, ...previousEnv };
   const agentDir = values["omp-agent-dir"] || env.PI_CODING_AGENT_DIR;
   if (agentDir) env.PI_CODING_AGENT_DIR = absolutePath(agentDir);
   const profileEnv = { OMP_KIRO_TRANSPORT: "acp" };
   for (const key of [
-    "PI_CODING_AGENT_DIR",
-    "OMP_PROFILE",
-    "PI_PROFILE",
-    "PI_CONFIG_DIR",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_STATE_HOME",
-    "XDG_CACHE_HOME",
-    "OMP_KIRO_COMMAND",
-    "OMP_KIRO_AUTH_FILE",
+    "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR",
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
+    "OMP_KIRO_COMMAND", "OMP_KIRO_AUTH_FILE",
   ]) {
     if (env[key]) profileEnv[key] = env[key];
   }
-
-  const { profile, catalog, provider } = await prepareProfile({
-    existingValue: providers[profileId],
-    profileId,
-    command: [ompCommand],
-    profileEnv,
+  let authFile;
+  if (transport === "http") {
+    authFile = authFilePath(values["auth-file"] ? absolutePath(values["auth-file"]) : undefined, env);
+    profileEnv.OMP_KIRO_TRANSPORT = "http";
+    profileEnv.OMP_KIRO_AUTH_FILE = authFile;
+  }
+  const provider = transport === "http" ? "kiro-http" : "kiro-cli";
+  const prepare = (catalog) => transport === "http"
+    ? prepareHttpProfile(previous, authFile, { profileId, command: [ompCommand], profileEnv, catalog })
+    : prepareProfile({
+      existingValue: previous, profileId, command: [ompCommand], profileEnv, catalog, provider,
+      label: "Kiro (OMP)",
+    });
+  // Validate conflicts before discovery can refresh credentials or invoke Kiro.
+  prepare([]);
+  const catalog = transport === "http"
+    ? await discoverHttpModels({ authProvider: (options) => loadKiroAuth({ ...options, authFile }) })
+    : await discoverModels();
+  if (!catalog.length) throw new Error("Kiro returned an empty model catalog; no configuration was changed.");
+  const profile = prepare(catalog);
+  const installed = spawnSync(ompCommand, ["install", packageDir], {
+    env: { ...env, ...profileEnv }, stdio: "inherit",
   });
-
-  const installed = spawnSync(ompCommand, ["install", packageDir], { env, stdio: "inherit" });
   if (installed.error) throw installed.error;
-  if (installed.status !== 0)
-    throw new Error(
-      `OMP extension installation failed (${installed.signal || installed.status}); Paseo configuration was not changed.`,
-    );
-
-  const next = {
-    ...config,
-    agents: { ...agents, providers: { ...providers, [profileId]: profile } },
-  };
-  await saveConfig({ configPath, original, next });
+  if (installed.status !== 0) {
+    throw new Error(`OMP extension installation failed (${installed.signal || installed.status}); Passession configuration was not changed.`);
+  }
+  if (withUsage) {
+    await installUsage({ values, configPath, config, profileId, profile, previous });
+  } else {
+    await saveConfig({ configPath, original, next: {
+      ...config, agents: { ...agents, providers: { ...providers, [profileId]: profile } },
+    } });
+    console.log(`Reload configuration without restarting: paseo daemon reload --home ${JSON.stringify(dirname(configPath))}`);
+    console.log("ACP setup did not reload or restart a daemon.");
+  }
   console.log(`Registered ${profileId} (${profile.label}) in ${configPath}.`);
   console.log(`Models: ${catalog.map((model) => `${provider}/${model.id}`).join(", ")}`);
-  console.log(
-    `Standalone: ${JSON.stringify(ompCommand)} --model ${JSON.stringify(`${provider}/${catalog[0].id}`)}`,
-  );
-  console.log(
-    "Use the same OMP environment for standalone sessions. Keep this checkout in place: OMP links the local package.",
-  );
-  if (profile.enabled === false)
-    console.log("The existing profile remains disabled; enable it explicitly to show it in Paseo.");
-  console.log(
-    `Reload configuration without restarting: paseo daemon reload --home ${JSON.stringify(dirname(configPath))}`,
-  );
-  console.log(`Then select ${profile.label} in Paseo. Setup did not reload or restart a daemon.`);
+  console.log(`Standalone: ${transport === "http" ? `OMP_KIRO_TRANSPORT=http OMP_KIRO_AUTH_FILE=${JSON.stringify(authFile)} ` : ""}${JSON.stringify(ompCommand)} --model ${JSON.stringify(`${provider}/${catalog[0].id}`)}`);
+  console.log("Use the same OMP environment for standalone sessions. Keep this checkout in place: OMP and the usage plugin link the local package.");
+  if (profile.enabled === false) console.log("The existing OMP profile remains disabled; enable it explicitly to show it in Passession.");
+  console.log(`Then select ${profile.label} in Passession. OMP owns tools, approvals, subagents, compaction, and history.`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

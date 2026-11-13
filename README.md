@@ -1,13 +1,13 @@
 # omp-kiro
 
-Use Kiro in [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi) or Paseo. OMP gets persistent ACP and direct HTTP model providers; Paseo gets a native HTTP coding agent and account-usage source.
+Use Kiro in [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi), including OMP-backed agents in [Passession](https://github.com/emotionbug/Passession) (the `paseo` CLI). OMP provides persistent ACP and direct HTTP model transports; the native Passession plugin adds **account usage only**, not a coding-agent provider.
 
-HTTP authentication, model discovery, and generation do not require a Kiro executable. Both hosts share the managed login and HTTP implementation. No generation request falls back to another transport or model.
+HTTP authentication, model discovery, and generation do not require a Kiro executable. OMP retains its tools, approvals, subagents, compaction, and history. No generation request falls back to another transport or model.
 
 ## Requirements
 
 - **OMP extension:** OMP **18.12.6+**. The host supplies `@oh-my-pi/pi-ai`.
-- **Native Paseo plugin:** Paseo **0.13.0+**, Node.js **22.13+**, and npm for installation preparation. Neither OMP nor Kiro CLI is required.
+- **Native Passession usage plugin:** Passession CLI and daemon **0.13.13+**, Rust/Cargo **1.93+** to build, and Node.js **22.13+** for setup. OMP is required for coding-agent sessions; usage-only installation does not require OMP or Kiro CLI.
 - **Standalone authentication:** Node.js **22.13+**. Bun's SQLite is used inside OMP.
 - **ACP only:** an authenticated `kiro-cli` supporting HTTP MCP servers; developed with **Kiro CLI 2.28.0**.
 - Available Kiro account quota. This project does not bypass subscription limits.
@@ -135,44 +135,63 @@ Update a linked checkout with `git -C omp-kiro pull --ff-only`, then start a new
 omp plugin uninstall omp-kiro
 ```
 
-## Paseo
+## Passession
 
-### Native HTTP agent
+### OMP HTTP profile and native account usage
 
-From a checkout, authenticate and install:
+With the selected Passession daemon already running, authenticate and install from a local checkout:
 
 ```bash
-npx github:emotionbug/omp-kiro login --provider google
+npm ci --ignore-scripts
+node auth-cli.mjs login --provider google
 npm run setup:paseo -- --http --enable-plugins --paseo-home "$HOME/.paseo"
-paseo provider models kiro-http --home "$HOME/.paseo"
-paseo usage --refresh --home "$HOME/.paseo"
+paseo provider models kiro-omp-http --home "$HOME/.paseo"
+paseo usage ls --refresh --home "$HOME/.paseo"
 ```
 
-`--enable-plugins` explicitly trusts unsandboxed plugin code and enables Paseo's external-plugin switch. That switch also starts other configured, enabled plugins. Omit it when the switch is already enabled. The installer reloads configuration and this plugin, **not the daemon**.
+Setup installs the OMP extension, builds the Rust usage executable, and installs this checkout as the `omp-kiro` directory plugin. Select **Kiro HTTP (OMP)** when creating an agent. The profile is `kiro-omp-http`, extends `omp`, and launches OMP with `OMP_KIRO_TRANSPORT=http`, an absolute `OMP_KIRO_AUTH_FILE`, and model IDs such as `kiro-http/auto`. Kiro CLI is not needed for HTTP, but OMP remains the coding-agent harness.
 
-Select **Kiro HTTP** when creating an agent. Paseo model IDs are the live upstream IDs, such as `auto`; the `kiro-http/` prefix belongs to OMP model selectors, not the native Paseo model field. No static model list needs updating.
+`--profile another-id` chooses a separate OMP profile; `--omp-command /absolute/path/omp` selects the executable. Existing matching OMP profiles retain unrelated environment, settings, models, and disabled state. Conflicting commands, auth paths, transports, and non-OMP profiles are rejected rather than overwritten. The old direct-native `kiro-http` profile and its history are not converted or deleted.
 
-The agent streams responses and executes workspace read/list/write/edit/shell tools, managed Kiro search, and the MCP servers Paseo injects. **New native sessions default to Full access:** workspace changes/deletions, commands, and injected MCP tools execute without individual approval dialogs. Initial plugin trust and login still require the normal setup/authorization. An explicitly selected or restored **Ask** mode still requests approval before changes, commands, and MCP calls; **Plan** permits workspace reads and read-only Kiro search. Exact MCP preapproval in Ask does not approve another server/tool or native filesystem commands. These modes are not an OS sandbox.
+**0.5 native cutover:** the root Passession plugin now uses the native executable protocol and contributes only the Kiro usage source. The retired JavaScript direct Kiro provider is removed. Existing direct-native sessions are not OMP sessions and cannot resume through this usage plugin. Keep their configuration/history intact; create a separate OMP profile for new coding sessions. Existing same-checkout directory installs are rebuilt/reloaded in place, never removed and reinstalled; plugin settings are retained. Installs pointing elsewhere must be updated explicitly at their source.
 
-Workspace file tools enforce containment on canonical filesystem targets. Since 0.4.5, absolute paths using a Windows short-name/junction spelling or a POSIX symlink alias are accepted when their resolved target remains inside the workspace. New writes resolve their existing parent first. Relative traversal and physical symlink/junction escapes remain rejected before a write; aliases do not bypass workspace containment.
-
-Native sessions persist owner-private history under `$XDG_STATE_HOME/omp-kiro/paseo`, defaulting to `~/.local/state/omp-kiro/paseo`. Restore replays stable message/tool IDs and command rows. Images, file attachments, steering, and OMP-specific compaction/subagent machinery are not implemented by the native provider.
-
-The standard **Usage** panel displays account credits, plan, reset/expiry dates, and on-demand usage. Monthly, trial, bonus, and purchased pools stay separate; duplicate purchase projections are not added twice. Usage fetches never rotate credentials or change billing. If authentication expires, `/kiro-models` can refresh the managed login through metadata access, or sign in again, then refresh usage. Current Paseo exposes plugin usage globally, not through native per-agent usage scopes; account quota is distinct from reported per-turn token usage.
-
-Setup converts the generated v0.3 `Kiro (HTTP)` OMP profile into the native provider, removing `extends: omp`, the OMP command, and its stale model list. Unrelated settings and an existing disabled state are retained. Other custom providers are rejected, not overwritten. Existing OMP-backed `kiro-http` sessions block cutover rather than being misread as native history.
-
-`--auth-file /absolute/path/auth.sqlite3` selects the native provider's store. Global usage follows the plugin process's `OMP_KIRO_AUTH_FILE`/XDG environment; keep those aligned when using a custom store.
-
-For a fresh Git-source installation instead of a linked checkout:
+### Add usage to existing OMP sessions
 
 ```bash
-paseo plugin install git:emotionbug/omp-kiro --home "$HOME/.paseo"
-# Only after accepting the unsandboxed-code trust described above:
-paseo daemon config set pluginsEnabled true --home "$HOME/.paseo"
+npm run setup:paseo -- --usage-only --enable-plugins --paseo-home "$HOME/.paseo"
+paseo usage ls --refresh --home "$HOME/.paseo"
+# A specific agent's account scope:
+paseo usage ls --agent AGENT_ID --refresh --home "$HOME/.paseo"
 ```
 
-Update a directory source with `git pull --ff-only` in its checkout, then `paseo plugin reload omp-kiro`. Git-managed sources use `paseo plugin update omp-kiro`. Removal uses `paseo plugin remove omp-kiro`; removing a directory source does not delete its checkout or HTTP login.
+`--usage-only` builds/installs the usage plugin without installing OMP, discovering models, refreshing authentication, or modifying agent profiles. It needs an existing managed HTTP login to display usage, even when the OMP session uses ACP. Usage fetches read credentials only: they never rotate tokens, write authentication, purchase credits, or change billing. Expired credentials require an explicit login or an OMP metadata operation that refreshes authentication before refreshing usage again.
+
+The standard **Usage** panel displays account credits, plan, reset/expiry dates, and on-demand usage. Monthly, trial, bonus, and purchased pools remain separate; duplicate purchase projections are not added twice. **Account quota is not per-turn token usage**: missing reported token/cost fields are not an estimate of account credits or a claim of free usage.
+
+The native usage client uses system trust roots plus an approved `NODE_EXTRA_CA_CERTS` PEM bundle. It bounds each fetch to 15 seconds rather than inheriting generation's unbounded retry loop; retry through Usage refresh after fixing connectivity or authentication.
+
+### Trust, auth alignment, and updates
+
+`--enable-plugins` explicitly trusts unsandboxed native plugin code, its build scripts, dependencies, and future source updates. It enables the global external-plugin switch (which can also start other configured enabled plugins) and explicitly enables an existing disabled `omp-kiro` install. Without the flag, setup requires the global switch to be enabled already and preserves this plugin's disabled state. To enable an already installed plugin after accepting that trust:
+
+```bash
+paseo daemon config set pluginsEnabled true --home "$HOME/.paseo"
+paseo plugin enable omp-kiro --home "$HOME/.paseo"
+```
+
+`--auth-file /absolute/path/auth.sqlite3` sets the HTTP OMP profile's store. **Global discovery follows the daemon process's** `OMP_KIRO_AUTH_FILE`, absolute `XDG_CONFIG_HOME`, and `HOME`, not the setup shell or profile. **Session discovery uses only that OMP session's environment**, including its `OMP_KIRO_AUTH_FILE`; it does not fall back to the daemon's account selection. With a custom store, align login, the OMP profile, and the daemon's launch environment explicitly. `--usage-only` does not change the daemon environment or accept `--auth-file`. Setup never copies tokens into Passession config and never restarts a live daemon to change its environment.
+
+Directory-source updates require rebuilding before reload; a reload alone does not compile Rust:
+
+```bash
+git pull --ff-only
+node build-paseo.mjs
+paseo plugin reload omp-kiro --home "$HOME/.paseo"
+```
+
+On Windows, disable a running `omp-kiro` plugin before rebuilding its executable, then explicitly enable it after the build; Windows may lock a running binary. Existing disabled installations stay disabled unless setup receives `--enable-plugins`.
+
+Alternatively rerun `--usage-only` setup after updating. Rust/Cargo 1.93+ and access to the pinned SDK/dependencies are build prerequisites; `CARGO` can select a Cargo executable. The staged executable is platform-specific, including `.exe` on Windows. Keep the checkout in place. Setup uses configuration/plugin reload commands only, **never a daemon restart**. Remove the usage plugin with `paseo plugin remove omp-kiro --home "$HOME/.paseo"`; removal deletes its plugin settings, but not the linked checkout, OMP sessions, or managed login.
 
 ### OMP-backed ACP profile
 
@@ -181,13 +200,13 @@ npm run setup:paseo -- --paseo-home "$HOME/.paseo"
 paseo daemon reload --home "$HOME/.paseo"
 ```
 
-Select **Kiro (OMP)**. This profile extends `omp`; OMP owns tools, approvals, subagents, and history. Rerun ACP setup to add newly discovered models to that profile. `--profile another-id` selects a separate ACP profile; `--omp-command /absolute/path/omp` selects its executable.
+Select **Kiro (OMP)**. ACP setup retains the existing OMP-backed behavior and does not install the usage plugin automatically; add it separately with `--usage-only`. Rerun ACP setup to add newly discovered models. `--profile another-id` selects a separate ACP profile.
 
-`PI_CONFIG_DIR` selects an isolated OMP configuration; `--omp-agent-dir` / `PI_CODING_AGENT_DIR` select agent state, not the plugin installation. `PASEO_HOME` can replace `--paseo-home`. Setup preserves the selected ACP environment.
+`PI_CONFIG_DIR` selects an isolated OMP configuration; `--omp-agent-dir` / `PI_CODING_AGENT_DIR` select agent state, not the plugin installation. `PASEO_HOME` can replace `--paseo-home`. Setup preserves the selected OMP environment.
 
 ## Kiro commands
 
-Available in OMP and the native Paseo composer:
+Available in OMP, including OMP-backed Passession sessions:
 
 | Command                 | Operation                                                    |
 | ----------------------- | ------------------------------------------------------------ |
@@ -196,9 +215,9 @@ Available in OMP and the native Paseo composer:
 | `/kiro-models [filter]` | Live transport-specific model catalog                        |
 | `/kiro-model <id>`      | Change the actual session model                              |
 | `/kiro-usage`           | Managed HTTP account quota, credits, and reset dates         |
-| `/kiro-reset`           | OMP/ACP only: close this connection, retaining OMP history   |
+| `/kiro-reset`           | ACP only: close this connection, retaining OMP history       |
 
-These commands do not start model generation. ACP and HTTP can be logged into different accounts; ACP `/kiro-usage` explicitly identifies the separate managed HTTP login. Commands do not log in automatically, purchase credits, enable overage billing, change native tool trust, or delete history. OMP's existing `/model`, `/compact`, and other host commands are not replaced.
+These commands do not start model generation. ACP and HTTP can be logged into different accounts; ACP `/kiro-usage` explicitly identifies the separate managed HTTP login. Commands do not log in automatically, purchase credits, enable overage billing, change host tool trust, or delete history. OMP's existing `/model`, `/compact`, and other host commands are not replaced.
 
 ## Transport and limitations
 
@@ -218,11 +237,11 @@ Generation uses the current Kiro runtime HTTPS endpoint; model discovery uses th
 
 Since 0.4.8, system-prompt arrays are joined and prepended once to the first wire user input. Developer instructions retain their role labels and conversation positions instead of being moved ahead of earlier turns. The feature-gated top-level `systemPrompt` field is not sent: it caused HTTP 400 `ValidationException: Improperly formed request` on the live Identity Center account. Instructions are preserved as an explicit text projection, **not upstream-enforced system/developer channels**; host tool permission decisions remain authoritative.
 
-The transport decodes checksum-validated AWS event-stream frames, assembles interleaved tool argument fragments, and forwards text, reported usage, errors, and cancellation. OMP or the native Paseo provider performs approved tool execution; the transport never executes tools, replaces the selected model, or falls back to ACP. Region routing is restricted to the artifact-backed US East and EU Central Kiro endpoint families.
+The transport decodes checksum-validated AWS event-stream frames, assembles interleaved tool argument fragments, and forwards text, reported usage, errors, and cancellation. OMP performs approved tool execution; the transport never executes tools, replaces the selected model, or falls back to ACP. Region routing is restricted to the artifact-backed US East and EU Central Kiro endpoint families.
 
 **Retry ownership (0.4.2):** HTTP recovery stays inside the shared transport, including actual OMP generation. Transient failures retry **until caller cancellation**, waiting **30 seconds after each failure** by default. OMP enables the explicit `continuePartial: true` turn option: after published text is interrupted, the transport moves the current input and completed tool results into local wire history once, appends the assistant fragment, and requests only continuation. The continuation retains model, origin, conversation ID, system instructions, workspace context, and tool schema, but never copies old `toolResults` into its current message. Subsequent text appends to the same OMP assistant message; repeated outages do not depend on OMP's bounded host recovery.
 
-Since 0.4.6, native Paseo also uses explicit `continuePartial: true`: its adapter exposes append-only message deltas, so an empty replacement snapshot cannot retract already published text. Accepted text stays in the same message and continuation context without replaying completed tools. Failed-response tool fragments are discarded, and tools execute only after a complete validated response. The standalone transport still supports explicit `onRestart` for consumers that can genuinely replace provisional text; without continuation or restart, failure after published text is terminal. Before new text, retries retain the exact serialized request. Native retry notifications remain separate from assistant text.
+The standalone transport supports explicit `onRestart` for consumers that can genuinely replace provisional text; without continuation or restart, failure after published text is terminal. Before new text, retries retain the exact serialized request.
 
 Transient network failures include offline DNS (`ENOTFOUND`, `EAI_AGAIN`), unreachable/refused connections, socket drops, and response-data timeouts. HTTP 408/429/500/502/503/504 and selected framed temporary service errors are retryable. `retry.maxAttempts: null` explicitly means unlimited attempts until abort (the default); a numeric 1–5 retains an explicitly finite policy. `OMP_KIRO_HTTP_MAX_ATTEMPTS` accepts `unlimited` or 1–5. `baseDelayMs`/`maxDelayMs` (environment: `OMP_KIRO_HTTP_RETRY_BASE_MS`/`OMP_KIRO_HTTP_RETRY_MAX_MS`) accept 0–30000; custom policies retain exponential backoff capped at `maxDelayMs`, while both defaults are 30000 for fixed cadence. A longer server `Retry-After` extends the wait instead of causing an early retry or failure, and all waits are abortable. The per-attempt response-data timeout defaults to 45 seconds (`OMP_KIRO_HTTP_IDLE_TIMEOUT_MS`: 1–300000). Catalog/search/usage and command wrappers impose no shorter default total deadline; usage callers may still set an explicit `timeoutMs`.
 
@@ -234,7 +253,7 @@ The Bun bundle must be a readable regular UTF-8 PEM file containing only certifi
 
 **Clean EOF limitation:** an abrupt stream exception or partial frame is detected, but a clean EOF exactly between valid frames has no authenticated end-of-response marker in this reconstruction. If at least one event arrived and all buffered tools are complete, it can be accepted as completion even when text was cut short. No transparent retry or complete-answer guarantee is claimed for that case.
 
-**Offline startup integration (0.4.3):** a packaged host can set the absolute `OMP_KIRO_MODEL_CATALOG_FILE` path to its real account snapshot written by `models.cmd`. Before registering HTTP models, the async OMP factory reads current managed auth **without refreshing it** and validates that snapshot. Native Paseo uses the same snapshot for its initial catalog and exact model validation. The configured snapshot is authoritative: OMP does not register a dynamic discovery callback, so host offline/background refresh cannot erase its account rows or initiate a detached live discovery. Run `models.cmd` and reload/restart the packaged session to refresh registered metadata; `/kiro-models` remains an explicitly requested live query. With no explicit path, both integrations retain live discovery. A bad, missing, or wrong-account configured snapshot fails closed and asks you to refresh `models.cmd`, never silently using live discovery or invented models.
+**Offline startup integration (0.4.3):** a packaged host can set the absolute `OMP_KIRO_MODEL_CATALOG_FILE` path to its real account snapshot written by `models.cmd`. Before registering HTTP models, the async OMP factory reads current managed auth **without refreshing it** and validates that snapshot. The configured snapshot is authoritative: OMP does not register a dynamic discovery callback, so host offline/background refresh cannot erase its account rows or initiate a detached live discovery. Run `models.cmd` and reload/restart the packaged OMP session to refresh registered metadata; `/kiro-models` remains an explicitly requested live query. With no explicit path, OMP retains live discovery. A bad, missing, or wrong-account configured snapshot fails closed and asks you to refresh `models.cmd`, never silently using live discovery or invented models.
 
 The shared `server/model-catalog.mjs` API exports `kiroCatalogAccountId(auth)` and `readKiroModelCatalog(file, { auth })`. The latter returns unchanged raw model rows from a bounded (4 MiB) JSON envelope `{version:1,fetchedAt,accountId,models:[{id,name,contextWindow?,maxTokens?}]}`. `accountId` is a SHA-256 binding to managed provider/auth kind, region, client registration, and profile ARN; without an ARN it conservatively binds the refresh token, or access token if no refresh token exists. No token is written to the catalog. Renewal under the same profile preserves the binding; no-profile refresh-token rotation requires a new snapshot. IDs, names, and advertised limits are preserved; unknown fields, malformed rows, duplicate IDs, and account mismatches are rejected. An empty account catalog stays empty.
 
@@ -242,7 +261,7 @@ Snapshot age is not credential validity: genuine metadata has no synthetic TTL f
 
 ### Managed backend web search
 
-In HTTP mode, the OMP extension registers one `web_search` override using the host's extension-tool contract; it does not delegate to OMP's native external search provider. The native Paseo provider exposes the same read-only search, including Plan mode. Queries contain 1–200 Unicode characters.
+In HTTP mode, the OMP extension registers one `web_search` override using the host's extension-tool contract; it does not delegate to OMP's native external search provider. Queries contain 1–200 Unicode characters.
 
 The search client sends authenticated JSON-RPC `tools/call` requests for `web_search` to the selected Kiro runtime's `/mcp`, using the managed bearer login and the profile header. Returned source URLs, snippets, dates, and `maxVerbatimWordLimit` are retained. It does **not** open or fetch those URLs, follow redirects, or fall back to Exa, Brave, or direct website retrieval. This is backend search, **not arbitrary-URL full-page fetch**. The observed remote tool inventory advertised `web_search` only, not `web_fetch`; the plugin does not invent that capability. Account/organization web-tool policy can reject search independently of model catalog access.
 
@@ -262,14 +281,17 @@ A successful model listing only proves catalog access. Authentication, quota, or
 ```bash
 npm ci --ignore-scripts
 npm run check
-npm run typecheck
 npm run lint
 npm test
+npm run test:paseo
+npm run build:paseo
 ```
 
-The Node suite covers child/HTTP handoffs, native workspace and real HTTP/stdio MCP effects, default automatic writes/commands and explicit Ask/Plan boundaries, restoration, cancellation/process cleanup, synthetic SQLite credentials, refresh races, event framing, model routing, and Kiro-only search requests that never fetch source URLs. Retry cases include fake-time fixed 30-second cadence beyond the old three-attempt limit, cancellation during sleep, longer Retry-After, repeated committed-text continuation with completed tools retained exactly once, credential refresh/identity checks, and safe single-use auth phases. Synthetic transient fixtures use explicit fast finite policies unless deliberately exercising the unbounded default with fake timers. Tests do not use account prompt quota.
+Native tests cover scoped accounts, read-only SQLite, expiry/rejection, precise quota pools, and duplicate purchase projections with controlled HTTP peers. An isolated Linux Passession 0.13.13 smoke verified usage-only setup, persisted enablement across reload, Kiro source discovery, and expired-login reporting with byte-identical authentication storage. No production generation or Windows/macOS runtime was exercised for 0.5.
 
-Actual OMP RPC verified command output, 22 live models, and a real session model change without generation. An isolated Paseo daemon loaded the directory plugin and exercised a controlled HTTP write/tool-result loop, denied writes, approved injected MCP, and restoration with identical provider items and all query user rows. The rendered usage surface uses the standard Paseo panel. Main-daemon native catalog and account usage were also checked without restarting it.
+The Node suite covers child/HTTP handoffs, cancellation/process cleanup, synthetic SQLite credentials, refresh races, event framing, model routing, setup preservation/trust boundaries, and Kiro-only search requests that never fetch source URLs. Retry cases include fake-time fixed 30-second cadence beyond the old three-attempt limit, cancellation during sleep, longer Retry-After, repeated committed-text continuation with completed tools retained exactly once, credential refresh/identity checks, and safe single-use auth phases. Synthetic transient fixtures use explicit fast finite policies unless deliberately exercising the unbounded default with fake timers. Tests do not use account prompt quota.
+
+Historical OMP RPC verification exercised command output, 22 live models, and a real session model change without generation. Earlier direct-native provider checks do not qualify the 0.5 usage-only executable; that provider is no longer shipped.
 
 Live independent Google/GitHub device initiation and pending polling, plus Builder ID registration/device initiation, succeeded without browser approval. The actual standalone CLI also obtained a live verification link with Kiro absent from its `PATH`, then cancelled cleanly without saving credentials. A controlled CLI-to-OMP smoke exercised approval responses, private persistence, refresh rotation, actual Bun consumption, and logout. Successful new production approval/token issuance and enterprise approval interactions remain unverified; they require user approval and service entitlement. Real inference with an existing managed Identity Center login is verified below.
 

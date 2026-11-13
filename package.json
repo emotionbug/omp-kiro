@@ -1,7 +1,7 @@
 {
   "name": "omp-kiro",
-  "version": "0.4.8",
-  "description": "Kiro ACP/HTTP model providers for OMP and a native Paseo HTTP coding agent with account usage.",
+  "version": "0.5.0",
+  "description": "Kiro ACP/HTTP model providers for OMP and native account usage integration for Passession.",
   "keywords": [
     "extension",
     "kiro",
@@ -25,33 +25,29 @@
   },
   "files": [
     "index.js",
-    "index.server.ts",
     "paseo-plugin.json",
     "icon.svg",
     "server/",
     "*.mjs",
+    "paseo/Cargo.toml",
+    "paseo/Cargo.lock",
+    "paseo/src/",
     "docs/",
     "README.md",
     "LICENSE"
   ],
   "type": "module",
   "scripts": {
-    "check": "node --check index.js && node --check setup.mjs && node --check auth-cli.mjs && node --check server/bridge.mjs && node --check server/auth.mjs && node --check server/model-catalog.mjs && node --check server/http.mjs && node --check server/network.mjs && node --check server/web.mjs && node --check server/eventstream.mjs && node --check server/social-login.mjs && node --check server/oidc-login.mjs && node --check server/usage.mjs && node --check server/commands.mjs && node --check server/provider.mjs && node --check server/usage-source.mjs && node --check server/tools.mjs && node --check server/mcp.mjs",
-    "typecheck": "tsc --noEmit",
-    "lint": "oxlint index.js index.server.ts *.mjs server test",
+    "check": "node --check index.js && node --check setup.mjs && node --check auth-cli.mjs && node --check build-paseo.mjs && node --check server/bridge.mjs && node --check server/auth.mjs && node --check server/model-catalog.mjs && node --check server/http.mjs && node --check server/network.mjs && node --check server/web.mjs && node --check server/eventstream.mjs && node --check server/social-login.mjs && node --check server/oidc-login.mjs && node --check server/usage.mjs && node --check server/commands.mjs",
+    "lint": "oxlint index.js *.mjs server test",
     "test": "node --test test/*.test.mjs",
     "auth": "node auth-cli.mjs",
-    "setup:paseo": "node setup.mjs"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "1.32.2",
-    "ajv": "8.20.0"
+    "setup:paseo": "node setup.mjs",
+    "build:paseo": "node build-paseo.mjs",
+    "test:paseo": "cargo test --locked --manifest-path paseo/Cargo.toml"
   },
   "devDependencies": {
-    "@getpaseo/plugin": "0.13.0",
-    "@types/node": "24.19.2",
     "oxlint": "1.61.0",
-    "typescript": "5.9.3",
     "zod": "4.4.3"
   },
   "peerDependencies": {

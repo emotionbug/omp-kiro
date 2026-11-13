@@ -1,7 +1,9 @@
 {
   "id": "omp-kiro",
-  "name": "Kiro HTTP",
-  "description": "Direct Kiro HTTP coding agent and account usage. Uses its own managed Kiro login; no OMP or Kiro CLI process required.",
-  "requirements": { "paseo": ">=0.13.0" },
-  "build": [["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]]
+  "name": "Kiro HTTP Usage",
+  "description": "Read-only Kiro account credits for OMP sessions in Passession. OMP continues to own the coding agent.",
+  "runtime": "native",
+  "requirements": { "paseo": ">=0.13.13" },
+  "server": { "executable": "paseo/bin/omp-kiro-usage", "args": [] },
+  "build": [["node", "build-paseo.mjs"]]
 }
