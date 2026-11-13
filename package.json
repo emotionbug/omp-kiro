@@ -1,7 +1,7 @@
 {
   "name": "omp-kiro",
   "version": "0.5.0",
-  "description": "Kiro ACP/HTTP model providers for OMP and native account usage integration for Passession.",
+  "description": "Kiro ACP/HTTP model providers and managed account usage commands for OMP.",
   "keywords": [
     "extension",
     "kiro",
@@ -25,26 +25,19 @@
   },
   "files": [
     "index.js",
-    "paseo-plugin.json",
-    "icon.svg",
     "server/",
     "*.mjs",
-    "paseo/Cargo.toml",
-    "paseo/Cargo.lock",
-    "paseo/src/",
     "docs/",
     "README.md",
     "LICENSE"
   ],
   "type": "module",
   "scripts": {
-    "check": "node --check index.js && node --check setup.mjs && node --check auth-cli.mjs && node --check build-paseo.mjs && node --check server/bridge.mjs && node --check server/auth.mjs && node --check server/model-catalog.mjs && node --check server/http.mjs && node --check server/network.mjs && node --check server/web.mjs && node --check server/eventstream.mjs && node --check server/social-login.mjs && node --check server/oidc-login.mjs && node --check server/usage.mjs && node --check server/commands.mjs",
+    "check": "node --check index.js && node --check setup.mjs && node --check auth-cli.mjs && node --check server/bridge.mjs && node --check server/auth.mjs && node --check server/model-catalog.mjs && node --check server/http.mjs && node --check server/network.mjs && node --check server/web.mjs && node --check server/eventstream.mjs && node --check server/social-login.mjs && node --check server/oidc-login.mjs && node --check server/usage.mjs && node --check server/commands.mjs",
     "lint": "oxlint index.js *.mjs server test",
     "test": "node --test test/*.test.mjs",
     "auth": "node auth-cli.mjs",
-    "setup:paseo": "node setup.mjs",
-    "build:paseo": "node build-paseo.mjs",
-    "test:paseo": "cargo test --locked --manifest-path paseo/Cargo.toml"
+    "setup:paseo": "node setup.mjs"
   },
   "devDependencies": {
     "oxlint": "1.61.0",

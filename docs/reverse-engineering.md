@@ -86,6 +86,8 @@ The live response returned the same purchased credit pool in both `addOnMetadata
 
 Packaged guide observations `ev_993885c4ee305f3280c07117c053efeafaa078189acebfaaac850748d148c0ad` and `ev_9ab0f259df5ee2cd1617aa0e35b4aa39a373ba879495846c70a98f58c2615f52` show engine-specific slash inventories. Some `/help` variants invoke an AI help agent. Consequently the integration implements local help and explicit account/model queries instead of forwarding arbitrary slash text to Kiro. OMP keeps its own history, compaction, tool-trust, and model machinery; ACP reset closes only the current bridge connection.
 
+Current integration contract: Passession 0.13.18+ owns built-in usage source `kiro`; this repository retains the JS usage normalization/client for OMP `/kiro-usage`, managed login, and ACP/HTTP model transports. Profile setup installs only the OMP extension and profile; it does not inspect daemon versions, install/enable external plugins, or reload/restart the daemon. Built-in account usage reads managed HTTP credentials without refresh/write; global discovery follows the daemon environment and session discovery follows only the OMP session environment. The daemon migration retires the old external `omp-kiro` registration without deleting its source checkout, saved settings, authentication, profiles, or history. This is a source/setup contract, not a new runtime observation.
+
 ## Authentication acquisition and storage
 
 ### Current social device protocol
@@ -150,7 +152,7 @@ The user-reported environment-specific native CLI failure was not rerun. No spec
 
 ## Historical 0.4 Paseo runtime evidence
 
-This section records the former JavaScript direct-provider integration. Version 0.5 replaces that plugin with a native, read-only usage source; the coding agent stays in OMP. These historical observations do not establish current native-plugin compatibility.
+This section records the former JavaScript direct-provider integration. The subsequent 0.5 external native usage plugin was also retired when account usage moved into Passession's built-in source in 0.13.18. Coding agents stay in OMP. These historical observations do not establish current built-in usage compatibility.
 
 The former provider imported implementation modules from `server/` through the old Paseo runtime compiler. Its direct sessions defaulted to `full`; explicit/restored `ask` and `plan` remained authoritative. That provider and its runtime-specific tools are no longer distributed.
 
@@ -158,7 +160,7 @@ Actual isolated-daemon observation `ev_a2720ad1c9461378778134522fdcbb8b408b48f4a
 
 An initial actual refresh exposed changing user IDs and missing query user rows. After correction, `ev_e99ce981599d92f28869eff93ab4243e19ca72c28907d44cdc23e60719735519` proved exact deep equality of all ten provider timeline items, including four user rows and stable tool IDs, across SDK refresh. Query commands stayed out of native generation history. Core-generated envelope timestamps and envelope turn IDs are not preserved by current Paseo rehydration; no exact-envelope claim is made.
 
-The former rendered Usage panel displayed controlled Kiro Pro quota and fractional credit balances. The installed 0.4 plugin separately returned the actual 22-model catalog and real account quota without restarting the daemon or calling generation. Its SDK usage fetches read but never refreshed/wrote the managed login. Its `PluginAgentSession` lacked `usageSession()`, so those observations established global quota only, not the current native runtime's session-scoped integration.
+The former rendered Usage panel displayed controlled Kiro Pro quota and fractional credit balances. The installed 0.4 plugin separately returned the actual 22-model catalog and real account quota without restarting the daemon or calling generation. Its SDK usage fetches read but never refreshed/wrote the managed login. Its `PluginAgentSession` lacked `usageSession()`, so those observations established global quota only, not current built-in session-scoped integration.
 
 ## Generation reconstruction and its limits
 

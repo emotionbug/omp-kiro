@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { prepareHttpProfile, prepareUsageInstall, requireNativePaseoVersion, runSetup } from "../setup.mjs";
+import { KiroAuthError } from "../server/auth.mjs";
+import { prepareHttpProfile, runSetup } from "../setup.mjs";
 
 const packageDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const catalog = [{ id: "auto", name: "Auto" }, { id: "model-new", name: "New model" }];
@@ -63,71 +64,57 @@ test("HTTP setup refuses direct-native profiles, other harnesses, and launch/env
   }
 });
 
-test("plugin trust is explicit and preserves a disabled directory install unless authorized", () => {
-  const installed = { source: "directory", path: packageDir, enabled: false };
-  const config = {
-    pluginsEnabled: true,
-    plugins: { "omp-kiro": installed, other: { source: "directory", path: "/other", enabled: false } },
-    pluginSettings: { "omp-kiro": { retained: true } },
-    agents: { providers: { "kiro-http": { enabled: false, env: { KEEP: "yes" } } } },
-  };
-  const before = structuredClone(config);
-  assert.deepEqual(prepareUsageInstall(config), { installed, enableExisting: false, reloadExisting: false });
-  assert.deepEqual(prepareUsageInstall(config, true), { installed, enableExisting: true, reloadExisting: false });
-  assert.throws(() => prepareUsageInstall({ ...config, pluginsEnabled: false }), /--enable-plugins/);
-  assert.equal(prepareUsageInstall({ ...config, pluginsEnabled: false }, true).enableExisting, true);
-  assert.deepEqual(config, before);
-});
-
-test("usage installation reloads enabled same-root installs without replacing other sources", () => {
-  const installed = { source: "directory", path: packageDir, enabled: true };
-  assert.deepEqual(prepareUsageInstall({ pluginsEnabled: true, plugins: { "omp-kiro": installed } }), {
-    installed, enableExisting: false, reloadExisting: true,
-  });
-  assert.equal(prepareUsageInstall({ pluginsEnabled: true }).installed, undefined);
-  for (const source of [
-    { source: "directory", path: "/another/checkout" },
-    { source: "git", path: packageDir },
-    null,
-  ]) {
-    assert.throws(() => prepareUsageInstall({ pluginsEnabled: true, plugins: { "omp-kiro": source } }));
-  }
-});
-
-test("native usage rejects old, prerelease, and unrecognized hosts", () => {
-  for (const version of ["paseo 0.13.0", "paseo 0.13.12", "paseo 0.13.13-beta.1", "v22.13.0", "unknown"]) {
-    assert.throws(() => requireNativePaseoVersion(version), /0\.13\.13/);
-  }
-});
-
-test("HTTP and usage-only require trust before reading or refreshing authentication", async (t) => {
-  const home = await mkdtemp(join(tmpdir(), "kiro-setup-trust-"));
-  t.after(() => rm(home, { recursive: true, force: true }));
-  for (const mode of ["--http", "--usage-only"]) {
-    await assert.rejects(runSetup([mode, "--paseo-home", home]), /--enable-plugins/);
-  }
-});
-
-test("usage-only rejects unsupported executables before modifying existing profiles or plugin settings", async (t) => {
-  const home = await mkdtemp(join(tmpdir(), "kiro-setup-version-"));
+test("HTTP setup reaches managed authentication without the Passession CLI or daemon", async (t) => {
+  const home = await mkdtemp(join(tmpdir(), "kiro-setup-auth-"));
   t.after(() => rm(home, { recursive: true, force: true }));
   const path = join(home, "config.json");
   const original = JSON.stringify({
-    pluginsEnabled: true,
+    pluginsEnabled: false,
     plugins: { "omp-kiro": { source: "directory", path: packageDir, enabled: false } },
     pluginSettings: { "omp-kiro": { keep: true } },
     agents: { providers: { "kiro-http": { env: { OMP_KIRO_AUTH_FILE: "/existing.sqlite3" } } } },
   });
   await writeFile(path, original);
-  // Node's real --version is not a compatible Passession host; no fake CLI or daemon is started.
-  await assert.rejects(runSetup([
-    "--usage-only", "--paseo-home", home, "--paseo-command", process.execPath,
-  ]), /0\.13\.13/);
+  const previousPath = process.env.PATH;
+  process.env.PATH = home;
+  try {
+    await assert.rejects(runSetup([
+      "--http", "--paseo-home", home,
+      "--auth-file", join(home, "missing.sqlite3"),
+    ]), KiroAuthError);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+  }
   assert.equal(await readFile(path, "utf8"), original);
 });
 
-test("usage-only cannot silently apply profile or authentication changes", async () => {
-  for (const option of [["--http"], ["--profile", "existing"], ["--auth-file", "/another.sqlite3"], ["--omp-agent-dir", "/state"]]) {
-    await assert.rejects(runSetup(["--usage-only", "--paseo-home", "/unused", ...option]), /does not configure an OMP profile/);
+test("setup rejects malformed config without replacing it", async (t) => {
+  const home = await mkdtemp(join(tmpdir(), "kiro-setup-config-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const path = join(home, "config.json");
+  for (const original of ["{", "null", '{"agents":[]}', '{"agents":{"providers":[]}}']) {
+    await writeFile(path, original);
+    await assert.rejects(runSetup(["--paseo-home", home]));
+    assert.equal(await readFile(path, "utf8"), original);
   }
+});
+
+test("ACP rejects HTTP-only auth selection without changing existing configuration", async (t) => {
+  const home = await mkdtemp(join(tmpdir(), "kiro-setup-acp-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const path = join(home, "config.json");
+  const original = '{"agents":{"providers":{"kiro-omp":{"extends":"omp","enabled":false}}}}';
+  await writeFile(path, original);
+  const transport = process.env.OMP_KIRO_TRANSPORT;
+  process.env.OMP_KIRO_TRANSPORT = "acp";
+  try {
+    await assert.rejects(runSetup([
+      "--paseo-home", home, "--auth-file", join(home, "missing.sqlite3"),
+    ]), /--auth-file applies only to --http/);
+  } finally {
+    if (transport === undefined) delete process.env.OMP_KIRO_TRANSPORT;
+    else process.env.OMP_KIRO_TRANSPORT = transport;
+  }
+  assert.equal(await readFile(path, "utf8"), original);
 });

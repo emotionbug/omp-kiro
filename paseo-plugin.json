@@ -1,9 +1,0 @@
-{
-  "id": "omp-kiro",
-  "name": "Kiro HTTP Usage",
-  "description": "Read-only Kiro account credits for OMP sessions in Passession. OMP continues to own the coding agent.",
-  "runtime": "native",
-  "requirements": { "paseo": ">=0.13.13" },
-  "server": { "executable": "paseo/bin/omp-kiro-usage", "args": [] },
-  "build": [["node", "build-paseo.mjs"]]
-}
