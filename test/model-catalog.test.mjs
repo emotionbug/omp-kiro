@@ -179,6 +179,36 @@ function registrationHost() {
   };
 }
 
+function profileCommandHost() {
+  const h = registrationHost();
+  h.commands = new Map();
+  h.messages = [];
+  h.selected = [];
+  let catalog = [];
+  h.ctx = {
+    model: cachedModel,
+    isIdle: () => true,
+    modelRegistry: {
+      async refreshProvider() {
+        const config = h.providers.at(-1).config;
+        catalog = config.fetchDynamicModels ? await config.fetchDynamicModels() : config.models;
+      },
+      find: (provider, id) => {
+        const model = catalog.find((model) => model.id === id);
+        return model ? { ...model, provider, api: "kiro-cli-http" } : undefined;
+      },
+    },
+  };
+  h.pi.registerCommand = (name, command) => h.commands.set(name, command);
+  h.pi.sendMessage = (message) => h.messages.push(message);
+  h.pi.setModel = async (model) => {
+    h.selected.push(model);
+    h.ctx.model = model;
+    return true;
+  };
+  return h;
+}
+
 test("default OMP transport registers authoritative HTTP account models offline without CLI discovery", async (t) => {
   noNetwork(t);
   const f = await fixture(t);
@@ -472,4 +502,103 @@ test("OMP Auto/off preserves advertised native off controls and omitted defaults
     }
     assert.deepEqual(requests.slice(start), [off, off, undefined]);
   }
+});
+
+test("profile switch bypasses an old snapshot and replaces native schemas without choosing another model", async (t) => {
+  const credential = { ...auth, expires_at: "2999-01-01T00:00:00Z" };
+  const f = await fixture(t, credential);
+  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_AUTH_FILE", f.authFile);
+  setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", f.file);
+  await writeFile(f.file, JSON.stringify({
+    ...f.snapshot,
+    models: [{ id: "cached", name: "Cached", additionalModelRequestFieldsSchema: cachedSchema }],
+  }));
+  const nextArn = `${auth.profile_arn}-next`;
+  const nextSchema = {
+    properties: { output_config: { properties: { effort: { enum: ["high", "none"] } } } },
+  };
+  let discoveries = 0;
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    if (init.headers["x-amz-target"]?.endsWith(".ListAvailableProfiles"))
+      return Response.json({ profiles: [
+        { arn: auth.profile_arn, profileName: "Original" },
+        { arn: nextArn, profileName: "Next Profile" },
+      ] });
+    if (new URL(url).hostname.startsWith("management.")) {
+      discoveries++;
+      return Response.json({ models: [
+        { modelId: "cached", additionalModelRequestFieldsSchema: nextSchema },
+        { modelId: "unrelated" },
+      ] });
+    }
+    requests.push(JSON.parse(init.body).additionalModelRequestFields);
+    return textResponse();
+  });
+  const h = profileCommandHost();
+  await kiroExtension(h.pi);
+  const originalConfig = h.providers[0].config;
+  const before = await originalConfig.streamSimple(cachedModel, turnContext, { reasoning: "high" }).result();
+  assert.equal(before.type, "done");
+  await h.commands.get("kiro-profile").handler("Next Profile", h.ctx);
+  assert.match(h.messages.at(-1).content, /Kiro profile selected/);
+  assert.match(h.messages.at(-1).content, /snapshot.*bypassed.*models\.cmd/);
+  assert.match(h.messages.at(-1).content, /all sessions sharing this managed auth store/);
+  assert.equal(discoveries, 1);
+  assert.equal(h.selected.length, 1);
+  assert.equal(h.selected[0].id, "cached");
+  assert.deepEqual(h.providers.at(-1).config.models, []);
+  assert.equal(typeof h.providers.at(-1).config.fetchDynamicModels, "function");
+  // Even an old host stream closure must resolve the new profile's schema.
+  const after = await originalConfig.streamSimple(h.ctx.model, turnContext, { reasoning: "high" }).result();
+  assert.equal(after.type, "done");
+  assert.deepEqual(requests, [
+    { reasoning: { effort: "high" } },
+    { output_config: { effort: "high" } },
+  ]);
+  assert.equal(JSON.parse(await readFile(f.file, "utf8")).accountId, f.snapshot.accountId);
+});
+
+test("external profile selection blocks old native schemas until an explicit model refresh", async (t) => {
+  const credential = { ...auth, expires_at: "2999-01-01T00:00:00Z" };
+  const f = await fixture(t, credential);
+  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_AUTH_FILE", f.authFile);
+  setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", undefined);
+  const nextSchema = {
+    properties: { output_config: { properties: { effort: { enum: ["high", "none"] } } } },
+  };
+  let discoveries = 0;
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    if (new URL(url).hostname.startsWith("management.")) {
+      discoveries++;
+      return Response.json({ models: [{
+        modelId: "cached",
+        additionalModelRequestFieldsSchema: discoveries === 1 ? cachedSchema : nextSchema,
+      }] });
+    }
+    requests.push(JSON.parse(init.body).additionalModelRequestFields);
+    return textResponse();
+  });
+  const h = profileCommandHost();
+  await kiroExtension(h.pi);
+  const originalConfig = h.providers[0].config;
+  assert.equal((await originalConfig.streamSimple(cachedModel, turnContext, { reasoning: "high" }).result()).type, "done");
+  await saveKiroAuth({ ...credential, profile_arn: `${auth.profile_arn}-external` }, { authFile: f.authFile });
+  const blocked = await originalConfig.streamSimple(cachedModel, turnContext, { reasoning: "high" }).result();
+  assert.equal(blocked.type, "error");
+  assert.match(blocked.error.errorMessage, /profile changed.*\/kiro-model/);
+  assert.equal(discoveries, 1);
+  assert.equal(requests.length, 1, "stale schemas must not reach generation");
+  await h.commands.get("kiro-model").handler("cached", h.ctx);
+  assert.match(h.messages.at(-1).content, /Kiro model selected/);
+  assert.equal(h.selected[0].id, "cached");
+  assert.equal((await originalConfig.streamSimple(h.ctx.model, turnContext, { reasoning: "high" }).result()).type, "done");
+  assert.deepEqual(requests, [
+    { reasoning: { effort: "high" } },
+    { output_config: { effort: "high" } },
+  ]);
+  assert.equal(discoveries, 2);
 });

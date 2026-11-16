@@ -2,6 +2,7 @@ import { getKiroAuthStatus, loadKiroAuth } from "./auth.mjs";
 import { closeSession, openKiro } from "./bridge.mjs";
 import { discoverHttpModels } from "./http.mjs";
 import { fetchKiroUsage } from "./usage.mjs";
+import { fetchKiroProfileUsage, listKiroProfiles, selectKiroProfile } from "./profiles.mjs";
 
 export class KiroCommandError extends Error {
   constructor(message, { code = "command_failed", status } = {}) {
@@ -39,6 +40,21 @@ export function getKiroCommands({ transport = "http" } = {}) {
       description: "Show managed Kiro account quota and credits",
       kind: "query",
     },
+    ...(transport === "http"
+      ? [
+          {
+            name: "kiro-profiles",
+            description: "List Kiro profiles and their reported plans and quotas",
+            kind: "query",
+          },
+          {
+            name: "kiro-profile",
+            description: "Change the managed Kiro profile for all sessions sharing this auth store",
+            argumentHint: "<exact-name-or-arn>",
+            kind: "action",
+          },
+        ]
+      : []),
     {
       name: "kiro-model",
       description: "Select a Kiro model for this session",
@@ -93,10 +109,44 @@ function usageText(usage) {
   );
 }
 
+function profileListText({ selectedArn, profiles }, { usage = false } = {}) {
+  const lines = [
+    `Selected profile: ${selectedArn ? singleLine(selectedArn) : "none (listing does not select one)"}`,
+    "Profiles represent service/account context. API values do not establish whether credit pools are independent or shared; do not sum profile quotas.",
+    "Selection persists for all sessions sharing this managed auth store.",
+  ];
+  for (const profile of profiles) {
+    lines.push(
+      "",
+      `${profile.arn === selectedArn ? "* " : ""}${singleLine(profile.name)} — ${singleLine(profile.arn)}`,
+      `Region: ${singleLine(profile.region)}; account: ${singleLine(profile.accountId)}`,
+    );
+    if (usage) {
+      if (profile.usage?.status === "available") lines.push(usageText(profile.usage));
+      else lines.push(`Usage: unknown, not zero.${profile.error ? ` ${singleLine(profile.error)}` : ""}`);
+    }
+  }
+  if (!profiles.length) lines.push("No profiles were reported for this login.");
+  lines.push(
+    "",
+    "Switch while idle with /kiro-profile <exact-name-or-arn>. No generation is requested.",
+  );
+  return lines.join("\n");
+}
+
 function safeFailure(error, transport, signal) {
   if (signal?.aborted) return signal.reason;
   if (error instanceof KiroCommandError) return error;
   if (error?.name === "AbortError" || error?.name === "TimeoutError") return error;
+  const profileFailures = {
+    invalid_profile: "Provide an exact Kiro profile ARN or unique profile name. Use /kiro-profiles to list profiles.",
+    unknown_profile: "The requested Kiro profile is not available to this login. Use /kiro-profiles to list profiles.",
+    ambiguous_profile: "The Kiro profile name is ambiguous; select an exact profile ARN.",
+    unsupported_profile_region: "The requested Kiro profile uses an unsupported region.",
+    credential_changed: "The managed credentials changed while selecting the profile. The newer login was preserved; list profiles and try again.",
+  };
+  if (Object.hasOwn(profileFailures, error?.code))
+    return new KiroCommandError(profileFailures[error.code], { code: error.code });
   const status = Number.isInteger(error?.status) ? error.status : undefined;
   if (
     error?.name === "KiroAuthError" ||
@@ -242,6 +292,14 @@ export async function executeKiroQuery(
           : "No Kiro models match this filter. Use /kiro-models without a filter to see the full catalog.",
       };
     }
+    if (name === "kiro-profiles") {
+      const profiles = await (services.fetchKiroProfileUsage ?? fetchKiroProfileUsage)({
+        authFile,
+        signal,
+      });
+      signal?.throwIfAborted();
+      return { title: "Kiro profiles", text: profileListText(profiles, { usage: true }) };
+    }
     const usage = await (services.fetchKiroUsage ?? fetchKiroUsage)({
       authFile,
       signal,
@@ -276,6 +334,8 @@ export function registerKiroCommands(pi, { transport = "http", authFile, service
           ...(ctx.signal ? [ctx.signal] : []),
         ]);
         let result;
+        let profileChanged;
+        let profileNotice;
         try {
           signal.throwIfAborted();
           if (command.kind === "query") {
@@ -287,10 +347,16 @@ export function registerKiroCommands(pi, { transport = "http", authFile, service
             });
             if (command.name === "kiro-status" && ctx.model)
               result.text += `\nSession model: ${singleLine(ctx.model.provider)}/${singleLine(ctx.model.id)}`;
+          } else if (command.name === "kiro-profile" && !String(args).trim()) {
+            const profiles = await (services.listKiroProfiles ?? listKiroProfiles)({
+              authFile,
+              signal,
+            });
+            result = { title: "Kiro profile selection", text: profileListText(profiles) };
           } else {
             if (!ctx.isIdle())
               throw new KiroCommandError(
-                "Wait for the current turn to finish before changing the Kiro connection or model.",
+                "Wait for the current turn to finish before changing the Kiro connection, model, or profile.",
                 { code: "session_busy" },
               );
             if (command.name === "kiro-reset") {
@@ -303,6 +369,40 @@ export function registerKiroCommands(pi, { transport = "http", authFile, service
                 title: "Kiro connection reset",
                 text: "The ACP connection is closed. OMP history is unchanged; the next turn reconnects with that history.",
               };
+            } else if (command.name === "kiro-profile") {
+              profileChanged = await (services.selectKiroProfile ?? selectKiroProfile)(
+                String(args).trim(),
+                { authFile, signal },
+              );
+              // Persistence has committed: invalidate local schemas even if this
+              // command is cancelled before the host catalog can be refreshed.
+              profileNotice = await services.onProfileChanged?.(profileChanged);
+              signal.throwIfAborted();
+              await ctx.modelRegistry.refreshProvider("kiro-http");
+              signal.throwIfAborted();
+              let modelText = "Use /kiro-models and /kiro-model <id> to choose a model.";
+              if (ctx.model?.provider === "kiro-http") {
+                const model = ctx.modelRegistry.find("kiro-http", ctx.model.id);
+                if (model) {
+                  if (!(await pi.setModel(model)))
+                    throw new KiroCommandError(
+                      "OMP could not refresh the current Kiro session model. Use /kiro-model <id> before continuing.",
+                      { code: "model_unavailable" },
+                    );
+                  modelText = `The current model, kiro-http/${singleLine(model.id)}, was refreshed.`;
+                } else {
+                  modelText = "The previous session model is unavailable for this profile. Use /kiro-models and /kiro-model <id> before continuing; no unrelated model was selected.";
+                }
+              }
+              result = {
+                title: "Kiro profile selected",
+                text: [
+                  `${singleLine(profileChanged.name)} — ${singleLine(profileChanged.arn)}`,
+                  "Selection is persisted for all sessions sharing this managed auth store. No generation was requested.",
+                  ...(profileNotice ? [profileNotice] : []),
+                  modelText,
+                ].join("\n"),
+              };
             } else {
               const id = String(args).trim();
               if (!id || /\s/.test(id))
@@ -310,6 +410,7 @@ export function registerKiroCommands(pi, { transport = "http", authFile, service
                   code: "invalid_arguments",
                 });
               const provider = transport === "http" ? "kiro-http" : "kiro-cli";
+              await services.onBeforeModelRefresh?.();
               await ctx.modelRegistry.refreshProvider(provider);
               signal.throwIfAborted();
               const model = ctx.modelRegistry.find(provider, id);
@@ -333,13 +434,14 @@ export function registerKiroCommands(pi, { transport = "http", authFile, service
         } catch (error) {
           const failure = safeFailure(error, transport, signal);
           result = {
-            title: "Kiro command failed",
+            title: profileChanged ? "Kiro profile selected; host refresh incomplete" : "Kiro command failed",
             text:
-              failure?.name === "TimeoutError"
+              `${profileChanged ? `Selection already changed to ${singleLine(profileChanged.name)} (${singleLine(profileChanged.arn)}) for all sessions sharing this managed auth store. No generation was requested. The host catalog/current model refresh did not complete; use /kiro-models and /kiro-model <id> before continuing.\n${profileNotice ? `${profileNotice}\n` : ""}` : ""}` +
+              (failure?.name === "TimeoutError"
                 ? "Kiro metadata request timed out. Check your connection and try again."
                 : signal.aborted || failure?.name === "AbortError"
                   ? "Kiro command cancelled."
-                  : failure.message,
+                  : failure.message),
           };
         } finally {
           pending.delete(controller);

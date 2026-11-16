@@ -5,7 +5,7 @@ import { registerKiroCommands } from "./server/commands.mjs";
 import { abortableRequest, isTransientNetworkError, isTlsError } from "./server/network.mjs";
 import { registerKiroWebSearch } from "./server/web.mjs";
 import { readKiroAuth } from "./server/auth.mjs";
-import { readKiroModelCatalog } from "./server/model-catalog.mjs";
+import { kiroCatalogAccountId, readKiroModelCatalog } from "./server/model-catalog.mjs";
 import { kiroThinkingConfig } from "./server/effort.mjs";
 
 function streamKiro(model, context, options = {}, transport, resolveModelSchema) {
@@ -141,46 +141,117 @@ export default async function kiroExtension(pi) {
   const provider = transport === "http" ? "kiro-http" : "kiro-cli";
   // OMP's public model object need not carry the native request schema.
   const modelSchemas = new Map();
+  const catalogModelIds = new Set();
   let catalogLoaded = false;
   let catalogFetch;
-  const rememberModels = (catalog) => {
+  let catalogVersion = 0;
+  let catalogAccountId;
+  let catalogRefreshRequired = false;
+  let snapshotActive = false;
+  const rememberModels = (catalog, accountId, version) => {
+    if (version !== catalogVersion)
+      throw new Error("Kiro profile changed during model discovery. Use /kiro-model <id> to refresh the session model.");
     modelSchemas.clear();
+    catalogModelIds.clear();
     for (const model of catalog) {
+      catalogModelIds.add(model.id);
       if (transport === "http" && model.additionalModelRequestFieldsSchema !== undefined)
         modelSchemas.set(model.id, model.additionalModelRequestFieldsSchema);
     }
+    catalogAccountId = accountId;
     catalogLoaded = true;
+    catalogRefreshRequired = false;
     return providerModels(catalog, transport);
   };
+  const invalidateModels = () => {
+    catalogVersion++;
+    modelSchemas.clear();
+    catalogModelIds.clear();
+    catalogLoaded = false;
+    catalogFetch = undefined;
+    catalogRefreshRequired = true;
+  };
   const fetchModels = () => {
-    catalogFetch ??= (transport === "http" ? discoverHttpModels() : discoverModels())
-      .then(rememberModels)
-      .finally(() => { catalogFetch = undefined; });
+    if (!catalogFetch) {
+      const version = catalogVersion;
+      const request = (async () => {
+        const accountId = transport === "http"
+          ? kiroCatalogAccountId(await readKiroAuth())
+          : undefined;
+        const catalog = await (transport === "http" ? discoverHttpModels() : discoverModels());
+        if (transport === "http" && accountId !== kiroCatalogAccountId(await readKiroAuth()))
+          throw new Error("Kiro profile changed during model discovery. Use /kiro-model <id> to refresh the session model.");
+        return rememberModels(catalog, accountId, version);
+      })();
+      catalogFetch = request;
+      void request.finally(() => {
+        if (catalogFetch === request) catalogFetch = undefined;
+      }).catch(() => {});
+    }
     return catalogFetch;
   };
+  const useLiveCatalog = () => {
+    const notice = snapshotActive
+      ? "The configured model snapshot belongs to the previous profile and is bypassed in this process. Regenerate it with models.cmd before restarting with that snapshot."
+      : undefined;
+    snapshotActive = false;
+    registerProvider({ models: [], fetchDynamicModels: fetchModels });
+    return notice;
+  };
+  const checkProfileIdentity = async () => {
+    if (transport !== "http") return false;
+    const accountId = kiroCatalogAccountId(await readKiroAuth());
+    if (catalogAccountId !== undefined && catalogAccountId !== accountId) {
+      invalidateModels();
+      catalogAccountId = accountId;
+      useLiveCatalog();
+      return true;
+    }
+    return false;
+  };
   const resolveModelSchema = async (id, signal) => {
-    // Host cache hits skip fetchDynamicModels, so public thinking metadata can
-    // exist without this process ever receiving the native request schema.
+    await checkProfileIdentity();
+    if (catalogRefreshRequired)
+      throw new Error("Kiro profile changed; the session model catalog must be refreshed. Use /kiro-models and /kiro-model <id> before continuing.");
+    // Host cache hits skip fetchDynamicModels, so native schemas may not yet
+    // have been loaded in this process.
     if (!catalogLoaded) {
       if (signal) await abortableRequest(fetchModels, signal);
       else await fetchModels();
     }
+    if (!catalogModelIds.has(id))
+      throw new Error("This model is unavailable for the selected Kiro profile. Use /kiro-models and /kiro-model <id>; no replacement model was selected.");
     return modelSchemas.get(id);
   };
-  const catalogFile = process.env.OMP_KIRO_MODEL_CATALOG_FILE;
-  const models = transport === "http" && catalogFile !== undefined
-    ? rememberModels(await readKiroModelCatalog(catalogFile, { auth: await readKiroAuth() }))
-    : undefined;
-  pi.registerProvider(provider, {
+  const registerProvider = (catalog) => pi.registerProvider(provider, {
     baseUrl: "https://kiro-cli.invalid/",
     apiKey: "kiro-cli-managed-auth",
     api: `kiro-cli-${transport}`,
-    // A configured account snapshot is authoritative. Advertising a dynamic
-    // callback lets host offline refresh replace it with an empty dynamic set.
-    ...(models !== undefined ? { models } : { fetchDynamicModels: fetchModels }),
+    ...catalog,
     streamSimple: (model, context, options) =>
       streamKiro(model, context, options, transport, resolveModelSchema),
   });
+  const catalogFile = process.env.OMP_KIRO_MODEL_CATALOG_FILE;
+  let models;
+  if (transport === "http" && catalogFile !== undefined) {
+    const auth = await readKiroAuth();
+    models = rememberModels(await readKiroModelCatalog(catalogFile, { auth }), kiroCatalogAccountId(auth), catalogVersion);
+    snapshotActive = true;
+  }
+  // Startup snapshots remain authoritative until a profile change invalidates
+  // their account binding; only then do we replace them with live discovery.
+  registerProvider(models !== undefined ? { models } : { fetchDynamicModels: fetchModels });
   if (transport === "http") registerKiroWebSearch(pi);
-  registerKiroCommands(pi, { transport });
+  registerKiroCommands(pi, {
+    transport,
+    services: {
+      onBeforeModelRefresh: checkProfileIdentity,
+      async onProfileChanged() {
+        invalidateModels();
+        const notice = useLiveCatalog();
+        catalogAccountId = kiroCatalogAccountId(await readKiroAuth());
+        return notice;
+      },
+    },
+  });
 }

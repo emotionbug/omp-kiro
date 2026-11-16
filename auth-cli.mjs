@@ -15,6 +15,8 @@ import {
 } from "./server/auth.mjs";
 import { loginSocial } from "./server/social-login.mjs";
 import { loginDevice } from "./server/oidc-login.mjs";
+import { fetchKiroProfileUsage, listKiroProfiles, selectKiroProfile } from "./server/profiles.mjs";
+import { executeKiroQuery } from "./server/commands.mjs";
 
 function usage() {
   console.log(`Usage: omp-kiro <command> [options]
@@ -23,7 +25,8 @@ Commands:
   login                 Authenticate without invoking Kiro CLI
   auth status           Show non-secret local login status
   auth logout           Remove this plugin's active login (not CLI login)
-  auth profile          Resolve the HTTP profile; --profile selects an available ARN
+  auth profiles         List all HTTP profiles; --usage compares their quotas
+  auth profile          Show selected profile; --profile selects an ARN or exact name
   auth import-cli       Explicitly import an existing CLI social login
 
 Login options:
@@ -31,13 +34,14 @@ Login options:
   --flow <name>         device (default); social accounts also loopback or manual
   --start-url <url>     Identity Center start URL
   --region <region>     OIDC issuer region (default: us-east-1)
-  --profile <arn>       Select an assigned Kiro profile (login or auth profile)
+  --profile <arn|name>  Select an assigned Kiro profile (login accepts an ARN)
+  --usage               Include per-profile plan, credits and reset (auth profiles)
   --timeout <seconds>   Overall deadline (default: 600)
 
 Storage options:
   --auth-file <path>    Dedicated plugin SQLite file (or OMP_KIRO_AUTH_FILE)
   --database <path>     Source CLI SQLite file for auth import-cli only
-  --json                Machine-readable auth status only
+  --json                Machine-readable auth status, profiles or profile
 
 No browser is launched automatically. Open the displayed authorization link on
 any device for the default device flow. Passwords and tokens are never requested
@@ -81,6 +85,7 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
       database: { type: "string" },
       json: { type: "boolean" },
       help: { type: "boolean", short: "h" },
+      usage: { type: "boolean" },
     },
   });
   if (values.help || positionals.length === 0) {
@@ -88,10 +93,12 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
     return;
   }
   const command = positionals.join(" ");
-  if (!["login", "auth status", "auth logout", "auth import-cli", "auth profile"].includes(command))
+  if (!["login", "auth status", "auth logout", "auth import-cli", "auth profile", "auth profiles"].includes(command))
     throw new Error("Unknown authentication command; use --help.");
-  if (values.json && command !== "auth status")
-    throw new Error("--json is supported only for auth status; credentials are never printed.");
+  if (values.json && !["auth status", "auth profile", "auth profiles"].includes(command))
+    throw new Error("--json is supported only for auth status/profile/profiles; credentials are never printed.");
+  if (values.usage && command !== "auth profiles")
+    throw new Error("--usage is supported only for auth profiles.");
   if (values.database && command !== "auth import-cli")
     throw new Error("--database is only a source for auth import-cli.");
   if (values.profile && !["login", "auth profile"].includes(command))
@@ -129,9 +136,31 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
   timer.unref();
   try {
     const signal = controller.signal;
+    if (command === "auth profiles") {
+      if (values.json) {
+        const query = values.usage ? fetchKiroProfileUsage : listKiroProfiles;
+        console.log(JSON.stringify(await query({ authFile, signal })));
+      } else if (values.usage) {
+        const result = await executeKiroQuery("kiro-profiles", "", { authFile, signal });
+        console.log(result.text);
+      } else {
+        const catalog = await listKiroProfiles({ authFile, signal });
+        for (const profile of catalog.profiles)
+          console.log(`${profile.arn === catalog.selectedArn ? "* " : "  "}${JSON.stringify(profile.name)}\n  ${profile.arn}`);
+        if (!catalog.selectedArn) console.log("No profile selected.");
+      }
+      return;
+    }
     if (command === "auth profile") {
-      const credential = await loadKiroAuth({ authFile, signal, profileArn: values.profile });
-      console.log(`Selected Kiro profile: ${JSON.stringify(credential.profile_arn)}`);
+      const profile = values.profile
+        ? await selectKiroProfile(values.profile, { authFile, signal })
+        : { arn: (await listKiroProfiles({ authFile, signal })).selectedArn ?? null };
+      if (values.json) console.log(JSON.stringify(profile));
+      else {
+        console.log(`Selected Kiro profile: ${JSON.stringify(profile.arn)}`);
+        if (values.profile)
+          console.log("Applies to all sessions sharing this auth store. Refresh the Kiro model catalog in other sessions before their next turn.");
+      }
       return;
     }
     if (command === "auth import-cli") {

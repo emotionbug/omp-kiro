@@ -117,14 +117,30 @@ This removes local browser-launch, callback-port, CLI installation, and keychain
 
 Since 0.4.7, login and HTTP authentication resolve a missing Kiro profile through `ListAvailableProfiles` before requesting models or generation. A single assigned profile is selected and persisted automatically, including for older managed logins that lack `profile_arn`; another browser approval is not required while the login remains valid. The OIDC issuer region stays unchanged and is distinct from the Kiro region encoded in the selected profile ARN.
 
-Multiple profiles are never resolved by arbitrarily picking the first. The CLI reports the available profile ARNs; select one with:
+Multiple profiles are never resolved by arbitrarily picking the first. Inspect and compare them inside OMP (HTTP transport only):
+
+```text
+/kiro-profiles
+/kiro-profile <exact-profile-name-or-arn>
+```
+
+`/kiro-profiles` lists every assigned profile, marks the current selection, and queries each profile's plan, used/remaining credit pools, limits, reset dates and on-demand settings. A failed usage lookup stays explicitly unavailable; it is not displayed as zero and does not hide other profiles. Listing does not change the selected profile. These are metadata requests, not model generation.
+
+A Kiro profile is a service context associated with an AWS account and region, not an OMP configuration profile. Different profiles can return different usage, subscription settings and model access. The usage API reports values for the requested ARN, but does not establish whether pools are independent or shared across an organization. Do not add the displayed limits together or assume switching grants extra credits. Enabled on-demand usage can incur charges; these commands never enable it, purchase credits or change a subscription.
+
+`/kiro-profile` accepts an exact ARN or unique exact name; ambiguous names are rejected. Switch only after the current turn finishes. Selection is saved in the managed auth store and affects **all sessions sharing that store**, not just this conversation. OMP history is retained. The command refreshes the current session's Kiro model catalog; other sessions must refresh theirs before continuing. If metadata refresh fails after a switch, the new selection remains saved and the command reports that separately. Offline snapshots are account-bound and must be regenerated for the newly selected profile rather than reused.
+
+Standalone commands support the same inspection and selection:
 
 ```bash
+npx github:emotionbug/omp-kiro auth profiles
+npx github:emotionbug/omp-kiro auth profiles --usage
+npx github:emotionbug/omp-kiro auth profiles --usage --json
 npx github:emotionbug/omp-kiro auth profile
 npx github:emotionbug/omp-kiro auth profile --profile "$PROFILE_ARN"
 ```
 
-`login --profile "$PROFILE_ARN"` also selects an assigned profile after authentication. Unassigned ARNs and empty catalogs fail explicitly. Profile persistence uses the same compare-and-swap guard as refresh, so lookup cannot overwrite a concurrent login/logout; identical resolution by another process is accepted. Successfully rotated refresh credentials are saved before profile discovery so a later discovery failure cannot discard the rotation. Usage-only reads remain read-only.
+`auth profile` without `--profile` reports the saved selection without choosing one. `auth profiles` lists the complete catalog even when a profile is already selected; `--usage` compares quotas without switching. `--auth-file` chooses the managed store and `--json` returns non-secret structured results. `login --profile "$PROFILE_ARN"` also selects an assigned profile after authentication. Unassigned ARNs and empty catalogs fail explicitly. Selection uses a compare-and-swap guard so lookup cannot overwrite a concurrent login/logout or profile change. Token refresh can update credentials during metadata queries, but listing and comparison never choose a profile. Successfully rotated refresh credentials are saved before profile discovery so a later discovery failure cannot discard the rotation.
 
 ### Credential storage and migration
 
@@ -218,6 +234,8 @@ Available in OMP, including OMP-backed Passession sessions:
 | `/kiro-models [filter]` | Live transport-specific model catalog                        |
 | `/kiro-model <id>`      | Change the actual session model                              |
 | `/kiro-usage`           | Managed HTTP account quota, credits, and reset dates         |
+| `/kiro-profiles`        | HTTP only: list profiles and compare their reported quotas   |
+| `/kiro-profile <name-or-arn>` | HTTP only: select a profile in the shared managed auth store |
 | `/kiro-reset`           | ACP only: close this connection, retaining OMP history       |
 
 These commands do not start model generation. ACP and HTTP can be logged into different accounts; ACP `/kiro-usage` explicitly identifies the separate managed HTTP login. Commands do not log in automatically, purchase credits, enable overage billing, change host tool trust, or delete history. OMP's existing `/model`, `/compact`, and other host commands are not replaced.

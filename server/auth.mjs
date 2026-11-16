@@ -203,9 +203,10 @@ export async function getKiroAuthStatus({ authFile = authFilePath(), now = Date.
   };
 }
 
-async function resolveProfile(credential, { signal, fetchImpl, retry, profileArn }) {
-  if (credential.profile_arn && (!profileArn || profileArn === credential.profile_arn))
-    return credential;
+export async function queryKiroProfiles(credential, {
+  signal, fetchImpl = defaultFetch, retry,
+} = {}) {
+  signal?.throwIfAborted();
   // The SSO issuer region is not the Kiro service/profile region.
   const region = credential.profile_arn?.split(":")[3] || "us-east-1";
   if (!["us-east-1", "eu-central-1"].includes(region))
@@ -237,11 +238,15 @@ async function resolveProfile(credential, { signal, fetchImpl, retry, profileArn
     if (!Array.isArray(data.profiles))
       throw new KiroAuthError("Kiro returned an invalid profile catalog.");
     for (const profile of data.profiles) {
-      if (typeof profile?.arn !== "string" || !profile.arn.startsWith("arn:aws:codewhisperer:"))
-        throw new KiroAuthError("Kiro returned an invalid profile ARN.");
+      const parts = typeof profile?.arn === "string"
+        ? /^arn:aws:codewhisperer:([^:]+):([^:]+):profile\/[^:]+$/.exec(profile.arn)
+        : null;
+      if (!parts) throw new KiroAuthError("Kiro returned an invalid profile ARN.");
       profiles.set(profile.arn, {
         arn: profile.arn,
         name: typeof profile.profileName === "string" ? profile.profileName : profile.arn,
+        region: parts[1],
+        accountId: parts[2],
       });
     }
     nextToken = data.nextToken;
@@ -251,15 +256,23 @@ async function resolveProfile(credential, { signal, fetchImpl, retry, profileArn
       seenTokens.add(nextToken);
     }
   } while (nextToken);
-  if (!profiles.size)
+  signal?.throwIfAborted();
+  return [...profiles.values()];
+}
+
+async function resolveProfile(credential, { signal, fetchImpl, retry, profileArn }) {
+  if (credential.profile_arn && (!profileArn || profileArn === credential.profile_arn))
+    return credential;
+  const profiles = await queryKiroProfiles(credential, { signal, fetchImpl, retry });
+  if (!profiles.length)
     throw new KiroAuthError("No Kiro profile is assigned to this login; check your Kiro subscription.");
-  const selected = profileArn ? profiles.get(profileArn)
-    : profiles.size === 1 ? profiles.values().next().value : undefined;
+  const selected = profileArn ? profiles.find((profile) => profile.arn === profileArn)
+    : profiles.length === 1 ? profiles[0] : undefined;
   if (!selected) {
     const error = new KiroAuthError(profileArn
       ? "The requested Kiro profile is not available to this login."
       : "Multiple Kiro profiles are available; run omp-kiro auth profile --profile <arn> to select one.");
-    Object.defineProperty(error, "profiles", { value: [...profiles.values()] });
+    Object.defineProperty(error, "profiles", { value: profiles });
     throw error;
   }
   if (!["us-east-1", "eu-central-1"].includes(selected.arn.split(":")[3]))
@@ -275,6 +288,7 @@ export async function loadKiroAuth({
   retry,
   expectedCredential,
   profileArn,
+  resolveProfile: shouldResolveProfile = true,
 } = {}) {
   signal?.throwIfAborted();
   const raw = await readAuthSnapshot({ authFile, signal });
@@ -290,13 +304,17 @@ export async function loadKiroAuth({
         (profileArn && expectedCredential.profile_arn && profileArn !== expectedCredential.profile_arn))
       throw new KiroAuthError("Kiro login or region changed during recovery; start a new turn.");
   }
-  if (Date.parse(credential.expires_at) > now() + 60_000 && credential.profile_arn &&
-      (!profileArn || credential.profile_arn === profileArn)) return credential;
+  if (Date.parse(credential.expires_at) > now() + 60_000 &&
+      (!shouldResolveProfile || (credential.profile_arn &&
+        (!profileArn || credential.profile_arn === profileArn)))) return credential;
   if (refreshing.has(authFile)) {
     if (signal) await abortableRequest(() => refreshing.get(authFile), signal);
     else await refreshing.get(authFile);
     signal?.throwIfAborted();
-    return loadKiroAuth({ signal, fetchImpl, authFile, now, retry, expectedCredential, profileArn });
+    return loadKiroAuth({
+      signal, fetchImpl, authFile, now, retry, expectedCredential, profileArn,
+      resolveProfile: shouldResolveProfile,
+    });
   }
   const prepare = async () => {
     let updated = credential;
@@ -309,11 +327,14 @@ export async function loadKiroAuth({
       if (updated.profile_arn && refreshed.profile_arn && updated.profile_arn !== refreshed.profile_arn)
         throw new KiroAuthError("Kiro account profile changed during refresh; sign in again explicitly.");
       updated = { ...updated, ...refreshed };
+      if (!shouldResolveProfile && !credential.profile_arn) delete updated.profile_arn;
       // Persist single-use refresh rotation even if the subsequent profile lookup fails.
       await saveKiroAuth(updated, { authFile, expectedRaw, signal });
       expectedRaw = JSON.stringify(updated);
     }
-    const resolved = await resolveProfile(updated, { signal, fetchImpl, retry, profileArn });
+    const resolved = shouldResolveProfile
+      ? await resolveProfile(updated, { signal, fetchImpl, retry, profileArn })
+      : updated;
     if (resolved !== updated) {
       try {
         await saveKiroAuth(resolved, { authFile, expectedRaw, signal });
