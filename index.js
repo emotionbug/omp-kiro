@@ -36,6 +36,11 @@ function streamKiro(model, context, options = {}, transport, resolveModelSchema)
       const modelRequestFieldsSchema = transport === "http"
         ? await resolveModelSchema(model.id, options.signal)
         : undefined;
+      const thinking = transport === "http" ? kiroThinkingConfig(modelRequestFieldsSchema) : undefined;
+      // Custom streamSimple providers bypass OMP's mandatory-reasoning clamp.
+      // Auto/off must use the native floor when this model cannot disable reasoning.
+      const useMinimumEffort = thinking?.requiresEffort &&
+        (options.reasoning === undefined || options.disableReasoning || options.forceReasoningOff);
       const runTransport = transport === "http" ? runHttpTurn : runTurn;
       const outcome = await runTransport({
         model: model.id,
@@ -46,9 +51,9 @@ function streamKiro(model, context, options = {}, transport, resolveModelSchema)
         ...(transport === "http" ? {
           continuePartial: true,
           modelRequestFieldsSchema,
-          reasoning: options.reasoning,
-          disableReasoning: model.reasoning ? options.disableReasoning : undefined,
-          forceReasoningOff: options.forceReasoningOff,
+          reasoning: useMinimumEffort ? thinking.efforts[0] : options.reasoning,
+          disableReasoning: !useMinimumEffort && model.reasoning ? options.disableReasoning : undefined,
+          forceReasoningOff: useMinimumEffort ? undefined : options.forceReasoningOff,
         } : {}),
         onText(delta) {
           if (!delta) return;

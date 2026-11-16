@@ -380,3 +380,96 @@ test("cancelling one concurrent cache-hit turn leaves the shared schema load usa
   assert.deepEqual(requests, [{ reasoning: { effort: "low" } }]);
   assert.equal(discoveries, 1);
 });
+
+test("OMP Auto/off uses the native minimum for mandatory reasoning, not the model default", async (t) => {
+  const f = await fixture(t, { ...auth, expires_at: "2999-01-01T00:00:00Z" });
+  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_AUTH_FILE", f.authFile);
+  setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", undefined);
+  let schema;
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    if (new URL(url).hostname.startsWith("management."))
+      return Response.json({ models: [{ modelId: "cached", additionalModelRequestFieldsSchema: schema }] });
+    requests.push(JSON.parse(init.body).additionalModelRequestFields);
+    return textResponse();
+  });
+  for (const [path, levels, minimum] of [
+    ["output_config", ["max", "high", "low", "medium", "xhigh"], "low"],
+    ["reasoning", ["max", "high", "medium"], "medium"],
+  ]) {
+    schema = { properties: {
+      [path]: { properties: { effort: { enum: levels, default: "high" } } },
+      thinking: { properties: { type: { enum: ["adaptive"] } } },
+    } };
+    const h = registrationHost();
+    await kiroExtension(h.pi);
+    const { config } = h.providers[0];
+    const start = requests.length;
+    // No dynamic discovery callback: the request schema must also be hydrated
+    // when the host supplies a cached model with missing thinking metadata.
+    for (const options of [
+      {},
+      { disableReasoning: true },
+      { reasoning: "high", forceReasoningOff: true },
+      { reasoning: "high", disableReasoning: true, forceReasoningOff: true },
+      { reasoning: "high" },
+    ]) {
+      const before = structuredClone(options);
+      const result = await config.streamSimple(cachedModel, turnContext, options).result();
+      assert.equal(result.type, "done");
+      assert.deepEqual(result.message.content, [{ type: "text", text: "Kiro answer" }]);
+      assert.deepEqual(options, before);
+    }
+    assert.deepEqual(requests.slice(start), [
+      { [path]: { effort: minimum } },
+      { [path]: { effort: minimum } },
+      { [path]: { effort: minimum } },
+      { [path]: { effort: minimum } },
+      { [path]: { effort: "high" } },
+    ]);
+    const count = requests.length;
+    const unsupported = await config.streamSimple(cachedModel, turnContext, { reasoning: "minimal" }).result();
+    assert.equal(unsupported.type, "error");
+    assert.match(unsupported.error.errorMessage, /does not advertise requested effort: minimal/);
+    assert.equal(requests.length, count, "unsupported positive effort must not generate");
+  }
+});
+
+test("OMP Auto/off preserves advertised native off controls and omitted defaults", async (t) => {
+  const f = await fixture(t, { ...auth, expires_at: "2999-01-01T00:00:00Z" });
+  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_AUTH_FILE", f.authFile);
+  setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", undefined);
+  let schema;
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    if (new URL(url).hostname.startsWith("management."))
+      return Response.json({ models: [{ modelId: "cached", additionalModelRequestFieldsSchema: schema }] });
+    requests.push(JSON.parse(init.body).additionalModelRequestFields);
+    return textResponse();
+  });
+  for (const [native, off] of [
+    [{ properties: {
+      output_config: { properties: { effort: { enum: ["low", "high"] } } },
+      thinking: { properties: { type: { enum: ["adaptive", "disabled"] } } },
+    } }, { thinking: { type: "disabled" } }],
+    [cachedSchema, { reasoning: { effort: "none" } }],
+  ]) {
+    schema = native;
+    const h = registrationHost();
+    await kiroExtension(h.pi);
+    const { config } = h.providers[0];
+    const start = requests.length;
+    for (const options of [
+      { reasoning: "high", disableReasoning: true },
+      { reasoning: "high", forceReasoningOff: true },
+      {},
+    ]) {
+      const result = await config.streamSimple(cachedModel, turnContext, options).result();
+      assert.equal(result.type, "done");
+      assert.deepEqual(result.message.content, [{ type: "text", text: "Kiro answer" }]);
+    }
+    assert.deepEqual(requests.slice(start), [off, off, undefined]);
+  }
+});

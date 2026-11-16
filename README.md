@@ -70,7 +70,9 @@ When your account advertises the model and its effort controls, use OMP's `--thi
 omp --model kiro-http/claude-opus-4.7 --thinking high
 ```
 
-The HTTP request uses the schema's actual `output_config.effort` or `reasoning.effort` under `additionalModelRequestFields`. Unsupported values are not emulated with prompts, token budgets, or another model. Off is sent only through an advertised `none` effort or `thinking.type: disabled`; a controllable model without an off form rejects an explicit off request. Unspecified transport effort retains native defaults; OMP's Auto remains OMP's per-turn policy.
+The HTTP request uses the schema's actual `output_config.effort` or `reasoning.effort` under `additionalModelRequestFields`. Unsupported values are not emulated with prompts, token budgets, or another model. Native Off is sent only through an advertised `none` effort or `thinking.type: disabled`.
+
+The OMP adapter follows OMP's mandatory-reasoning policy: when the schema offers effort levels but no Off control, an omitted or disabled host setting (including Auto resolving to Off) uses the lowest advertised effort instead. Explicit supported positive levels remain unchanged. This normalization is required because OMP's custom-provider path bypasses its built-in reasoning normalization. Models that support Off still receive their native Off control. Direct transport callers retain the strict contract: unsupported Off is rejected and omitted effort retains native defaults.
 
 After upgrading from a version without effort support, OMP can still restore old model rows with `reasoning: false` from its persistent cache. Refresh the catalog with `omp models refresh kiro-http`, then start a new session (or reload the host's model list). `omp models kiro-http --json` should show the advertised `thinking` levels for supported models. A plugin upgrade alone does not invalidate OMP's model cache.
 
