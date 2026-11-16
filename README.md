@@ -121,6 +121,7 @@ Multiple profiles are never resolved by arbitrarily picking the first. Inspect a
 
 ```text
 /kiro-profiles
+/kiro-profile
 /kiro-profile <exact-profile-name-or-arn>
 ```
 
@@ -128,7 +129,7 @@ Multiple profiles are never resolved by arbitrarily picking the first. Inspect a
 
 A Kiro profile is a service context associated with an AWS account and region, not an OMP configuration profile. Different profiles can return different usage, subscription settings and model access. The usage API reports values for the requested ARN, but does not establish whether pools are independent or shared across an organization. Do not add the displayed limits together or assume switching grants extra credits. Enabled on-demand usage can incur charges; these commands never enable it, purchase credits or change a subscription.
 
-`/kiro-profile` accepts an exact ARN or unique exact name; ambiguous names are rejected. Switch only after the current turn finishes. Selection is saved in the managed auth store and affects **all sessions sharing that store**, not just this conversation. OMP history is retained. The command refreshes the current session's Kiro model catalog; other sessions must refresh theirs before continuing. If metadata refresh fails after a switch, the new selection remains saved and the command reports that separately. Offline snapshots are account-bound and must be regenerated for the newly selected profile rather than reused.
+`/kiro-profile` accepts an exact ARN or unique exact name; ambiguous names are rejected. Since 0.5.1, without an argument in an interactive host (OMP TUI, or Passession over RPC), it opens a selection dialog with one option per profile: name, region and account, with `(current)` on the saved selection; profiles that would share a label also show their ARN. Picking a profile runs the same selection as passing its ARN; cancelling or picking the current profile changes nothing. Hosts without interactive UI (print mode, `--no-ui`) list profiles as text instead. Switch only after the current turn finishes; the picker refuses to open while a turn is running. Selection is saved in the managed auth store and affects **all sessions sharing that store**, not just this conversation. OMP history is retained. The command refreshes the current session's Kiro model catalog; other sessions must refresh theirs before continuing. If metadata refresh fails after a switch, the new selection remains saved and the command reports that separately. Offline snapshots are account-bound and must be regenerated for the newly selected profile rather than reused.
 
 Standalone commands support the same inspection and selection:
 
@@ -235,7 +236,7 @@ Available in OMP, including OMP-backed Passession sessions:
 | `/kiro-model <id>`      | Change the actual session model                              |
 | `/kiro-usage`           | Managed HTTP account quota, credits, and reset dates         |
 | `/kiro-profiles`        | HTTP only: list profiles and compare their reported quotas   |
-| `/kiro-profile <name-or-arn>` | HTTP only: select a profile in the shared managed auth store |
+| `/kiro-profile [name-or-arn]` | HTTP only: select a profile in the shared managed auth store (picker without an argument) |
 | `/kiro-reset`           | ACP only: close this connection, retaining OMP history       |
 
 These commands do not start model generation. ACP and HTTP can be logged into different accounts; ACP `/kiro-usage` explicitly identifies the separate managed HTTP login. Commands do not log in automatically, purchase credits, enable overage billing, change host tool trust, or delete history. OMP's existing `/model`, `/compact`, and other host commands are not replaced.

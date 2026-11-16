@@ -50,7 +50,7 @@ export function getKiroCommands({ transport = "http" } = {}) {
           {
             name: "kiro-profile",
             description: "Change the managed Kiro profile for all sessions sharing this auth store",
-            argumentHint: "<exact-name-or-arn>",
+            argumentHint: "[exact-name-or-arn]",
             kind: "action",
           },
         ]
@@ -132,6 +132,32 @@ function profileListText({ selectedArn, profiles }, { usage = false } = {}) {
     "Switch while idle with /kiro-profile <exact-name-or-arn>. No generation is requested.",
   );
   return lines.join("\n");
+}
+
+/** One unique, single-line label per profile, mapped back to that profile (and its ARN). */
+function profileChoices({ selectedArn, profiles }) {
+  const base = profiles.map((profile) =>
+    [profile.name, profile.region, profile.accountId]
+      .map((part) => singleLine(part ?? "").trim())
+      .filter(Boolean)
+      .join(" · "),
+  );
+  const choices = new Map();
+  profiles.forEach((profile, index) => {
+    const label = base.indexOf(base[index]) === base.lastIndexOf(base[index])
+      ? base[index]
+      : `${base[index]} · ${singleLine(profile.arn)}`;
+    choices.set(`${label}${profile.arn === selectedArn ? " (current)" : ""}`, profile);
+  });
+  return choices;
+}
+
+function requireIdle(ctx) {
+  if (!ctx.isIdle())
+    throw new KiroCommandError(
+      "Wait for the current turn to finish before changing the Kiro connection, model, or profile.",
+      { code: "session_busy" },
+    );
 }
 
 function safeFailure(error, transport, signal) {
@@ -336,6 +362,42 @@ export function registerKiroCommands(pi, { transport = "http", authFile, service
         let result;
         let profileChanged;
         let profileNotice;
+        // Shared by `/kiro-profile <selector>` and the no-argument picker.
+        const selectProfile = async (selector) => {
+          profileChanged = await (services.selectKiroProfile ?? selectKiroProfile)(selector, {
+            authFile,
+            signal,
+          });
+          // Persistence has committed: invalidate local schemas even if this
+          // command is cancelled before the host catalog can be refreshed.
+          profileNotice = await services.onProfileChanged?.(profileChanged);
+          signal.throwIfAborted();
+          await ctx.modelRegistry.refreshProvider("kiro-http");
+          signal.throwIfAborted();
+          let modelText = "Use /kiro-models and /kiro-model <id> to choose a model.";
+          if (ctx.model?.provider === "kiro-http") {
+            const model = ctx.modelRegistry.find("kiro-http", ctx.model.id);
+            if (model) {
+              if (!(await pi.setModel(model)))
+                throw new KiroCommandError(
+                  "OMP could not refresh the current Kiro session model. Use /kiro-model <id> before continuing.",
+                  { code: "model_unavailable" },
+                );
+              modelText = `The current model, kiro-http/${singleLine(model.id)}, was refreshed.`;
+            } else {
+              modelText = "The previous session model is unavailable for this profile. Use /kiro-models and /kiro-model <id> before continuing; no unrelated model was selected.";
+            }
+          }
+          return {
+            title: "Kiro profile selected",
+            text: [
+              `${singleLine(profileChanged.name)} — ${singleLine(profileChanged.arn)}`,
+              "Selection is persisted for all sessions sharing this managed auth store. No generation was requested.",
+              ...(profileNotice ? [profileNotice] : []),
+              modelText,
+            ].join("\n"),
+          };
+        };
         try {
           signal.throwIfAborted();
           if (command.kind === "query") {
@@ -348,17 +410,48 @@ export function registerKiroCommands(pi, { transport = "http", authFile, service
             if (command.name === "kiro-status" && ctx.model)
               result.text += `\nSession model: ${singleLine(ctx.model.provider)}/${singleLine(ctx.model.id)}`;
           } else if (command.name === "kiro-profile" && !String(args).trim()) {
+            const interactive = ctx.hasUI === true && typeof ctx.ui?.select === "function";
+            // Picking changes shared state: refuse before any dialog is shown.
+            if (interactive) requireIdle(ctx);
             const profiles = await (services.listKiroProfiles ?? listKiroProfiles)({
               authFile,
               signal,
             });
-            result = { title: "Kiro profile selection", text: profileListText(profiles) };
-          } else {
-            if (!ctx.isIdle())
-              throw new KiroCommandError(
-                "Wait for the current turn to finish before changing the Kiro connection, model, or profile.",
-                { code: "session_busy" },
+            signal.throwIfAborted();
+            if (!interactive || !profiles.profiles.length) {
+              result = { title: "Kiro profile selection", text: profileListText(profiles) };
+            } else {
+              const choices = profileChoices(profiles);
+              const label = await ctx.ui.select(
+                "Select a Kiro profile (applies to all sessions sharing this auth store)",
+                [...choices.keys()],
+                { signal },
               );
+              signal.throwIfAborted();
+              const profile = choices.get(label);
+              if (label === undefined)
+                result = {
+                  title: "Kiro profile unchanged",
+                  text: "Selection cancelled. The Kiro profile is unchanged.",
+                };
+              else if (!profile)
+                throw new KiroCommandError(
+                  "The chosen option does not match a listed Kiro profile. The profile is unchanged.",
+                  { code: "invalid_profile" },
+                );
+              else if (profile.arn === profiles.selectedArn)
+                result = {
+                  title: "Kiro profile unchanged",
+                  text: `${singleLine(profile.name)} — ${singleLine(profile.arn)} is already selected. Nothing was changed.`,
+                };
+              else {
+                // The dialog may have stayed open while a turn started.
+                requireIdle(ctx);
+                result = await selectProfile(profile.arn);
+              }
+            }
+          } else {
+            requireIdle(ctx);
             if (command.name === "kiro-reset") {
               if (String(args).trim())
                 throw new KiroCommandError("/kiro-reset does not accept arguments.", {
@@ -370,39 +463,7 @@ export function registerKiroCommands(pi, { transport = "http", authFile, service
                 text: "The ACP connection is closed. OMP history is unchanged; the next turn reconnects with that history.",
               };
             } else if (command.name === "kiro-profile") {
-              profileChanged = await (services.selectKiroProfile ?? selectKiroProfile)(
-                String(args).trim(),
-                { authFile, signal },
-              );
-              // Persistence has committed: invalidate local schemas even if this
-              // command is cancelled before the host catalog can be refreshed.
-              profileNotice = await services.onProfileChanged?.(profileChanged);
-              signal.throwIfAborted();
-              await ctx.modelRegistry.refreshProvider("kiro-http");
-              signal.throwIfAborted();
-              let modelText = "Use /kiro-models and /kiro-model <id> to choose a model.";
-              if (ctx.model?.provider === "kiro-http") {
-                const model = ctx.modelRegistry.find("kiro-http", ctx.model.id);
-                if (model) {
-                  if (!(await pi.setModel(model)))
-                    throw new KiroCommandError(
-                      "OMP could not refresh the current Kiro session model. Use /kiro-model <id> before continuing.",
-                      { code: "model_unavailable" },
-                    );
-                  modelText = `The current model, kiro-http/${singleLine(model.id)}, was refreshed.`;
-                } else {
-                  modelText = "The previous session model is unavailable for this profile. Use /kiro-models and /kiro-model <id> before continuing; no unrelated model was selected.";
-                }
-              }
-              result = {
-                title: "Kiro profile selected",
-                text: [
-                  `${singleLine(profileChanged.name)} — ${singleLine(profileChanged.arn)}`,
-                  "Selection is persisted for all sessions sharing this managed auth store. No generation was requested.",
-                  ...(profileNotice ? [profileNotice] : []),
-                  modelText,
-                ].join("\n"),
-              };
+              result = await selectProfile(String(args).trim());
             } else {
               const id = String(args).trim();
               if (!id || /\s/.test(id))

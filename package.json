@@ -1,6 +1,6 @@
 {
   "name": "omp-kiro",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Kiro ACP/HTTP model providers and managed account usage commands for OMP.",
   "keywords": [
     "extension",
