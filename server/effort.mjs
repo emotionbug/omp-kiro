@@ -46,7 +46,10 @@ function controls(schema) {
     }
   }
   const thinking = property(schema, "thinking");
-  const disabled = values(thinking && property(thinking, "type"), "thinking type").includes("disabled");
+  const thinkingType = thinking && property(thinking, "type");
+  const thinkingTypes = values(thinkingType, "thinking type");
+  const thinkingDisplays = values(thinking && property(thinking, "display"), "thinking display");
+  const disabled = thinkingTypes.includes("disabled");
   return {
     path,
     efforts: LEVELS.filter((level) => nativeValues.includes(level)),
@@ -54,6 +57,9 @@ function controls(schema) {
     none: nativeValues.includes("none"),
     disabled,
     canDisable: nativeValues.includes("none") || disabled,
+    canSummarize: thinkingTypes.includes("adaptive") && thinkingDisplays.includes("summarized"),
+    defaultAdaptive: thinkingType?.default === "adaptive" ||
+      (thinkingTypes.length === 1 && thinkingTypes[0] === "adaptive" && !nativeValues.includes("none")),
   };
 }
 
@@ -69,7 +75,7 @@ export function kiroThinkingConfig(schema) {
   };
 }
 
-/** Omission preserves upstream defaults; off is never emulated with prompts or budgets. */
+/** Preserve native defaults/off; request summaries only for advertised adaptive thinking. */
 export function kiroEffortFields(schema, { reasoning, disableReasoning, forceReasoningOff } = {}) {
   const control = controls(schema);
   if (disableReasoning || forceReasoningOff) {
@@ -78,8 +84,10 @@ export function kiroEffortFields(schema, { reasoning, disableReasoning, forceRea
     if (control.efforts.length) throw new RangeError("Kiro model does not advertise a reasoning off control.");
     return undefined;
   }
-  if (reasoning === undefined) return undefined;
-  if (!control.efforts.includes(reasoning))
+  if (reasoning !== undefined && !control.efforts.includes(reasoning))
     throw new RangeError(`Kiro model does not advertise requested effort: ${String(reasoning)}`);
-  return { [control.path]: { effort: reasoning } };
+  const fields = reasoning === undefined ? {} : { [control.path]: { effort: reasoning } };
+  if (control.canSummarize && (reasoning !== undefined || control.defaultAdaptive))
+    fields.thinking = { type: "adaptive", display: "summarized" };
+  return Object.keys(fields).length ? fields : undefined;
 }

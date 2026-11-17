@@ -250,23 +250,30 @@ test("OMP configured wrong-account snapshot rejects before registration; no expl
 });
 
 
-function textResponse() {
+function frame(event, payload) {
   const headers = Buffer.concat([
-    [":message-type", "event"], [":event-type", "assistantResponseEvent"],
+    [":message-type", "event"], [":event-type", event],
   ].map(([name, value]) => {
     const size = Buffer.alloc(2);
     size.writeUInt16BE(Buffer.byteLength(value));
     return Buffer.concat([Buffer.from([name.length]), Buffer.from(name), Buffer.from([7]), size, Buffer.from(value)]);
   }));
-  const payload = Buffer.from(JSON.stringify({ content: "Kiro answer" }));
-  const bytes = Buffer.alloc(16 + headers.length + payload.length);
+  const body = Buffer.from(JSON.stringify(payload));
+  const bytes = Buffer.alloc(16 + headers.length + body.length);
   bytes.writeUInt32BE(bytes.length, 0);
   bytes.writeUInt32BE(headers.length, 4);
   bytes.writeUInt32BE(crc32(bytes.subarray(0, 8)), 8);
   headers.copy(bytes, 12);
-  payload.copy(bytes, 12 + headers.length);
+  body.copy(bytes, 12 + headers.length);
   bytes.writeUInt32BE(crc32(bytes.subarray(0, -4)), bytes.length - 4);
-  return new Response(bytes);
+  return bytes;
+}
+
+const answer = (content) => frame("assistantResponseEvent", { content });
+const reasoningEvent = (data) => frame("reasoningContentEvent", data);
+
+function textResponse() {
+  return new Response(answer("Kiro answer"));
 }
 
 const turnContext = { messages: [{ role: "user", content: "Say hello" }] };
@@ -601,4 +608,261 @@ test("external profile selection blocks old native schemas until an explicit mod
     { output_config: { effort: "high" } },
   ]);
   assert.equal(discoveries, 2);
+});
+
+const reasoningSchema = { properties: {
+  output_config: { properties: { effort: { enum: ["low", "high"] } } },
+  thinking: { properties: { type: { enum: ["adaptive"] }, display: { enum: ["summarized"] } } },
+} };
+const summarized = { type: "adaptive", display: "summarized" };
+const readTool = {
+  name: "read",
+  description: "Read a file",
+  parameters: { type: "object", properties: { path: { type: "string" } } },
+};
+const opaque = "b3BhcXVlLXJlYXNvbmluZw==";
+
+// Sends complete frames, then drops the socket or stays open until cancelled.
+function partialResponse(frames, { hang = false } = {}) {
+  let sent = false;
+  return new Response(new ReadableStream({
+    pull(controller) {
+      if (!sent) {
+        sent = true;
+        controller.enqueue(Buffer.concat(frames));
+      } else if (hang) return new Promise(() => {});
+      else controller.error(Object.assign(new TypeError("terminated"), {
+        cause: Object.assign(new Error("socket disconnected"), { code: "UND_ERR_SOCKET" }),
+      }));
+    },
+  }));
+}
+
+async function reasoningProvider(t, responses, { maxAttempts = "3" } = {}) {
+  const f = await fixture(t, { ...auth, expires_at: "2999-01-01T00:00:00Z" });
+  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_AUTH_FILE", f.authFile);
+  setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", undefined);
+  setEnv(t, "OMP_KIRO_HTTP_MAX_ATTEMPTS", maxAttempts);
+  setEnv(t, "OMP_KIRO_HTTP_RETRY_BASE_MS", "0");
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    if (new URL(url).hostname.startsWith("management."))
+      return Response.json({ models: [{ modelId: "cached", additionalModelRequestFieldsSchema: reasoningSchema }] });
+    requests.push(JSON.parse(init.body));
+    return responses.shift();
+  });
+  const h = registrationHost();
+  await kiroExtension(h.pi);
+  return { requests, stream: (context, options) => h.providers[0].config.streamSimple(cachedModel, context, options) };
+}
+
+// Host-visible lifecycle: event type, content index, then delta or final content.
+function lifecycle(events) {
+  return events.map(({ type, contentIndex, delta, content }) => {
+    if (contentIndex === undefined) return type;
+    const value = delta ?? content;
+    return typeof value === "string" ? [type, contentIndex, value] : [type, contentIndex];
+  });
+}
+
+test("native reasoning phases stream around text with stable indices and replay the signed phase after tools", async (t) => {
+  const p = await reasoningProvider(t, [
+    new Response(Buffer.concat([
+      reasoningEvent({ text: "Plan " }),
+      reasoningEvent({ text: "steps" }),
+      reasoningEvent({ signature: "sig-plan" }),
+      answer("Answer"),
+      reasoningEvent({ text: "Check" }),
+      reasoningEvent({ signature: "sig-check" }),
+      frame("toolUseEvent", { toolUseId: "tool-1", name: "read", input: "{\"path\":" }),
+      frame("toolUseEvent", { toolUseId: "tool-1", input: "\"a\"}", stop: true }),
+    ])),
+    new Response(answer("Done")),
+  ]);
+  const context = { tools: [readTool], messages: [{ role: "user", content: "Read a" }] };
+  const stream = p.stream(context, { reasoning: "high" });
+  const result = await stream.result();
+  assert.equal(result.type, "done");
+  // Signature-only events never surface as deltas or text.
+  assert.deepEqual(lifecycle(stream.events), [
+    "start",
+    ["thinking_start", 0], ["thinking_delta", 0, "Plan "], ["thinking_delta", 0, "steps"],
+    ["thinking_end", 0, "Plan steps"],
+    ["text_start", 1], ["text_delta", 1, "Answer"], ["text_end", 1, "Answer"],
+    ["thinking_start", 2], ["thinking_delta", 2, "Check"], ["thinking_end", 2, "Check"],
+    ["toolcall_start", 3], ["toolcall_delta", 3, "{\"path\":\"a\"}"], ["toolcall_end", 3],
+    "done",
+  ]);
+  assert.equal(result.message.stopReason, "toolUse");
+  assert.deepEqual(result.message.content, [
+    { type: "thinking", thinking: "Plan steps", thinkingSignature: "sig-plan" },
+    { type: "text", text: "Answer" },
+    { type: "thinking", thinking: "Check", thinkingSignature: "sig-check" },
+    { type: "toolCall", id: "tool-1", name: "read", arguments: { path: "a" } },
+  ]);
+  const followUp = await p.stream({ ...context, messages: [
+    ...context.messages,
+    result.message,
+    { role: "toolResult", toolCallId: "tool-1", toolName: "read", content: [{ type: "text", text: "a" }], isError: false },
+  ] }, { reasoning: "high" }).result();
+  assert.equal(followUp.type, "done");
+  assert.deepEqual(p.requests.map((request) => request.additionalModelRequestFields), [
+    { output_config: { effort: "high" }, thinking: summarized },
+    { output_config: { effort: "high" }, thinking: summarized },
+  ]);
+  // The native scalar carries the last complete signed phase, never a merge.
+  assert.deepEqual(p.requests[1].conversationState.history[1], { assistantResponseMessage: {
+    content: "Answer",
+    toolUses: [{ toolUseId: "tool-1", name: "read", input: { path: "a" } }],
+    reasoningContent: { reasoningText: { text: "Check", signature: "sig-check" } },
+  } });
+});
+
+test("redacted reasoning stays opaque while a later unsigned phase is not replayed", async (t) => {
+  const p = await reasoningProvider(t, [
+    new Response(Buffer.concat([reasoningEvent({ redactedContent: opaque }), answer("Done")])),
+    new Response(Buffer.concat([reasoningEvent({ text: "Visible summary" }), answer("Again")])),
+    new Response(answer("Finished")),
+  ]);
+  const stream = p.stream(turnContext, {});
+  const result = await stream.result();
+  assert.equal(result.type, "done");
+  assert.deepEqual(lifecycle(stream.events), [
+    "start", ["text_start", 1], ["text_delta", 1, "Done"], ["text_end", 1, "Done"], "done",
+  ]);
+  assert.deepEqual(result.message.content, [
+    { type: "redactedThinking", data: opaque },
+    { type: "text", text: "Done" },
+  ]);
+  const nextContext = { messages: [
+    ...turnContext.messages, result.message, { role: "user", content: "Again" },
+  ] };
+  const nextStream = p.stream(nextContext, {});
+  const next = await nextStream.result();
+  assert.equal(next.type, "done");
+  assert.deepEqual(lifecycle(nextStream.events), [
+    "start",
+    ["thinking_start", 0], ["thinking_delta", 0, "Visible summary"], ["thinking_end", 0, "Visible summary"],
+    ["text_start", 1], ["text_delta", 1, "Again"], ["text_end", 1, "Again"], "done",
+  ]);
+  // OMP Auto keeps the mandatory native minimum and asks for readable summaries.
+  assert.deepEqual(p.requests[0].additionalModelRequestFields, {
+    output_config: { effort: "low" }, thinking: summarized,
+  });
+  assert.deepEqual(p.requests[1].conversationState.history[1], {
+    assistantResponseMessage: { content: "Done", reasoningContent: { redactedContent: opaque } },
+  });
+  await p.stream({ messages: [
+    ...nextContext.messages, next.message, { role: "user", content: "Finish" },
+  ] }, {}).result();
+  assert.deepEqual(p.requests[2].conversationState.history[3], { assistantResponseMessage: { content: "Again" } });
+});
+
+test("socket failure and cancellation close open reasoning and text blocks exactly once", async (t) => {
+  const p = await reasoningProvider(t, [
+    partialResponse([reasoningEvent({ text: "Half" }), reasoningEvent({ signature: "sig-lost" }), answer("Partial")]),
+    partialResponse([reasoningEvent({ text: "Waiting" })], { hang: true }),
+  ], { maxAttempts: "1" });
+  const failedStream = p.stream(turnContext, { reasoning: "high" });
+  const failed = await failedStream.result();
+  assert.equal(failed.type, "error");
+  assert.equal(failed.error.stopReason, "error");
+  assert.match(failed.error.errorMessage, /Kiro HTTP network error/);
+  assert.deepEqual(lifecycle(failedStream.events), [
+    "start",
+    ["thinking_start", 0], ["thinking_delta", 0, "Half"], ["thinking_end", 0, "Half"],
+    ["text_start", 1], ["text_delta", 1, "Partial"], ["text_end", 1, "Partial"],
+    "error",
+  ]);
+  // A failed attempt keeps its displayed summary but loses replay eligibility.
+  assert.deepEqual(failed.error.content, [{ type: "thinking", thinking: "Half" }, { type: "text", text: "Partial" }]);
+
+  const controller = new AbortController();
+  const abortedStream = p.stream(turnContext, { reasoning: "high", signal: controller.signal });
+  for (let waits = 0; !abortedStream.events.some((event) => event.type === "thinking_delta"); waits++) {
+    assert.ok(waits < 5000, "reasoning delta was not streamed");
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  controller.abort();
+  const aborted = await abortedStream.result();
+  assert.equal(aborted.type, "error");
+  assert.equal(aborted.error.stopReason, "aborted");
+  assert.deepEqual(lifecycle(abortedStream.events), [
+    "start", ["thinking_start", 0], ["thinking_delta", 0, "Waiting"], ["thinking_end", 0, "Waiting"], "error",
+  ]);
+});
+
+test("a retried attempt opens new reasoning blocks and never signs earlier output", async (t) => {
+  const p = await reasoningProvider(t, [
+    partialResponse([reasoningEvent({ text: "First" }), reasoningEvent({ signature: "sig-old" }), answer("Hel")]),
+    new Response(Buffer.concat([
+      reasoningEvent({ text: "Second" }), reasoningEvent({ signature: "sig-new" }), answer("lo"),
+    ])),
+    new Response(answer("Next")),
+  ]);
+  const stream = p.stream(turnContext, { reasoning: "high" });
+  const result = await stream.result();
+  assert.equal(result.type, "done");
+  assert.deepEqual(lifecycle(stream.events), [
+    "start",
+    ["thinking_start", 0], ["thinking_delta", 0, "First"], ["thinking_end", 0, "First"],
+    ["text_start", 1], ["text_delta", 1, "Hel"], ["text_end", 1, "Hel"],
+    ["thinking_start", 2], ["thinking_delta", 2, "Second"], ["thinking_end", 2, "Second"],
+    ["text_start", 3], ["text_delta", 3, "lo"], ["text_end", 3, "lo"],
+    "done",
+  ]);
+  assert.deepEqual(result.message.content, [
+    { type: "thinking", thinking: "First" },
+    { type: "text", text: "Hel" },
+    { type: "thinking", thinking: "Second", thinkingSignature: "sig-new" },
+    { type: "text", text: "lo" },
+  ]);
+  // Continuation replays committed text only; the abandoned signature is gone.
+  assert.deepEqual(p.requests[1].conversationState.history.at(-1), { assistantResponseMessage: { content: "Hel" } });
+  const next = await p.stream({ messages: [
+    ...turnContext.messages, result.message, { role: "user", content: "Next" },
+  ] }, { reasoning: "high" }).result();
+  assert.equal(next.type, "done");
+  assert.deepEqual(p.requests[2].conversationState.history[1], { assistantResponseMessage: {
+    content: "Hello",
+    reasoningContent: { reasoningText: { text: "Second", signature: "sig-new" } },
+  } });
+});
+
+test("native refusal reaches OMP as a structured error without releasing a buffered tool", async (t) => {
+  const p = await reasoningProvider(t, [new Response(Buffer.concat([
+    reasoningEvent({ text: "Review", signature: "not-replayable" }),
+    frame("toolUseEvent", { toolUseId: "discarded", name: "read", input: "{}", stop: true }),
+    frame("meteringEvent", { usage: 0.5, unit: "credits" }),
+    frame("metadataEvent", {
+      stopReason: "CONTENT_FILTERED", tokenUsage: { outputTokens: 7 },
+      stopDetails: { refusal: { category: "OTHER", explanation: `Rejected ${auth.access_token}` } },
+    }),
+  ]))]);
+  const stream = p.stream({ ...turnContext, tools: [readTool] }, { reasoning: "high" });
+  const result = await stream.result();
+  assert.equal(result.type, "error");
+  assert.deepEqual(result.error.stopDetails, {
+    type: "refusal", category: "OTHER", explanation: "Rejected [redacted]",
+  });
+  assert.deepEqual(result.error.content, [{ type: "thinking", thinking: "Review" }]);
+  assert.equal(result.error.usage.output, 7);
+  assert.deepEqual(result.error.usage.credits, { cost: 0.5 });
+  assert.ok(!stream.events.some(({ type }) => type.startsWith("toolcall") || type === "done"));
+  assert.equal(p.requests.length, 1);
+});
+
+test("ordinary answer tags and orphan signatures never manufacture thinking output", async (t) => {
+  const literal = "<thinking>This is a quoted tag, not native reasoning.</thinking>";
+  const p = await reasoningProvider(t, [new Response(Buffer.concat([
+    reasoningEvent({ signature: "orphan" }), answer(literal),
+  ]))]);
+  const stream = p.stream(turnContext, { reasoning: "high" });
+  const result = await stream.result();
+  assert.equal(result.type, "done");
+  assert.deepEqual(result.message.content, [{ type: "text", text: literal }]);
+  assert.deepEqual(lifecycle(stream.events), [
+    "start", ["text_start", 0], ["text_delta", 0, literal], ["text_end", 0, literal], "done",
+  ]);
 });

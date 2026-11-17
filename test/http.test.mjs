@@ -907,3 +907,404 @@ test("generation idle timeout resets on bytes rather than imposing a total deadl
     clearInterval(timer);
   }
 });
+
+const reasoningModel = "reasoning-model";
+const reasoningFrame = (data) => frame("reasoningContentEvent", data);
+const toolFrame = (id) => frame("toolUseEvent", { toolUseId: id, name: "read", input: '{"path":"a"}', stop: true });
+
+// Mirrors the OMP provider: blocks enter content in wire order; the transport owns their fields.
+function streamRecorder() {
+  const events = [];
+  const content = [];
+  return {
+    events,
+    content,
+    onReasoning(event) {
+      if (event.type === "delta") assert.ok(event.block.thinking.endsWith(event.delta), "text is stored before its delta");
+      events.push(event);
+      if (event.type === "start" || event.type === "redacted") content.push(event.block);
+    },
+    onText(delta) {
+      events.push({ type: "text", delta });
+      const last = content.at(-1);
+      if (last?.type === "text") last.text += delta;
+      else content.push({ type: "text", text: delta });
+    },
+  };
+}
+
+function hostAssistant(content, outcome) {
+  return {
+    role: "assistant", provider: "kiro-http", api: "kiro-cli-http", model: reasoningModel,
+    content: [...content, ...(outcome.toolCalls ?? [])],
+    stopReason: outcome.stopReason,
+    ...(outcome.upstreamModel ? { upstreamModel: outcome.upstreamModel } : {}),
+  };
+}
+
+function followUp(assistant) {
+  return buildHttpRequest({
+    model: reasoningModel,
+    context: {
+      ...context,
+      messages: [...context.messages, assistant, { role: "toolResult", toolCallId: "call", content: "actual a" }],
+    },
+  }).conversationState.history[1].assistantResponseMessage;
+}
+
+test("native reasoning phases stream in wire order without replaying an older signature for an unsigned tail", async () => {
+  const stream = streamRecorder();
+  const run = transport(async () => response([
+    reasoningFrame({ text: "Plan " }),
+    reasoningFrame({ text: "first" }),
+    reasoningFrame({ signature: "sig-1" }),
+    frame("assistantResponseEvent", { content: "Reading" }),
+    reasoningFrame({ redactedContent: "b3BhcXVl" }),
+    reasoningFrame({ text: "Check", signature: "sig-2-superseded" }),
+    reasoningFrame({ signature: "sig-2" }),
+    reasoningFrame({ text: "unsigned tail" }),
+    toolFrame("call"),
+  ], 7));
+  const outcome = await run({
+    model: reasoningModel, context, onText: stream.onText, onReasoning: stream.onReasoning,
+  });
+  const blocks = stream.content;
+  assert.deepEqual(blocks, [
+    { type: "thinking", thinking: "Plan first", thinkingSignature: "sig-1" },
+    { type: "text", text: "Reading" },
+    { type: "redactedThinking", data: "b3BhcXVl" },
+    { type: "thinking", thinking: "Check", thinkingSignature: "sig-2" },
+    { type: "thinking", thinking: "unsigned tail" },
+  ]);
+  assert.deepEqual(stream.events.map(({ type, block, delta }) => [type, blocks.indexOf(block), delta]), [
+    ["start", 0, undefined], ["delta", 0, "Plan "], ["delta", 0, "first"], ["end", 0, undefined],
+    ["text", -1, "Reading"],
+    ["redacted", 2, undefined],
+    ["start", 3, undefined], ["delta", 3, "Check"], ["end", 3, undefined],
+    ["start", 4, undefined], ["delta", 4, "unsigned tail"], ["end", 4, undefined],
+  ]);
+  const visible = stream.events.map(({ delta }) => delta ?? "").join("");
+  for (const hidden of ["sig-", "b3BhcXVl"]) assert.ok(!visible.includes(hidden));
+  assert.equal(outcome.upstreamModel, undefined);
+  assert.deepEqual(followUp(hostAssistant(blocks, outcome)), {
+    content: "Reading",
+    toolUses: [{ toolUseId: "call", name: "read", input: { path: "a" } }],
+  });
+});
+
+test("reasoning history replays only the producing Kiro HTTP model's complete phases", () => {
+  const kiro = (content, extra = {}) => ({
+    role: "assistant", provider: "kiro-http", api: "kiro-cli-http", model: reasoningModel,
+    stopReason: "stop", content, ...extra,
+  });
+  const signed = (text, signature) => ({ type: "thinking", thinking: text, thinkingSignature: signature });
+  const text = (value) => ({ type: "text", text: value });
+  const turns = [
+    [kiro([signed("a", "sig-a"), { type: "redactedThinking", data: "b3BhcXVl" }, text("Hel"), text("lo")])],
+    [kiro([signed("b", "sig-b"), text("other model")], { model: "other-model" })],
+    [kiro([signed("c", "sig-c"), text("rerouted")], { upstreamModel: "other-model" })],
+    [kiro([signed("d", "sig-d"), text("foreign")], { provider: "anthropic", api: "anthropic-messages" })],
+    [kiro([signed("e", "sig-e"), text("failed")], { stopReason: "error" })],
+    [kiro([signed("f", "sig-f"), { type: "redactedThinking", data: "" }, { type: "thinking", thinking: "unsigned" },
+      text("invalidated")])],
+    [kiro([signed("g", "sig-g"), text("merged")]), kiro([signed("h", "sig-h"), text("cancelled")], { stopReason: "aborted" })],
+  ];
+  const input = {
+    model: reasoningModel,
+    sessionId: "replay-session",
+    context: {
+      ...context,
+      messages: [
+        ...turns.flatMap((assistants, index) => [{ role: "user", content: `q${index}` }, ...assistants]),
+        { role: "user", content: "final" },
+      ],
+    },
+  };
+  const original = structuredClone(input);
+  const body = buildHttpRequest(input);
+  const assistants = body.conversationState.history.flatMap((message) =>
+    message.assistantResponseMessage ? [message.assistantResponseMessage] : []);
+  assert.deepEqual(assistants.map(({ reasoningContent }) => reasoningContent), [
+    { redactedContent: "b3BhcXVl" },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined, // The latest phase is unsigned; an older signature is not a substitute.
+    undefined, // A later aborted assistant turn cannot inherit the earlier turn's signature.
+  ]);
+  assert.equal(assistants[0].content, "Hello", "reasoning-split native text is one stream");
+  assert.deepEqual(input, original);
+  const withoutReasoning = structuredClone(body);
+  for (const message of withoutReasoning.conversationState.history)
+    delete message.assistantResponseMessage?.reasoningContent;
+  assert.deepEqual(withoutReasoning, buildHttpRequest({
+    ...input,
+    context: {
+      ...input.context,
+      messages: input.context.messages.map((message) => message.role === "assistant"
+        ? { ...message, content: message.content.filter(({ type }) => !["thinking", "redactedThinking"].includes(type)) }
+        : message),
+    },
+  }), "text and tools are unchanged by reasoning replay");
+});
+
+test("retries never replay or re-sign reasoning from an abandoned attempt", async () => {
+  for (const mode of ["continuePartial", "onRestart"]) {
+    const bodies = [];
+    const stream = streamRecorder();
+    let restarts = 0;
+    const run = createHttpTransport({
+      authProvider: async () => auth,
+      retry: fastRetry,
+      fetchImpl: async (_url, init) => {
+        bodies.push(init.body);
+        return bodies.length === 1
+          ? interruptedResponse([
+            reasoningFrame({ text: "first" }),
+            reasoningFrame({ signature: "sig-abandoned" }),
+            reasoningFrame({ redactedContent: "YWJhbmRvbmVk" }),
+            frame("assistantResponseEvent", { content: "Committed " }),
+            reasoningFrame({ text: "open" }),
+          ])
+          : response([
+            reasoningFrame({ text: "second" }),
+            reasoningFrame({ signature: "sig-final" }),
+            frame("assistantResponseEvent", { content: "done" }),
+            toolFrame("call"),
+          ]);
+      },
+    });
+    const outcome = await run({
+      model: reasoningModel, context, onText: stream.onText, onReasoning: stream.onReasoning,
+      ...(mode === "continuePartial" ? { continuePartial: true } : { onRestart() { restarts++; } }),
+    });
+    assert.equal(bodies.length, 2);
+    for (const hidden of ["sig-abandoned", "YWJhbmRvbmVk", "first"]) assert.ok(!bodies[1].includes(hidden));
+    if (mode === "onRestart") {
+      assert.equal(restarts, 1);
+      assert.equal(bodies[0], bodies[1]);
+    }
+    const reasoningBlocks = stream.content.filter(({ type }) => type !== "text");
+    assert.deepEqual(reasoningBlocks, [
+      { type: "thinking", thinking: "first" },
+      { type: "redactedThinking", data: "" },
+      { type: "thinking", thinking: "open" },
+      { type: "thinking", thinking: "second", thinkingSignature: "sig-final" },
+    ]);
+    for (const block of reasoningBlocks.filter(({ type }) => type === "thinking"))
+      assert.equal(stream.events.filter((event) => event.type === "end" && event.block === block).length, 1);
+    const replay = followUp(hostAssistant(stream.content, outcome));
+    assert.deepEqual(replay.reasoningContent, { reasoningText: { text: "second", signature: "sig-final" } });
+    assert.deepEqual(replay.toolUses.map(({ toolUseId }) => toolUseId), ["call"]);
+  }
+});
+
+test("failed or cancelled reasoning ends once and keeps no replayable metadata", async () => {
+  const valid = reasoningFrame({ text: "more" });
+  const corrupt = Buffer.from(valid);
+  corrupt[corrupt.length - 5] ^= 1;
+  const reason = new Error("cancelled while thinking");
+  const prefix = [
+    reasoningFrame({ text: "signed" }),
+    reasoningFrame({ signature: "sig" }),
+    reasoningFrame({ redactedContent: "b3BhcXVl" }),
+    reasoningFrame({ text: "open" }),
+  ];
+  for (const [respond, expected, cancel] of [
+    [() => interruptedResponse(prefix), (error) => error.cause?.code === "UND_ERR_SOCKET"],
+    [() => response([...prefix, corrupt]), /checksum/],
+    [() => response([...prefix, valid.subarray(0, -1)]), /Truncated/],
+    [() => response([...prefix, reasoningFrame({ signature: 7 })]), /Invalid Kiro reasoning event/],
+    [() => response([...prefix, valid]), (error) => error === reason, true],
+  ]) {
+    const controller = new AbortController();
+    const stream = streamRecorder();
+    let attempts = 0;
+    const run = createHttpTransport({
+      authProvider: async () => auth,
+      retry: fastRetry,
+      fetchImpl: async () => { attempts++; return respond(); },
+    });
+    await assert.rejects(run({
+      model: reasoningModel, context, signal: controller.signal, onText: stream.onText,
+      onReasoning(event) {
+        stream.onReasoning(event);
+        if (cancel && event.delta === "open") controller.abort(reason);
+      },
+    }), expected);
+    assert.equal(attempts, 1, "published reasoning without a recovery opt-in is terminal");
+    assert.deepEqual(stream.content, [
+      { type: "thinking", thinking: "signed" },
+      { type: "redactedThinking", data: "" },
+      { type: "thinking", thinking: "open" },
+    ]);
+    assert.deepEqual(
+      stream.events.filter(({ type }) => type === "end").map(({ block }) => stream.content.indexOf(block)),
+      [0, 2],
+    );
+  }
+});
+
+test("a different advertised response model is reported and blocks signature replay", async () => {
+  for (const advertised of [reasoningModel, "rerouted-model"]) {
+    const bodies = [];
+    const stream = streamRecorder();
+    const run = transport(async (_url, init) => {
+      bodies.push(JSON.parse(init.body));
+      return response([
+        reasoningFrame({ text: "think", signature: "sig" }),
+        frame("assistantResponseEvent", { content: "Reading", modelId: advertised }),
+        toolFrame("call"),
+      ]);
+    });
+    const outcome = await run({
+      model: reasoningModel, context, onText: stream.onText, onReasoning: stream.onReasoning,
+    });
+    const rerouted = advertised !== reasoningModel;
+    assert.equal(bodies[0].conversationState.currentMessage.userInputMessage.modelId, reasoningModel);
+    assert.equal(outcome.upstreamModel, rerouted ? advertised : undefined);
+    assert.deepEqual(followUp(hostAssistant(stream.content, outcome)).reasoningContent,
+      rerouted ? undefined : { reasoningText: { text: "think", signature: "sig" } });
+  }
+});
+
+test("native uppercase stop reasons distinguish completion, truncation and real tool handoffs", async () => {
+  for (const reason of ["MAX_TOKENS", "MODEL_CONTEXT_WINDOW_EXCEEDED", "max_tokens", "length", "END_TURN"]) {
+    const result = await transport(async () => response([
+      frame("assistantResponseEvent", { content: "partial" }),
+      frame("metadataEvent", { stopReason: reason }),
+    ]))({ model: "model", context });
+    assert.equal(result.stopReason, reason === "END_TURN" ? "stop" : "length");
+  }
+  const result = await transport(async () => response([
+    toolFrame("call"), frame("metadataEvent", { stopReason: "TOOL_USE" }),
+  ]))({ model: "model", context });
+  assert.equal(result.stopReason, "toolUse");
+  assert.deepEqual(result.toolCalls, [{ type: "toolCall", id: "call", name: "read", arguments: { path: "a" } }]);
+  await assert.rejects(transport(async () => response([
+    frame("metadataEvent", { stopReason: "TOOL_USE" }),
+  ]))({ model: "model", context }), /TOOL_USE without a tool call/);
+});
+
+test("refusal, paused turns, handoff compaction and unknown stops never release buffered tools or retry", async () => {
+  for (const [stopReason, code] of [
+    ["CONTENT_FILTERED", "ContentFiltered"], ["PAUSE_TURN", "PausedTurn"],
+    ["COMPACTION_REQUIRED_FOR_MODEL_HANDOFF", "CompactionRequired"], ["UNKNOWN", "UnsupportedStopReason"],
+  ]) {
+    let attempts = 0;
+    const stream = streamRecorder();
+    const run = createHttpTransport({
+      authProvider: async () => auth, retry: fastRetry,
+      fetchImpl: async () => {
+        attempts++;
+        return response([
+          reasoningFrame({ text: "Review", signature: "discarded-signature" }),
+          toolFrame("unapproved"),
+          frame("metadataEvent", {
+            tokenUsage: { outputTokens: 8 },
+            stopReason,
+            stopDetails: { refusal: { category: "OTHER", explanation: `Not allowed ${auth.access_token}` } },
+          }),
+        ]);
+      },
+    });
+    await assert.rejects(run({ model: "model", context, continuePartial: true, onReasoning: stream.onReasoning }), (error) => {
+      assert.equal(error.code, code);
+      assert.equal(error.usage.output, 8);
+      assert.ok(!JSON.stringify(error).includes(auth.access_token));
+      if (stopReason === "CONTENT_FILTERED") assert.deepEqual(error.stopDetails, {
+        type: "refusal", category: "OTHER", explanation: "Not allowed [redacted]",
+      });
+      return true;
+    });
+    assert.equal(attempts, 1);
+    assert.deepEqual(stream.content, [{ type: "thinking", thinking: "Review" }]);
+  }
+});
+
+test("partial token metadata merges and credit metering never becomes dollars or estimated context tokens", async () => {
+  const result = await transport(async () => response([
+    frame("meteringEvent", { usage: 0.25, unit: "credit", unitPlural: "credits" }),
+    frame("metadataEvent", { tokenUsage: { uncachedInputTokens: 10, cacheReadInputTokens: 4 } }),
+    frame("contextUsageEvent", { contextUsagePercentage: 80 }),
+    frame("metadataEvent", { tokenUsage: {
+      outputTokens: 3, cacheWriteInputTokens: 5, totalTokens: 22, normalizedTokenUsage: 9000, contextUsagePercentage: 80,
+    } }),
+    frame("metadataEvent", { tokenUsage: { uncachedInputTokens: -1, outputTokens: "invalid" } }),
+    frame("meteringEvent", { usage: 400, unit: "tokens" }),
+    frame("assistantResponseEvent", { content: "Done" }),
+  ]))({ model: "model", context });
+  assert.deepEqual(result.usage, {
+    input: 10, output: 3, cacheRead: 4, cacheWrite: 5, totalTokens: 22,
+    credits: { cost: 0.25 },
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  });
+});
+
+test("native event error variants honor transient versus quota classification", async () => {
+  for (const [event, reason, retryable] of [
+    ["error", undefined, true], ["serviceUnavailableError", undefined, true],
+    ["throttlingError", "INSUFFICIENT_MODEL_CAPACITY", true],
+    ["throttlingError", "MONTHLY_REQUEST_COUNT", false],
+    ["throttlingError", "DAILY_REQUEST_COUNT", false],
+    ["validationError", undefined, false],
+  ]) {
+    let attempts = 0;
+    const run = createHttpTransport({
+      authProvider: async () => auth, retry: fastRetry,
+      fetchImpl: async () => ++attempts === 1
+        ? response([frame(event, { message: `Request rejected ${auth.refresh_token}`, reason })])
+        : response([frame("assistantResponseEvent", { content: "Recovered" })]),
+    });
+    const text = [];
+    const turn = run({ model: "model", context, onText: (value) => text.push(value) });
+    if (retryable) {
+      await turn;
+      assert.deepEqual(text, ["Recovered"]);
+      assert.equal(attempts, 2);
+    } else {
+      await assert.rejects(turn, (error) => {
+        assert.equal(error.reason, reason);
+        assert.ok(!error.message.includes(auth.refresh_token));
+        return true;
+      });
+      assert.deepEqual(text, []);
+      assert.equal(attempts, 1);
+    }
+  }
+});
+
+test("a server-side tool result cannot impersonate an OMP-executed tool result", async () => {
+  let attempts = 0;
+  const run = createHttpTransport({
+    authProvider: async () => auth, retry: fastRetry,
+    fetchImpl: async () => {
+      attempts++;
+      return response([
+        toolFrame("call"),
+        frame("toolResultEvent", { toolResult: { toolUseId: "call", content: [{ text: "not executed by OMP" }] } }),
+      ]);
+    },
+  });
+  await assert.rejects(run({ model: "model", context, continuePartial: true }),
+    (error) => error.code === "UnsupportedServerToolResult");
+  assert.equal(attempts, 1);
+});
+
+test("native throttle delays use milliseconds and preserve the longer HTTP Retry-After", async () => {
+  for (const [respond, expected] of [
+    [() => Response.json({ __type: "ThrottlingException", retryAfterMilliseconds: 2500 }, { status: 429 }), 2500],
+    [() => Response.json({ __type: "ThrottlingException" }, {
+      status: 429, headers: { "x-amzn-kiro-ratelimit-retry-after": "3500", "retry-after": "2" },
+    }), 3500],
+    [() => Response.json({ __type: "ThrottlingException", retryAfterMilliseconds: 1000 }, {
+      status: 429, headers: { "x-amzn-kiro-ratelimit-retry-after": "invalid", "retry-after": "4" },
+    }), 4000],
+    [() => response([frame("throttlingError", { message: "slow down", retryAfterMilliseconds: 1250 })]), 1250],
+  ]) {
+    const run = createHttpTransport({ authProvider: async () => auth, fetchImpl: async () => respond() });
+    await assert.rejects(run({ model: "model", context, retry: { maxAttempts: 1 } }),
+      (error) => error.retryAfterMs === expected);
+  }
+});

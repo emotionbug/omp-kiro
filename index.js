@@ -29,17 +29,33 @@ function streamKiro(model, context, options = {}, transport, resolveModelSchema)
     timestamp: Date.now(),
   };
   async function run() {
+    // Each content block keeps the index where it was appended; text and
+    // reasoning phases alternate as separate blocks in wire order.
     let text;
+    let textIndex;
+    let thinking;
+    let thinkingIndex;
+    const append = (block) => message.content.push(block) - 1;
+    const endText = () => {
+      if (!text) return;
+      stream.push({ type: "text_end", contentIndex: textIndex, content: text.text, partial: message });
+      text = undefined;
+    };
+    const endThinking = () => {
+      if (!thinking) return;
+      stream.push({ type: "thinking_end", contentIndex: thinkingIndex, content: thinking.thinking, partial: message });
+      thinking = undefined;
+    };
     stream.push({ type: "start", partial: message });
     try {
       options.signal?.throwIfAborted();
       const modelRequestFieldsSchema = transport === "http"
         ? await resolveModelSchema(model.id, options.signal)
         : undefined;
-      const thinking = transport === "http" ? kiroThinkingConfig(modelRequestFieldsSchema) : undefined;
+      const thinkingConfig = transport === "http" ? kiroThinkingConfig(modelRequestFieldsSchema) : undefined;
       // Custom streamSimple providers bypass OMP's mandatory-reasoning clamp.
       // Auto/off must use the native floor when this model cannot disable reasoning.
-      const useMinimumEffort = thinking?.requiresEffort &&
+      const useMinimumEffort = thinkingConfig?.requiresEffort &&
         (options.reasoning === undefined || options.disableReasoning || options.forceReasoningOff);
       const runTransport = transport === "http" ? runHttpTurn : runTurn;
       const outcome = await runTransport({
@@ -51,24 +67,45 @@ function streamKiro(model, context, options = {}, transport, resolveModelSchema)
         ...(transport === "http" ? {
           continuePartial: true,
           modelRequestFieldsSchema,
-          reasoning: useMinimumEffort ? thinking.efforts[0] : options.reasoning,
+          reasoning: useMinimumEffort ? thinkingConfig.efforts[0] : options.reasoning,
           disableReasoning: !useMinimumEffort && model.reasoning ? options.disableReasoning : undefined,
           forceReasoningOff: useMinimumEffort ? undefined : options.forceReasoningOff,
+          // The transport owns each block and has already applied text and
+          // signature updates; signatures and opaque data never become deltas.
+          onReasoning({ type, block, delta }) {
+            if (type === "start") {
+              endText();
+              endThinking();
+              thinking = block;
+              thinkingIndex = append(block);
+              stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: message });
+            } else if (type === "delta") {
+              if (block === thinking && delta)
+                stream.push({ type: "thinking_delta", contentIndex: thinkingIndex, delta, partial: message });
+            } else if (type === "end") {
+              if (block === thinking) endThinking();
+            } else if (type === "redacted") {
+              endText();
+              endThinking();
+              append(block);
+            }
+          },
         } : {}),
         onText(delta) {
           if (!delta) return;
+          endThinking();
           if (!text) {
             text = { type: "text", text: "" };
-            message.content.push(text);
-            stream.push({ type: "text_start", contentIndex: 0, partial: message });
+            textIndex = append(text);
+            stream.push({ type: "text_start", contentIndex: textIndex, partial: message });
           }
           text.text += delta;
-          stream.push({ type: "text_delta", contentIndex: 0, delta, partial: message });
+          stream.push({ type: "text_delta", contentIndex: textIndex, delta, partial: message });
         },
       });
       options.signal?.throwIfAborted();
-      if (text)
-        stream.push({ type: "text_end", contentIndex: 0, content: text.text, partial: message });
+      endText();
+      endThinking();
       const toolCalls = outcome.toolCalls ?? (outcome.toolCall ? [outcome.toolCall] : []);
       for (const toolCall of toolCalls) {
         const contentIndex = message.content.length;
@@ -83,10 +120,20 @@ function streamKiro(model, context, options = {}, transport, resolveModelSchema)
         stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: message });
       }
       if (outcome.usage) message.usage = outcome.usage;
+      if (outcome.upstreamModel) message.upstreamModel = outcome.upstreamModel;
+      if (outcome.stopDetails) message.stopDetails = outcome.stopDetails;
       message.stopReason = toolCalls.length ? "toolUse" : (outcome.stopReason ?? "stop");
       stream.push({ type: "done", reason: message.stopReason, message });
     } catch (error) {
+      endText();
+      endThinking();
       message.stopReason = options.signal?.aborted ? "aborted" : "error";
+      if (transport === "http") {
+        if (error?.stopDetails) message.stopDetails = error.stopDetails;
+        if (error?.usage) message.usage = error.usage;
+        if (error?.upstreamModel) message.upstreamModel = error.upstreamModel;
+        if (Number.isFinite(error?.status)) message.errorStatus = error.status;
+      }
       // Transient HTTP recovery/committed-text continuation stays inside the
       // transport. Terminal errors remain sanitized for the host.
       message.errorMessage =

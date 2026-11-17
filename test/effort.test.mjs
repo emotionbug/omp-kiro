@@ -53,6 +53,59 @@ test("explicit off uses only a declared native representation and takes preceden
   }
 });
 
+test("summaries require both advertised adaptive type and summarized display", () => {
+  for (const [types, displays, expected] of [
+    [["adaptive"], ["summarized", "omitted"], { type: "adaptive", display: "summarized" }],
+    [["adaptive", "disabled"], ["summarized"], { type: "adaptive", display: "summarized" }],
+    [["enabled", "disabled"], ["summarized"], undefined],
+    [["adaptive"], ["omitted"], undefined],
+    [["adaptive"], undefined, undefined],
+  ]) {
+    const native = schema("output_config", ["low", "high"]);
+    native.properties.thinking = { properties: {
+      type: { enum: types },
+      ...(displays ? { display: { enum: displays } } : {}),
+    } };
+    assert.deepEqual(kiroEffortFields(native, { reasoning: "high" }), {
+      output_config: { effort: "high" },
+      ...(expected ? { thinking: expected } : {}),
+    });
+  }
+});
+
+test("Auto preserves optional thinking defaults but requests summaries for default adaptive thinking", () => {
+  const native = schema("output_config", ["low", "high"]);
+  native.properties.thinking = { properties: {
+    type: { enum: ["adaptive", "disabled"] },
+    display: { enum: ["summarized", "omitted"] },
+  } };
+  assert.equal(kiroEffortFields(native), undefined);
+  native.properties.thinking.properties.type.default = "disabled";
+  assert.equal(kiroEffortFields(native), undefined);
+  native.properties.thinking.properties.type.default = "adaptive";
+  assert.deepEqual(kiroEffortFields(native), { thinking: { type: "adaptive", display: "summarized" } });
+  delete native.properties.thinking.properties.type.default;
+  native.properties.thinking.properties.type.enum = ["adaptive"];
+  assert.deepEqual(kiroEffortFields(native), { thinking: { type: "adaptive", display: "summarized" } });
+  native.properties.output_config.properties.effort.enum.push("none");
+  assert.equal(kiroEffortFields(native), undefined, "a native off effort still preserves Auto defaults");
+});
+
+test("explicit off never enables adaptive summaries even when they are available by default", () => {
+  const native = schema("reasoning", ["low", "none"]);
+  native.properties.thinking = { properties: {
+    type: { enum: ["adaptive", "disabled"], default: "adaptive" },
+    display: { enum: ["summarized", "omitted"] },
+  } };
+  for (const flag of ["disableReasoning", "forceReasoningOff"]) {
+    assert.deepEqual(kiroEffortFields(native, { reasoning: "high", [flag]: true }), {
+      reasoning: { effort: "none" },
+    });
+  }
+  native.properties.reasoning.properties.effort.enum = ["low"];
+  assert.deepEqual(kiroEffortFields(native, { disableReasoning: true }), { thinking: { type: "disabled" } });
+});
+
 test("malformed control metadata fails rather than inventing capability", () => {
   for (const malformed of [
     [], "schema", 5, { properties: [] }, { properties: { reasoning: null } },
@@ -60,6 +113,7 @@ test("malformed control metadata fails rather than inventing capability", () => 
     schema("reasoning", "high"), schema("reasoning", []), schema("reasoning", ["high", 1]),
     schema("reasoning", ["high", "high"]), schema("reasoning", ["high"], "low"),
     { properties: { thinking: { properties: { type: { enum: "disabled" } } } } },
+    { properties: { thinking: { properties: { display: { enum: ["summarized", "summarized"] } } } } },
     { properties: { ...schema("output_config", ["high"]).properties, ...schema("reasoning", ["high"]).properties } },
   ]) {
     assert.throws(() => kiroThinkingConfig(malformed), TypeError);

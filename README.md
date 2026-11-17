@@ -259,11 +259,31 @@ Generation uses the current Kiro runtime HTTPS endpoint; model discovery uses th
 
 Since 0.4.8, system-prompt arrays are joined and prepended once to the first wire user input. Developer instructions retain their role labels and conversation positions instead of being moved ahead of earlier turns. The feature-gated top-level `systemPrompt` field is not sent: it caused HTTP 400 `ValidationException: Improperly formed request` on the live Identity Center account. Instructions are preserved as an explicit text projection, **not upstream-enforced system/developer channels**; host tool permission decisions remain authoritative.
 
-The transport decodes checksum-validated AWS event-stream frames, assembles interleaved tool argument fragments, and forwards text, reported usage, errors, and cancellation. OMP performs approved tool execution; the transport never executes tools, replaces the selected model, or falls back to ACP. Region routing is restricted to the artifact-backed US East and EU Central Kiro endpoint families.
+The transport decodes checksum-validated AWS event-stream frames, assembles interleaved tool argument fragments, and forwards text, native reasoning, reported usage, errors, and cancellation. OMP performs approved tool execution; the transport never executes tools, replaces the selected model, or falls back to ACP. Region routing is restricted to the artifact-backed US East and EU Central Kiro endpoint families.
+
+**Reasoning display:** HTTP `reasoningContentEvent.text` streams through OMP's thinking blocks, separately from the answer. When the model schema advertises both adaptive thinking and summarized display, an explicit positive effort requests `thinking: {type: "adaptive", display: "summarized"}`. Auto does so when adaptive thinking is the declared default/only mode; optional thinking without an advertised default is not forcibly enabled. Mandatory-effort models still use their native minimum for OMP Auto/off. A supported explicit native off takes precedence. This consumes the existing generation stream; there is no separate reasoning-generation request.
+
+Signatures are stored as thinking metadata, never displayed. Opaque redacted content is stored as `redactedThinking`, without decoding it or inventing a “Reasoning hidden” message. Ordinary answer tags such as `<thinking>` remain answer text. Whether a readable block is available depends on the model/service; effort alone does not guarantee one.
+
+On follow-up requests, only the last reasoning phase of an eligible `kiro-http` / `kiro-cli-http` assistant message can replay as native `reasoningContent`: signed text or a nonempty opaque blob. The requested/producing model must match, including any advertised upstream model. An unsigned latest phase, a failed/aborted turn, or a later ineligible assistant message does not inherit an older signature. Signed phases are never concatenated. Failed-attempt signatures and opaque replay data are invalidated; already displayed text can remain as an unsigned phase, separate from the next attempt. Continuations carry committed answer text, not abandoned reasoning or tools.
+
+Other native response handling:
+
+| Event | Handling |
+| --- | --- |
+| `metadataEvent` | Merge reported token fields; map native `MAX_TOKENS` and `MODEL_CONTEXT_WINDOW_EXCEEDED` to length termination. `CONTENT_FILTERED` becomes a structured refusal error and cannot release buffered tools. |
+| `meteringEvent` | Map an explicit `credit`/`credits` unit to `usage.credits.cost`, not dollar cost or token counts. Other units remain unmapped. |
+| Native error variants / exception frames | Surface errors; daily/monthly request-count limits are terminal. Native `retryAfterMilliseconds` and `x-amzn-kiro-ratelimit-retry-after` are milliseconds; the longer native/HTTP retry delay wins. |
+| `toolResultEvent` | Reject server-side tool results rather than impersonating actual OMP-executed results. |
+| `contextUsageEvent`, code references, document citations | Not mapped to OMP's current generic output contract. Percentages and normalized usage are not guessed into occupied token counts; citations are not injected into answer text. |
+
+`PAUSE_TURN`, model-handoff compaction requests, unknown stop reasons, and `TOOL_USE` without actual calls fail explicitly rather than claiming completion. Automatic paused-turn resumption/model handoff is not implemented.
+
+For direct transport consumers, `onReasoning({type, block, delta?})` emits `start`, `delta`, and `end` for readable phases, and `redacted` for opaque blocks. The transport updates the stable block before a delta callback and closes readable phases on text/tool boundaries, completion, error, cancellation, and retry.
 
 **Retry ownership (0.4.2):** HTTP recovery stays inside the shared transport, including actual OMP generation. Transient failures retry **until caller cancellation**, waiting **30 seconds after each failure** by default. OMP enables the explicit `continuePartial: true` turn option: after published text is interrupted, the transport moves the current input and completed tool results into local wire history once, appends the assistant fragment, and requests only continuation. The continuation retains model, origin, conversation ID, system instructions, workspace context, and tool schema, but never copies old `toolResults` into its current message. Subsequent text appends to the same OMP assistant message; repeated outages do not depend on OMP's bounded host recovery.
 
-The standalone transport supports explicit `onRestart` for consumers that can genuinely replace provisional text; without continuation or restart, failure after published text is terminal. Before new text, retries retain the exact serialized request.
+The standalone transport supports explicit `onRestart` for consumers that can genuinely replace provisional output; without continuation or restart, failure after published text or reasoning is terminal. Before new answer text, retries retain the exact serialized request.
 
 Transient network failures include offline DNS (`ENOTFOUND`, `EAI_AGAIN`), unreachable/refused connections, socket drops, and response-data timeouts. HTTP 408/429/500/502/503/504 and selected framed temporary service errors are retryable. `retry.maxAttempts: null` explicitly means unlimited attempts until abort (the default); a numeric 1–5 retains an explicitly finite policy. `OMP_KIRO_HTTP_MAX_ATTEMPTS` accepts `unlimited` or 1–5. `baseDelayMs`/`maxDelayMs` (environment: `OMP_KIRO_HTTP_RETRY_BASE_MS`/`OMP_KIRO_HTTP_RETRY_MAX_MS`) accept 0–30000; custom policies retain exponential backoff capped at `maxDelayMs`, while both defaults are 30000 for fixed cadence. A longer server `Retry-After` extends the wait instead of causing an early retry or failure, and all waits are abortable. The per-attempt response-data timeout defaults to 45 seconds (`OMP_KIRO_HTTP_IDLE_TIMEOUT_MS`: 1–300000). Catalog/search/usage and command wrappers impose no shorter default total deadline; usage callers may still set an explicit `timeoutMs`.
 
@@ -292,7 +312,7 @@ The target machine still needs approved Kiro service/proxy/gateway access and an
 ### Shared limits
 
 - **Text only:** images and unsupported content are rejected. Thinking blocks are not forwarded as conversation text.
-- **Reasoning output:** effort selection does not add native reasoning-event rendering or signed-reasoning history replay; those output/history behaviors remain unchanged.
+- **Reasoning output:** HTTP displays native readable reasoning and preserves eligible signed/opaque history as described above. ACP reasoning forwarding remains unchanged. Live generation entitlement and readable-summary availability are not guaranteed by catalog access.
 - **Usage:** unreported token/cost fields remain numeric defaults, not a claim of free usage. HTTP forwards token counts only when upstream reports them.
 - **Planning limits:** ACP supplies no numeric limits, so it uses conservative 128,000-token context and 16,000-token output metadata. HTTP uses the live advertised limits, with conservative defaults for missing fields.
 - **Trust:** these are unsandboxed host plugins. ACP launches Kiro; HTTP uses the separate managed credential store. The selected host owns tool permission decisions.
