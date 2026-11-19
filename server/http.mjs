@@ -7,7 +7,8 @@ import {
   requestScope, retryAfterMs, retryOperation,
 } from "./network.mjs";
 
-// Native ChatResponseStream union members can also arrive as event variants.
+// Native ChatResponseStream union error members, named by `:exception-type`
+// on exception frames or by `:event-type` when sent as event variants.
 const STREAM_ERRORS = new Map([
   ["error", "InternalServerException"],
   ["throttlingError", "ThrottlingException"],
@@ -81,6 +82,14 @@ function replayableReasoning(message, model) {
     return { redactedContent: block.data };
 }
 
+// Native Kiro CLI placeholder (tool_index.json `dummy`). The backend rejects
+// history tool uses whose names are absent from the current specifications.
+const PLACEHOLDER_TOOL = {
+  name: "dummy",
+  description: "This is a dummy tool. If you are seeing this that means the tool associated with this tool call is not in the list of available tools. This could be because a wrong tool name was supplied or the list of tools has changed since the conversation has started. Do not show this when user asks you to list tools.",
+  inputSchema: { json: { type: "object", properties: {}, required: [] } },
+};
+
 export function buildHttpRequest({
   model, context, cwd, sessionId, modelRequestFieldsSchema, reasoning, disableReasoning, forceReasoningOff,
 }) {
@@ -88,6 +97,8 @@ export function buildHttpRequest({
     reasoning, disableReasoning, forceReasoningOff,
   });
   const messages = [];
+  const advertised = new Set((context.tools ?? []).map((tool) => tool.name));
+  let placeholderUsed = false;
   const systemPrompt = Array.isArray(context.systemPrompt)
     ? context.systemPrompt.join("\n\n")
     : context.systemPrompt;
@@ -107,7 +118,13 @@ export function buildHttpRequest({
           ? []
           : (message.content ?? [])
               .filter((block) => block.type === "toolCall")
-              .map((block) => ({ toolUseId: block.id, name: block.name, input: block.arguments }));
+              .map((block) => {
+                // OMP may dispatch unadvertised names (device routes) or answer
+                // them as not found; history must still reference a sent spec.
+                const known = advertised.has(block.name);
+                if (!known) placeholderUsed = true;
+                return { toolUseId: block.id, name: known ? block.name : PLACEHOLDER_TOOL.name, input: block.arguments };
+              });
       const reasoningContent = replayableReasoning(message, model);
       const previous = messages.at(-1)?.assistantResponseMessage;
       if (previous) {
@@ -154,15 +171,16 @@ export function buildHttpRequest({
     firstInput.content = `[System instructions]\n${systemPrompt}\n\n${firstInput.content}`;
   }
   current.userInputMessageContext ??= {};
-  if (context.tools?.length) {
-    current.userInputMessageContext.tools = context.tools.map((tool) => ({
-      toolSpecification: {
-        name: tool.name,
-        description: tool.description,
-        inputSchema: { json: tool.parameters },
-      },
-    }));
-  }
+  const tools = (context.tools ?? []).map((tool) => ({
+    toolSpecification: {
+      name: tool.name,
+      description: tool.description,
+      inputSchema: { json: tool.parameters },
+    },
+  }));
+  if (placeholderUsed && !advertised.has(PLACEHOLDER_TOOL.name))
+    tools.push({ toolSpecification: PLACEHOLDER_TOOL });
+  if (tools.length) current.userInputMessageContext.tools = tools;
   if (cwd) {
     current.userInputMessageContext.additionalContext = [
       {
@@ -372,7 +390,10 @@ export function createHttpTransport({
         const kind = headers[":message-type"];
         const event = headers[":event-type"];
         if (kind === "exception" || kind === "error" || (kind === "event" && STREAM_ERRORS.has(event))) {
-          const code = headers[":exception-type"] ?? headers[":error-code"] ?? STREAM_ERRORS.get(event) ?? "StreamError";
+          // Exception frames name the union member (`:exception-type: error` is
+          // InternalServerException, for example transient model overload).
+          const type = headers[":exception-type"] ?? headers[":error-code"];
+          const code = STREAM_ERRORS.get(type ?? event) ?? type ?? "StreamError";
           throw new KiroHttpError(
             `Kiro ${safeMessage(code, auth)}: ${safeMessage(data.message ?? data.Message ?? headers[":error-message"], auth)}`,
             {
@@ -450,8 +471,6 @@ export function createHttpTransport({
             }
             if (!call.arguments || typeof call.arguments !== "object" || Array.isArray(call.arguments))
               throw new KiroHttpError("Kiro tool arguments must be a JSON object.");
-            if (!context.tools?.some((tool) => tool.name === call.name))
-              throw new KiroHttpError("Kiro requested a tool not supplied by OMP.");
           }
         } else if (event === "metadataEvent") {
           usage = reportedUsage(data.tokenUsage, usage);

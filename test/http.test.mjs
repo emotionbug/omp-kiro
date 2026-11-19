@@ -103,8 +103,9 @@ test("native request preserves system, assistant tool uses and real parallel too
     { toolUseId: "b", content: [{ text: "actual error" }], status: "error" },
   ]);
   assert.deepEqual(
-    current.userInputMessageContext.tools[0].toolSpecification.inputSchema.json,
-    context.tools[0].parameters,
+    current.userInputMessageContext.tools.map((tool) => tool.toolSpecification.inputSchema.json),
+    [context.tools[0].parameters],
+    "advertised history adds no placeholder specification",
   );
   assert.equal(current.userInputMessageContext.additionalContext[0].innerContext, "/work");
 });
@@ -328,17 +329,53 @@ test("corrupt and truncated frames fail instead of accepting partial output", as
   );
 });
 
-test("incomplete, invalid, or unknown tool calls are rejected", async () => {
+test("incomplete or invalid tool calls are rejected", async () => {
   for (const [data, pattern] of [
     [{ toolUseId: "a", name: "read", input: "{}" }, /incomplete/],
     [{ toolUseId: "a", name: "read", input: "{", stop: true }, /invalid JSON/],
     [{ toolUseId: "a", name: "read", input: "[]", stop: true }, /JSON object/],
-    [{ toolUseId: "a", name: "unknown", input: "{}", stop: true }, /not supplied/],
   ]) {
     await assert.rejects(
       transport(async () => response([frame("toolUseEvent", data)]))({ model: "model", context }),
       pattern,
     );
+  }
+});
+
+test("unadvertised tool calls reach OMP dispatch and later history uses the native placeholder", async () => {
+  const outcome = await transport(async () => response([
+    frame("assistantResponseEvent", { content: "Checking" }),
+    frame("toolUseEvent", { toolUseId: "device", name: "lsp", input: '{"action":"diagnostics"}', stop: true }),
+  ]))({ model: "model", context });
+  assert.deepEqual(outcome.toolCalls, [
+    { type: "toolCall", id: "device", name: "lsp", arguments: { action: "diagnostics" } },
+  ]);
+  const handoff = {
+    ...context,
+    messages: [
+      ...context.messages,
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "known", name: "read", arguments: { path: "a" } },
+          { type: "toolCall", id: "device", name: "lsp", arguments: { action: "diagnostics" } },
+        ],
+      },
+      { role: "toolResult", toolCallId: "known", content: "actual a" },
+      { role: "toolResult", toolCallId: "device", isError: true, content: "Tool lsp not found" },
+    ],
+  };
+  for (const [tools, specs, uses] of [
+    [context.tools, ["read", "dummy"], ["read", "dummy"]],
+    [[], ["dummy"], ["dummy", "dummy"]],
+  ]) {
+    const body = buildHttpRequest({ model: "model", context: { ...handoff, tools } });
+    const history = body.conversationState.history[1].assistantResponseMessage.toolUses;
+    assert.deepEqual(history.map((use) => use.name), uses);
+    assert.deepEqual(history.map((use) => use.input), [{ path: "a" }, { action: "diagnostics" }]);
+    const current = body.conversationState.currentMessage.userInputMessage.userInputMessageContext;
+    assert.deepEqual(current.tools.map((tool) => tool.toolSpecification.name), specs);
+    assert.deepEqual(current.toolResults.map((result) => result.toolUseId), ["known", "device"]);
   }
 });
 
@@ -639,6 +676,30 @@ test("temporary HTTP and framed service rejections recover within one finite att
   assert.deepEqual(text, ["Recovered"]);
 });
 
+test("framed model overload error continues published text instead of ending the turn", async () => {
+  const bodies = [];
+  const text = [];
+  const run = createHttpTransport({
+    authProvider: async () => auth,
+    retry: fastRetry,
+    fetchImpl: async (_url, init) => {
+      bodies.push(JSON.parse(init.body));
+      return bodies.length === 1
+        ? response([
+          frame("assistantResponseEvent", { content: "partial " }),
+          frame("error", {
+            message: "Encountered unexpectedly high load when processing the request, please try again.",
+          }, "exception"),
+        ])
+        : response([frame("assistantResponseEvent", { content: "rest" })]);
+    },
+  });
+  await run({ model: "selected-only", context, continuePartial: true, onText: (delta) => text.push(delta) });
+  assert.equal(bodies.length, 2);
+  assert.deepEqual(text, ["partial ", "rest"]);
+  assert.equal(bodies[1].conversationState.history.at(-1).assistantResponseMessage.content, "partial ");
+});
+
 test("native provisional text can explicitly reset before same-request recovery", async () => {
   const bodies = [];
   const restarts = [];
@@ -835,12 +896,11 @@ test("recovery never silently switches accounts or regions during credential rel
   }
 });
 
-test("committed continuation never turns malformed JSON, unknown tools or CRC into a retry", async () => {
+test("committed continuation never turns malformed JSON or CRC into a retry", async () => {
   const corrupt = frame("metadataEvent", {});
   corrupt[corrupt.length - 5] ^= 1;
   for (const frames of [
     [frame("toolUseEvent", { toolUseId: "bad-json", name: "read", input: "{bad", stop: true })],
-    [frame("toolUseEvent", { toolUseId: "not-supplied", name: "missing", input: "{}", stop: true })],
     [corrupt],
   ]) {
     let calls = 0;
