@@ -7,6 +7,9 @@ import { refreshOidc } from "./oidc-login.mjs";
 import { abortableRequest, defaultFetch, fetchWithRetry } from "./network.mjs";
 
 const refreshing = new Map();
+const ACTIVE = "active";
+const PROFILES = "profiles";
+const PROFILE_ARN = /^arn:aws:codewhisperer:([^:]+):([^:]+):profile\/[^:]+$/;
 
 export class KiroAuthError extends Error {
   constructor(message) {
@@ -102,7 +105,7 @@ function validateCredential(value) {
   return value;
 }
 
-export async function readAuthSnapshot({ authFile = authFilePath(), signal } = {}) {
+async function readRow(id, { authFile, signal }) {
   signal?.throwIfAborted();
   if (!(await exists(authFile))) return null;
   const db = await openDatabase(authFile, true);
@@ -113,10 +116,14 @@ export async function readAuthSnapshot({ authFile = authFilePath(), signal } = {
         .get("credentials")
     )
       return null;
-    return db.prepare("SELECT value FROM credentials WHERE id = ?").get("active")?.value ?? null;
+    return db.prepare("SELECT value FROM credentials WHERE id = ?").get(id)?.value ?? null;
   } finally {
     db.close();
   }
+}
+
+export async function readAuthSnapshot({ authFile = authFilePath(), signal } = {}) {
+  return readRow(ACTIVE, { authFile, signal });
 }
 
 function parseCredential(raw, { allowSignedOut = false } = {}) {
@@ -137,7 +144,7 @@ export async function readKiroAuth({ authFile = authFilePath(), signal } = {}) {
 
 export async function saveKiroAuth(
   credential,
-  { authFile = authFilePath(), expectedRaw, signal } = {},
+  { authFile = authFilePath(), expectedRaw, signal, replacesLogin = false } = {},
 ) {
   signal?.throwIfAborted();
   validateCredential(credential);
@@ -149,17 +156,17 @@ export async function saveKiroAuth(
     if (expectedRaw === null) {
       result = db
         .prepare("INSERT OR IGNORE INTO credentials (id, value) VALUES (?, ?)")
-        .run("active", value);
+        .run(ACTIVE, value);
     } else if (expectedRaw !== undefined) {
       result = db
         .prepare("UPDATE credentials SET value = ? WHERE id = ? AND value = ?")
-        .run(value, "active", expectedRaw);
+        .run(value, ACTIVE, expectedRaw);
     } else {
       result = db
         .prepare(
           "INSERT INTO credentials (id, value) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET value = excluded.value",
         )
-        .run("active", value);
+        .run(ACTIVE, value);
     }
     if (Number(result.changes) !== 1) {
       const error = new KiroAuthError(
@@ -168,6 +175,8 @@ export async function saveKiroAuth(
       error.code = "credential_changed";
       throw error;
     }
+    // A new login must not inherit the previous login's profile catalog.
+    if (replacesLogin) db.prepare("DELETE FROM credentials WHERE id = ?").run(PROFILES);
     return credential;
   } finally {
     db.close();
@@ -182,7 +191,8 @@ export async function logoutKiroAuth({ authFile = authFilePath(), signal } = {})
     const value = JSON.stringify({ kind: "logged-out", revision: randomUUID() });
     db.prepare(
       "INSERT INTO credentials (id, value) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET value = excluded.value",
-    ).run("active", value);
+    ).run(ACTIVE, value);
+    db.prepare("DELETE FROM credentials WHERE id = ?").run(PROFILES);
   } finally {
     db.close();
   }
@@ -201,6 +211,52 @@ export async function getKiroAuthStatus({ authFile = authFilePath(), now = Date.
     expired: Date.parse(credential.expires_at) <= now(),
     refreshable: typeof credential.refresh_token === "string" && Boolean(credential.refresh_token),
   };
+}
+
+/** Non-secret profile catalog that profile listing saved for this store's login. */
+export async function readProfileCatalog({ authFile = authFilePath(), signal } = {}) {
+  const raw = await readRow(PROFILES, { authFile, signal });
+  if (raw === null) return null;
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (
+    value?.version !== 1 || typeof value.fetchedAt !== "string" || !Array.isArray(value.profiles) ||
+    !value.profiles.every((profile) =>
+      typeof profile?.name === "string" && typeof profile.arn === "string" && PROFILE_ARN.test(profile.arn))
+  )
+    return null;
+  return {
+    fetchedAt: value.fetchedAt,
+    profiles: value.profiles.map((profile) => profileRecord(profile.arn, profile.name)),
+  };
+}
+
+/** Save a listed catalog only while the login that listed it is still the store's active login. */
+export async function saveProfileCatalog(profiles, { authFile = authFilePath(), credential, signal } = {}) {
+  signal?.throwIfAborted();
+  const value = JSON.stringify({
+    version: 1,
+    fetchedAt: new Date().toISOString(),
+    profiles: profiles.map(({ arn, name }) => ({ arn, name })),
+  });
+  const db = await writableDatabase(authFile);
+  try {
+    const result = db.prepare(
+      "INSERT INTO credentials (id, value) SELECT ?, ? WHERE EXISTS (SELECT 1 FROM credentials WHERE id = ? AND value = ?) ON CONFLICT(id) DO UPDATE SET value = excluded.value",
+    ).run(PROFILES, value, ACTIVE, JSON.stringify(credential));
+    return Number(result.changes) === 1;
+  } finally {
+    db.close();
+  }
+}
+
+function profileRecord(arn, name) {
+  const parts = PROFILE_ARN.exec(arn);
+  return { arn, name, region: parts[1], accountId: parts[2] };
 }
 
 export async function queryKiroProfiles(credential, {
@@ -238,16 +294,12 @@ export async function queryKiroProfiles(credential, {
     if (!Array.isArray(data.profiles))
       throw new KiroAuthError("Kiro returned an invalid profile catalog.");
     for (const profile of data.profiles) {
-      const parts = typeof profile?.arn === "string"
-        ? /^arn:aws:codewhisperer:([^:]+):([^:]+):profile\/[^:]+$/.exec(profile.arn)
-        : null;
-      if (!parts) throw new KiroAuthError("Kiro returned an invalid profile ARN.");
-      profiles.set(profile.arn, {
-        arn: profile.arn,
-        name: typeof profile.profileName === "string" ? profile.profileName : profile.arn,
-        region: parts[1],
-        accountId: parts[2],
-      });
+      if (typeof profile?.arn !== "string" || !PROFILE_ARN.test(profile.arn))
+        throw new KiroAuthError("Kiro returned an invalid profile ARN.");
+      profiles.set(profile.arn, profileRecord(
+        profile.arn,
+        typeof profile.profileName === "string" ? profile.profileName : profile.arn,
+      ));
     }
     nextToken = data.nextToken;
     if (nextToken) {
@@ -375,6 +427,20 @@ export async function refreshExpiredKiroAuth(credential, {
   return refreshed;
 }
 
+/**
+ * Auth for one fixed profile of a store's login. Token refresh still persists,
+ * but the pinned ARN never replaces the store's saved profile selection.
+ */
+export function pinnedKiroAuth({ authFile, profileArn }) {
+  return async ({ expectedCredential, ...options } = {}) => {
+    const credential = await loadKiroAuth({ ...options, authFile, resolveProfile: false });
+    const pinned = { ...credential, profile_arn: profileArn };
+    if (expectedCredential && authIdentity(pinned) !== authIdentity(expectedCredential))
+      throw new KiroAuthError("Kiro login or region changed during recovery; start a new turn.");
+    return pinned;
+  };
+}
+
 export async function importCliAuth({
   databasePath = join(homedir(), ".local", "share", "kiro-cli", "data.sqlite3"),
   authFile = authFilePath(),
@@ -400,5 +466,5 @@ export async function importCliAuth({
     throw new KiroAuthError("Invalid CLI social login record; use omp-kiro login instead.");
   }
   const credential = validateCredential({ ...source, kind: "social" });
-  return saveKiroAuth(credential, { authFile, expectedRaw, signal });
+  return saveKiroAuth(credential, { authFile, expectedRaw, signal, replacesLogin: true });
 }

@@ -145,7 +145,8 @@ export function createKiroSearchTool(options = {}) {
   };
 }
 
-export function registerKiroWebSearch(pi, options = {}) {
+/** `authProviderFor(model)` selects a pinned account profile for the session's current model. */
+export function registerKiroWebSearch(pi, { authProviderFor, ...options } = {}) {
   const tool = createKiroSearchTool(options);
   pi.registerTool({
     name: tool.name,
@@ -159,8 +160,10 @@ export function registerKiroWebSearch(pi, options = {}) {
         "Search query must contain 1–200 Unicode characters and not be blank.",
       ).describe("Search query, 1–200 Unicode characters."),
     }).strict(),
-    async execute(_id, params, signal) {
-      const result = await tool.execute(params, signal);
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const authProvider = authProviderFor?.(ctx?.model);
+      const search = authProvider ? createKiroSearchTool({ ...options, authProvider }) : tool;
+      const result = await search.execute(params, signal);
       return { content: [{ type: "text", text: result.text }], details: { provider: "kiro" } };
     },
   });

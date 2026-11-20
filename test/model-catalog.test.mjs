@@ -184,17 +184,17 @@ function profileCommandHost() {
   h.commands = new Map();
   h.messages = [];
   h.selected = [];
-  let catalog = [];
+  const catalogs = new Map();
   h.ctx = {
     model: cachedModel,
     isIdle: () => true,
     modelRegistry: {
-      async refreshProvider() {
-        const config = h.providers.at(-1).config;
-        catalog = config.fetchDynamicModels ? await config.fetchDynamicModels() : config.models;
+      async refreshProvider(provider) {
+        const { config } = h.providers.findLast((entry) => entry.id === provider);
+        catalogs.set(provider, config.fetchDynamicModels ? await config.fetchDynamicModels() : config.models);
       },
       find: (provider, id) => {
-        const model = catalog.find((model) => model.id === id);
+        const model = catalogs.get(provider)?.find((model) => model.id === id);
         return model ? { ...model, provider, api: "kiro-cli-http" } : undefined;
       },
     },
@@ -555,8 +555,13 @@ test("profile switch bypasses an old snapshot and replaces native schemas withou
   assert.equal(discoveries, 1);
   assert.equal(h.selected.length, 1);
   assert.equal(h.selected[0].id, "cached");
-  assert.deepEqual(h.providers.at(-1).config.models, []);
-  assert.equal(typeof h.providers.at(-1).config.fetchDynamicModels, "function");
+  const unpinned = h.providers.findLast(({ id }) => id === "kiro-http").config;
+  assert.deepEqual(unpinned.models, []);
+  assert.equal(typeof unpinned.fetchDynamicModels, "function");
+  // Listing saved the store's two profiles, so each now also has a pinned provider.
+  assert.deepEqual(h.providers.slice(-2).map(({ id }) => id), [
+    "kiro-default-catalogfixture", "kiro-default-catalogfixturenext",
+  ]);
   // Even an old host stream closure must resolve the new profile's schema.
   const after = await originalConfig.streamSimple(h.ctx.model, turnContext, { reasoning: "high" }).result();
   assert.equal(after.type, "done");

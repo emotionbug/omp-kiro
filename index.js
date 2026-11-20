@@ -1,14 +1,15 @@
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import { closeSession, discoverModels, runTurn } from "./server/bridge.mjs";
-import { discoverHttpModels, runHttpTurn } from "./server/http.mjs";
+import { createHttpTransport, discoverHttpModels, runHttpTurn } from "./server/http.mjs";
 import { registerKiroCommands } from "./server/commands.mjs";
 import { abortableRequest, isTransientNetworkError, isTlsError } from "./server/network.mjs";
 import { registerKiroWebSearch } from "./server/web.mjs";
-import { readKiroAuth } from "./server/auth.mjs";
+import { pinnedKiroAuth, readKiroAuth } from "./server/auth.mjs";
+import { kiroTargets, listKiroAccounts, pinnedKiroTargets } from "./server/accounts.mjs";
 import { kiroCatalogAccountId, readKiroModelCatalog } from "./server/model-catalog.mjs";
 import { kiroThinkingConfig } from "./server/effort.mjs";
 
-function streamKiro(model, context, options = {}, transport, resolveModelSchema) {
+function streamKiro(model, context, options = {}, transport, route) {
   const stream = new AssistantMessageEventStream();
   const message = {
     role: "assistant",
@@ -49,15 +50,17 @@ function streamKiro(model, context, options = {}, transport, resolveModelSchema)
     stream.push({ type: "start", partial: message });
     try {
       options.signal?.throwIfAborted();
+      if (!route)
+        throw new Error("This Kiro account profile is no longer signed in. Choose another Kiro model; no replacement model was selected.");
       const modelRequestFieldsSchema = transport === "http"
-        ? await resolveModelSchema(model.id, options.signal)
+        ? await route.resolveModelSchema(model.id, options.signal)
         : undefined;
       const thinkingConfig = transport === "http" ? kiroThinkingConfig(modelRequestFieldsSchema) : undefined;
       // Custom streamSimple providers bypass OMP's mandatory-reasoning clamp.
       // Auto/off must use the native floor when this model cannot disable reasoning.
       const useMinimumEffort = thinkingConfig?.requiresEffort &&
         (options.reasoning === undefined || options.disableReasoning || options.forceReasoningOff);
-      const runTransport = transport === "http" ? runHttpTurn : runTurn;
+      const runTransport = route.runTurn;
       const outcome = await runTransport({
         model: model.id,
         context,
@@ -155,12 +158,12 @@ function streamKiro(model, context, options = {}, transport, resolveModelSchema)
   return stream;
 }
 
-function providerModels(models, transport) {
+function providerModels(models, transport, label) {
   return models.map(({ id, name, contextWindow, maxTokens, additionalModelRequestFieldsSchema }) => {
     const thinking = transport === "http" ? kiroThinkingConfig(additionalModelRequestFieldsSchema) : undefined;
     return {
       id,
-      name: `Kiro · ${name}`,
+      name: `Kiro · ${label ? `${label} · ` : ""}${name}`,
       reasoning: Boolean(thinking),
       ...(thinking ? { thinking } : {}),
       input: ["text"],
@@ -170,6 +173,49 @@ function providerModels(models, transport) {
       maxTokens: maxTokens ?? 16000,
     };
   });
+}
+
+/** One account profile with its own auth, model catalog and native schemas. */
+function pinnedProvider(target) {
+  const authProvider = pinnedKiroAuth({ authFile: target.authFile, profileArn: target.arn });
+  const schemas = new Map();
+  let ids;
+  let pending;
+  const discover = () => {
+    if (!pending) {
+      const request = discoverHttpModels({ authProvider }).then((catalog) => {
+        schemas.clear();
+        for (const model of catalog)
+          if (model.additionalModelRequestFieldsSchema !== undefined)
+            schemas.set(model.id, model.additionalModelRequestFieldsSchema);
+        ids = new Set(catalog.map((model) => model.id));
+        return providerModels(catalog, "http", target.label);
+      });
+      pending = request;
+      void request.finally(() => {
+        if (pending === request) pending = undefined;
+      }).catch(() => {});
+    }
+    return pending;
+  };
+  return {
+    target,
+    authProvider,
+    discover,
+    route: {
+      runTurn: createHttpTransport({ authProvider }),
+      async resolveModelSchema(id, signal) {
+        // Host cache hits skip fetchDynamicModels in a new process.
+        if (!ids) {
+          if (signal) await abortableRequest(discover, signal);
+          else await discover();
+        }
+        if (!ids.has(id))
+          throw new Error(`This model is unavailable for Kiro ${target.label}. List its models with /kiro-models; no replacement model was selected.`);
+        return schemas.get(id);
+      },
+    },
+  };
 }
 
 export default async function kiroExtension(pi) {
@@ -186,6 +232,17 @@ export default async function kiroExtension(pi) {
   });
   pi.on("session_before_switch", (_event, ctx) => closeSession(ctx.sessionManager.getSessionId()));
   const provider = transport === "http" ? "kiro-http" : "kiro-cli";
+  // Every Kiro provider shares one API; the model's provider selects its account route.
+  const routes = new Map();
+  const streamSimple = (model, context, options) =>
+    streamKiro(model, context, options, transport, routes.get(model.provider));
+  const providerConfig = (catalog) => ({
+    baseUrl: "https://kiro-cli.invalid/",
+    apiKey: "kiro-cli-managed-auth",
+    api: `kiro-cli-${transport}`,
+    ...catalog,
+    streamSimple,
+  });
   // OMP's public model object need not carry the native request schema.
   const modelSchemas = new Map();
   const catalogModelIds = new Set();
@@ -270,14 +327,38 @@ export default async function kiroExtension(pi) {
       throw new Error("This model is unavailable for the selected Kiro profile. Use /kiro-models and /kiro-model <id>; no replacement model was selected.");
     return modelSchemas.get(id);
   };
-  const registerProvider = (catalog) => pi.registerProvider(provider, {
-    baseUrl: "https://kiro-cli.invalid/",
-    apiKey: "kiro-cli-managed-auth",
-    api: `kiro-cli-${transport}`,
-    ...catalog,
-    streamSimple: (model, context, options) =>
-      streamKiro(model, context, options, transport, resolveModelSchema),
-  });
+  const registerProvider = (catalog) => pi.registerProvider(provider, providerConfig(catalog));
+  routes.set(provider, { resolveModelSchema, runTurn: transport === "http" ? runHttpTurn : runTurn });
+  const pinned = new Map();
+  const reconcilePinned = async () => {
+    let targets;
+    try {
+      targets = pinnedKiroTargets(kiroTargets(await listKiroAccounts()));
+    } catch {
+      // An unreadable accounts directory keeps the current registrations.
+      return;
+    }
+    const wanted = new Map(targets.map((target) => [target.provider, target]));
+    for (const [name, entry] of pinned) {
+      const next = wanted.get(name);
+      if (next && next.authFile === entry.target.authFile && next.arn === entry.target.arn &&
+          next.label === entry.target.label) {
+        wanted.delete(name);
+        continue;
+      }
+      pinned.delete(name);
+      routes.delete(name);
+      if (!next) pi.unregisterProvider(name);
+    }
+    for (const target of wanted.values()) {
+      const entry = pinnedProvider(target);
+      pinned.set(target.provider, entry);
+      routes.set(target.provider, entry.route);
+      pi.registerProvider(target.provider, providerConfig({ fetchDynamicModels: entry.discover }));
+    }
+  };
+  let syncing = Promise.resolve();
+  const syncPinnedProviders = () => (syncing = syncing.then(reconcilePinned, reconcilePinned));
   const catalogFile = process.env.OMP_KIRO_MODEL_CATALOG_FILE;
   let models;
   if (transport === "http" && catalogFile !== undefined) {
@@ -288,7 +369,11 @@ export default async function kiroExtension(pi) {
   // Startup snapshots remain authoritative until a profile change invalidates
   // their account binding; only then do we replace them with live discovery.
   registerProvider(models !== undefined ? { models } : { fetchDynamicModels: fetchModels });
-  if (transport === "http") registerKiroWebSearch(pi);
+  if (transport === "http") {
+    // Local store reads only: startup never contacts Kiro for account inventory.
+    await syncPinnedProviders();
+    registerKiroWebSearch(pi, { authProviderFor: (model) => pinned.get(model?.provider)?.authProvider });
+  }
   registerKiroCommands(pi, {
     transport,
     services: {
@@ -299,6 +384,8 @@ export default async function kiroExtension(pi) {
         catalogAccountId = kiroCatalogAccountId(await readKiroAuth());
         return notice;
       },
+      pinnedTarget: (name) => pinned.get(name),
+      onAccountsChanged: syncPinnedProviders,
     },
   });
 }

@@ -17,12 +17,21 @@ import { loginSocial } from "./server/social-login.mjs";
 import { loginDevice } from "./server/oidc-login.mjs";
 import { fetchKiroProfileUsage, listKiroProfiles, selectKiroProfile } from "./server/profiles.mjs";
 import { executeKiroQuery } from "./server/commands.mjs";
+import {
+  DEFAULT_ACCOUNT,
+  kiroAccountAuthFile,
+  kiroTargetProvider,
+  kiroTargets,
+  listKiroAccounts,
+  pinnedKiroTargets,
+} from "./server/accounts.mjs";
 
 function usage() {
   console.log(`Usage: omp-kiro <command> [options]
 
 Commands:
   login                 Authenticate without invoking Kiro CLI
+  accounts              List every local account, its profiles and model providers
   auth status           Show non-secret local login status
   auth logout           Remove this plugin's active login (not CLI login)
   auth profiles         List all HTTP profiles; --usage compares their quotas
@@ -39,9 +48,15 @@ Login options:
   --timeout <seconds>   Overall deadline (default: 600)
 
 Storage options:
-  --auth-file <path>    Dedicated plugin SQLite file (or OMP_KIRO_AUTH_FILE)
+  --account <name>      Named account next to the default store (default: default)
+  --auth-file <path>    Default plugin SQLite file (or OMP_KIRO_AUTH_FILE)
   --database <path>     Source CLI SQLite file for auth import-cli only
-  --json                Machine-readable auth status, profiles or profile
+  --json                Machine-readable accounts, auth status, profiles or profile
+
+Each account is a separate login stored in accounts/<name>.sqlite3 beside the
+default store. Once a named account exists, or one account has several
+profiles, every account profile gets its own OMP model provider
+(kiro-<account>-<profile id>/<model>) so a session can pin it.
 
 No browser is launched automatically. Open the displayed authorization link on
 any device for the default device flow. Passwords and tokens are never requested
@@ -82,6 +97,7 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
       profile: { type: "string" },
       timeout: { type: "string", default: "600" },
       "auth-file": { type: "string" },
+      account: { type: "string" },
       database: { type: "string" },
       json: { type: "boolean" },
       help: { type: "boolean", short: "h" },
@@ -93,17 +109,30 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
     return;
   }
   const command = positionals.join(" ");
-  if (!["login", "auth status", "auth logout", "auth import-cli", "auth profile", "auth profiles"].includes(command))
+  if (!["login", "accounts", "auth status", "auth logout", "auth import-cli", "auth profile", "auth profiles"].includes(command))
     throw new Error("Unknown authentication command; use --help.");
-  if (values.json && !["auth status", "auth profile", "auth profiles"].includes(command))
-    throw new Error("--json is supported only for auth status/profile/profiles; credentials are never printed.");
+  if (values.json && !["accounts", "auth status", "auth profile", "auth profiles"].includes(command))
+    throw new Error("--json is supported only for accounts and auth status/profile/profiles; credentials are never printed.");
   if (values.usage && command !== "auth profiles")
     throw new Error("--usage is supported only for auth profiles.");
   if (values.database && command !== "auth import-cli")
     throw new Error("--database is only a source for auth import-cli.");
   if (values.profile && !["login", "auth profile"].includes(command))
     throw new Error("--profile is supported only for login or auth profile.");
-  const authFile = values["auth-file"] ? resolve(values["auth-file"]) : authFilePath();
+  if (values.account !== undefined && command === "accounts")
+    throw new Error("accounts lists every account; --account selects one for the other commands.");
+  const defaultAuthFile = values["auth-file"] ? resolve(values["auth-file"]) : authFilePath();
+  const account = values.account ?? DEFAULT_ACCOUNT;
+  const authFile = kiroAccountAuthFile(account, { authFile: defaultAuthFile });
+  if (command === "accounts") {
+    if (values.json) {
+      const accounts = await listKiroAccounts({ authFile: defaultAuthFile });
+      const pinned = new Set(pinnedKiroTargets(kiroTargets(accounts)).map((target) => target.provider));
+      const targets = kiroTargets(accounts).map((target) => ({ ...target, pinned: pinned.has(target.provider) }));
+      console.log(JSON.stringify({ accounts, targets }));
+    } else console.log((await executeKiroQuery("kiro-accounts", "", { authFile: defaultAuthFile })).text);
+    return;
+  }
   if (command === "auth status") {
     const status = await getKiroAuthStatus({ authFile });
     if (values.json) console.log(JSON.stringify(status));
@@ -146,7 +175,7 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
       } else {
         const catalog = await listKiroProfiles({ authFile, signal });
         for (const profile of catalog.profiles)
-          console.log(`${profile.arn === catalog.selectedArn ? "* " : "  "}${JSON.stringify(profile.name)}\n  ${profile.arn}`);
+          console.log(`${profile.arn === catalog.selectedArn ? "* " : "  "}${JSON.stringify(profile.name)}\n  ${profile.arn}\n  pinned models: ${kiroTargetProvider(account, profile.arn) ?? "unavailable"}/…`);
         if (!catalog.selectedArn) console.log("No profile selected.");
       }
       return;
@@ -203,14 +232,37 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
       throw new Error(
         "Unsupported provider; choose google, github, builder-id, or identity-center.",
       );
-    await saveKiroAuth(credential, { authFile, expectedRaw, signal });
-    await loadKiroAuth({
-      authFile, signal, profileArn: values.profile,
-      expectedCredential: { ...credential, profile_arn: undefined },
-    });
+    await saveKiroAuth(credential, { authFile, expectedRaw, signal, replacesLogin: true });
+    let unselected = false;
+    try {
+      await loadKiroAuth({
+        authFile, signal, profileArn: values.profile,
+        expectedCredential: { ...credential, profile_arn: undefined },
+      });
+    } catch (error) {
+      // Several profiles and no --profile: pinned providers still need no selection.
+      if (values.profile || !error.profiles) throw error;
+      unselected = true;
+    }
     console.log(`Authenticated ${credential.provider}. Credentials saved to ${authFile}.`);
-    console.log(`For this store, set OMP_KIRO_AUTH_FILE to ${authFile}.`);
-    console.log("Use: omp --model kiro-http/auto");
+    let targets = [];
+    try {
+      const { profiles } = await listKiroProfiles({ authFile, signal });
+      targets = kiroTargets([{ name: account, authFile, status: { loggedIn: true }, catalog: { profiles } }]);
+    } catch {
+      console.log(`Profiles could not be listed; run omp-kiro auth profiles --account ${account} to name its model providers.`);
+    }
+    for (const target of targets)
+      console.log(`Model provider: ${target.provider}/… — ${JSON.stringify(target.name)}`);
+    if (account === DEFAULT_ACCOUNT) {
+      console.log(`For this store, set OMP_KIRO_AUTH_FILE to ${authFile}.`);
+      if (unselected)
+        console.log("Several profiles are available: select one for kiro-http with omp-kiro auth profile --profile <arn>, or use a pinned provider.");
+      else console.log("Use: omp --model kiro-http/auto");
+    } else {
+      console.log(`Named accounts are found beside ${defaultAuthFile}; OMP and Passession must use that same default store.`);
+      if (targets.length) console.log(`Use: omp --model ${targets[0].provider}/auto`);
+    }
   } finally {
     clearTimeout(timer);
     process.removeListener("SIGINT", abort);

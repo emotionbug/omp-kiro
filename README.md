@@ -131,6 +131,8 @@ A Kiro profile is a service context associated with an AWS account and region, n
 
 `/kiro-profile` accepts an exact ARN or unique exact name; ambiguous names are rejected. Since 0.5.1, without an argument in an interactive host (OMP TUI, or Passession over RPC), it opens a selection dialog with one option per profile: name, region and account, with `(current)` on the saved selection; profiles that would share a label also show their ARN. Picking a profile runs the same selection as passing its ARN; cancelling or picking the current profile changes nothing. Hosts without interactive UI (print mode, `--no-ui`) list profiles as text instead. Switch only after the current turn finishes; the picker refuses to open while a turn is running. Selection is saved in the managed auth store and affects **all sessions sharing that store**, not just this conversation. OMP history is retained. The command refreshes the current session's Kiro model catalog; other sessions must refresh theirs before continuing. If metadata refresh fails after a switch, the new selection remains saved and the command reports that separately. Offline snapshots are account-bound and must be regenerated for the newly selected profile rather than reused.
 
+To use different profiles in different sessions at the same time, pick a pinned model provider instead; see [Multiple accounts and pinned profiles](#multiple-accounts-and-pinned-profiles). Pinning never changes the saved selection.
+
 Standalone commands support the same inspection and selection:
 
 ```bash
@@ -172,6 +174,25 @@ Update a linked checkout with `git -C omp-kiro pull --ff-only`, then start a new
 omp plugin uninstall omp-kiro
 ```
 
+### Multiple accounts and pinned profiles
+
+Sign in to more than one account at once. Each account is a separate login with its own token refresh:
+
+```bash
+npx github:emotionbug/omp-kiro login --account work --provider identity-center \
+  --start-url https://your-portal.awsapps.com/start
+npx github:emotionbug/omp-kiro login --account personal --provider github
+npx github:emotionbug/omp-kiro accounts
+```
+
+The existing store is account `default`. A named account lives in `accounts/<name>.sqlite3` beside the default store (`~/.config/omp-kiro/accounts/work.sqlite3` by default), so OMP and Passession find it through the same `OMP_KIRO_AUTH_FILE` or `XDG_CONFIG_HOME` that locates the default store. Names use 1–32 lowercase letters, digits or inner hyphens; `http` and `cli` are reserved. `--account` works with `login`, `auth status`, `auth logout`, `auth profiles`, `auth profile` and `auth import-cli`; `accounts --json` lists every account and provider without credentials.
+
+Once a named account is signed in, or one account has several profiles, every account profile also gets its own OMP model provider: `kiro-<account>-<profile id>`, where the profile ID is the ARN's final segment reduced to lowercase letters and digits, for example `kiro-work-ehga3grvqmuk/claude-sonnet-4.5`. The ID does not change when Kiro renames the profile. Its models are named `Kiro · <account> · <profile> · <model>`; the profile part is left out when the account has one profile. With a single account and a single profile nothing is added, so `kiro-http/…` is the only provider, as before.
+
+Choosing such a model pins that session to the account and profile. Generation, `/kiro-status`, `/kiro-models`, `/kiro-usage` and Kiro web search then use that login's tokens with that profile ARN. Token refresh is saved to that account's store, but its saved profile selection is never changed, so sessions on different accounts and profiles run side by side. `kiro-http/…` keeps following the default account's saved selection (`/kiro-profile`).
+
+Providers are built from the local stores only; extension startup does not contact Kiro. A store names all of its profiles after `login`, `auth profiles`, `/kiro-profiles` or `/kiro-profile` has listed them; until then it offers only its saved profile. New OMP sessions pick up added accounts; in a running session, `/kiro-accounts` re-reads the stores. Signing an account out removes its providers, and a session still on one of its models fails instead of switching to another account.
+
 ## Passession
 
 ### OMP HTTP profile and built-in account usage
@@ -193,7 +214,7 @@ Setup installs the OMP extension and registers **Kiro HTTP (OMP)**: profile `kir
 
 ### Usage for existing OMP sessions
 
-No external plugin installation or external-plugin enablement is needed on Passession 0.13.18+. Built-in source `kiro` uses an existing managed HTTP login, including when an OMP session uses ACP:
+No external plugin installation or external-plugin enablement is needed on Passession 0.13.18+. Built-in source `kiro` uses an existing managed HTTP login, including when an OMP session uses ACP. Since Passession 0.13.46 it lists every signed-in account, one row per profile when an account has several, and an agent on a pinned model shows the usage of exactly that account profile:
 
 ```bash
 paseo usage ls --refresh --home "$HOME/.paseo"
@@ -204,6 +225,8 @@ paseo usage ls --agent AGENT_ID --refresh --home "$HOME/.paseo"
 Usage fetches read credentials only: they never rotate tokens, write authentication, purchase credits, or change billing. Expired credentials require an explicit login or an OMP metadata operation that refreshes authentication before refreshing usage again. The OMP `/kiro-usage` command remains available independently of Passession's built-in source.
 
 The standard **Usage** panel displays account credits, plan, reset/expiry dates, and on-demand usage. Monthly, trial, bonus, and purchased pools remain separate; duplicate purchase projections are not added twice. **Account quota is not per-turn token usage**: missing reported token/cost fields are not an estimate of account credits or a claim of free usage.
+
+Pinned providers appear in the model list of Passession's built-in **OMP** provider, so each agent can pick an account and profile from the model picker or keep it in an agent profile. A `kiro-omp-http` profile created by setup lists only the `kiro-http/…` models it was configured with; add pinned model IDs to its `models` or use the built-in OMP provider.
 
 ### Auth alignment and migration
 
@@ -233,11 +256,14 @@ Available in OMP, including OMP-backed Passession sessions:
 | `/kiro`                 | Local help and transport information                         |
 | `/kiro-status`          | HTTP login status without refreshing; ACP metadata handshake |
 | `/kiro-models [filter]` | Live transport-specific model catalog                        |
-| `/kiro-model <id>`      | Change the actual session model                              |
+| `/kiro-model <id>`      | Change the actual session model; `<provider>/<id>` with a pinned `kiro-<account>-<profile id>` provider picks that account profile |
 | `/kiro-usage`           | Managed HTTP account quota, credits, and reset dates         |
 | `/kiro-profiles`        | HTTP only: list profiles and compare their reported quotas   |
 | `/kiro-profile [name-or-arn]` | HTTP only: select a profile in the shared managed auth store (picker without an argument) |
+| `/kiro-accounts`        | HTTP only: list local accounts, their profiles and pinned providers; re-read the stores |
 | `/kiro-reset`           | ACP only: close this connection, retaining OMP history       |
+
+On a pinned model, `/kiro-status`, `/kiro-models` and `/kiro-usage` report that account profile. `/kiro-profiles` and `/kiro-profile` always act on the default account.
 
 These commands do not start model generation. ACP and HTTP can be logged into different accounts; ACP `/kiro-usage` explicitly identifies the separate managed HTTP login. Commands do not log in automatically, purchase credits, enable overage billing, change host tool trust, or delete history. OMP's existing `/model`, `/compact`, and other host commands are not replaced.
 

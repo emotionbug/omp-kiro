@@ -1,4 +1,5 @@
 import { getKiroAuthStatus, loadKiroAuth } from "./auth.mjs";
+import { kiroTargets, listKiroAccounts, pinnedKiroTargets } from "./accounts.mjs";
 import { closeSession, openKiro } from "./bridge.mjs";
 import { discoverHttpModels } from "./http.mjs";
 import { fetchKiroUsage } from "./usage.mjs";
@@ -53,12 +54,17 @@ export function getKiroCommands({ transport = "http" } = {}) {
             argumentHint: "[exact-name-or-arn]",
             kind: "action",
           },
+          {
+            name: "kiro-accounts",
+            description: "List signed-in Kiro accounts, their profiles and pinned model providers",
+            kind: "query",
+          },
         ]
       : []),
     {
       name: "kiro-model",
       description: "Select a Kiro model for this session",
-      argumentHint: "<id>",
+      argumentHint: "<id|provider/id>",
       kind: "action",
     },
     ...(transport === "acp"
@@ -130,6 +136,39 @@ function profileListText({ selectedArn, profiles }, { usage = false } = {}) {
   lines.push(
     "",
     "Switch while idle with /kiro-profile <exact-name-or-arn>. No generation is requested.",
+  );
+  return lines.join("\n");
+}
+
+function accountsText(accounts) {
+  const pinned = new Set(pinnedKiroTargets(kiroTargets(accounts)).map((target) => target.provider));
+  const lines = ["Each account is a separate login; each of its profiles can have its own model provider."];
+  for (const account of accounts) {
+    lines.push("", `${account.name} — ${singleLine(account.authFile)}`);
+    if (account.error) {
+      lines.push(`Status: unreadable. ${singleLine(account.error)}`);
+      continue;
+    }
+    const { status } = account;
+    if (!status.loggedIn) {
+      lines.push("Status: signed out");
+      continue;
+    }
+    lines.push(`Status: ${status.expired
+      ? status.refreshable ? "expired; refreshes on next use" : "expired; sign in again"
+      : "signed in"} (${singleLine(status.provider)}, ${singleLine(status.kind)})`);
+    const targets = kiroTargets([account]);
+    if (!account.catalog)
+      lines.push(`Profiles: not listed yet; run omp-kiro auth profiles --account ${account.name}.`);
+    else if (!targets.length) lines.push("Profiles: none usable over Kiro HTTP.");
+    for (const target of targets)
+      lines.push(
+        `${pinned.has(target.provider) ? `${target.provider}/…` : "kiro-http/…"} — ${singleLine(target.name ?? target.arn)}${target.arn === account.selectedArn ? " (saved selection)" : ""}`,
+      );
+  }
+  lines.push(
+    "",
+    "kiro-http/… follows the default account's saved profile (/kiro-profile). Pinned providers exist once a named account is signed in or one account has several profiles; pick their models per session. Add an account with omp-kiro login --account <name>.",
   );
   return lines.join("\n");
 }
@@ -326,6 +365,11 @@ export async function executeKiroQuery(
       signal?.throwIfAborted();
       return { title: "Kiro profiles", text: profileListText(profiles, { usage: true }) };
     }
+    if (name === "kiro-accounts") {
+      const accounts = await (services.listKiroAccounts ?? listKiroAccounts)({ authFile });
+      signal?.throwIfAborted();
+      return { title: "Kiro accounts", text: accountsText(accounts) };
+    }
     const usage = await (services.fetchKiroUsage ?? fetchKiroUsage)({
       authFile,
       signal,
@@ -401,12 +445,19 @@ export function registerKiroCommands(pi, { transport = "http", authFile, service
         try {
           signal.throwIfAborted();
           if (command.kind === "query") {
+            // A pinned session model scopes status, models and usage to its account profile.
+            const pinned = ["kiro-status", "kiro-models", "kiro-usage"].includes(command.name)
+              ? services.pinnedTarget?.(ctx.model?.provider)
+              : undefined;
             result = await executeKiroQuery(command.name, args, {
               transport,
-              authFile,
+              authFile: pinned ? pinned.target.authFile : authFile,
+              ...(pinned ? { authProvider: pinned.authProvider } : {}),
               signal,
               services,
             });
+            if (pinned)
+              result.text += `\nAccount profile: ${singleLine(pinned.target.label)} (${pinned.target.provider})`;
             if (command.name === "kiro-status" && ctx.model)
               result.text += `\nSession model: ${singleLine(ctx.model.provider)}/${singleLine(ctx.model.id)}`;
           } else if (command.name === "kiro-profile" && !String(args).trim()) {
@@ -465,13 +516,18 @@ export function registerKiroCommands(pi, { transport = "http", authFile, service
             } else if (command.name === "kiro-profile") {
               result = await selectProfile(String(args).trim());
             } else {
-              const id = String(args).trim();
-              if (!id || /\s/.test(id))
-                throw new KiroCommandError("Usage: /kiro-model <id>. List IDs with /kiro-models.", {
+              const value = String(args).trim();
+              if (!value || /\s/.test(value))
+                throw new KiroCommandError("Usage: /kiro-model <id|provider/id>. List IDs with /kiro-models.", {
                   code: "invalid_arguments",
                 });
-              const provider = transport === "http" ? "kiro-http" : "kiro-cli";
-              await services.onBeforeModelRefresh?.();
+              const unpinned = transport === "http" ? "kiro-http" : "kiro-cli";
+              // Model IDs may contain "/": only a known Kiro provider prefix qualifies one.
+              const prefix = value.slice(0, Math.max(value.indexOf("/"), 0));
+              const qualified = prefix === unpinned || Boolean(prefix && services.pinnedTarget?.(prefix));
+              const provider = qualified ? prefix : unpinned;
+              const id = qualified ? value.slice(prefix.length + 1) : value;
+              if (provider === unpinned) await services.onBeforeModelRefresh?.();
               await ctx.modelRegistry.refreshProvider(provider);
               signal.throwIfAborted();
               const model = ctx.modelRegistry.find(provider, id);
@@ -491,6 +547,9 @@ export function registerKiroCommands(pi, { transport = "http", authFile, service
               };
             }
           }
+          if (["kiro-accounts", "kiro-profiles", "kiro-profile"].includes(command.name))
+            // Listing saved this store's catalog; register newly visible account profiles.
+            await services.onAccountsChanged?.();
           signal.throwIfAborted();
         } catch (error) {
           const failure = safeFailure(error, transport, signal);

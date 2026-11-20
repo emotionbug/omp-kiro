@@ -1,6 +1,6 @@
 {
   "name": "omp-kiro",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "description": "Kiro ACP/HTTP model providers and managed account usage commands for OMP.",
   "keywords": [
     "extension",
@@ -33,7 +33,7 @@
   ],
   "type": "module",
   "scripts": {
-    "check": "node --check index.js && node --check setup.mjs && node --check auth-cli.mjs && node --check server/bridge.mjs && node --check server/auth.mjs && node --check server/profiles.mjs && node --check server/model-catalog.mjs && node --check server/effort.mjs && node --check server/http.mjs && node --check server/network.mjs && node --check server/web.mjs && node --check server/eventstream.mjs && node --check server/social-login.mjs && node --check server/oidc-login.mjs && node --check server/usage.mjs && node --check server/commands.mjs",
+    "check": "node --check index.js && node --check setup.mjs && node --check auth-cli.mjs && node --check server/bridge.mjs && node --check server/auth.mjs && node --check server/accounts.mjs && node --check server/profiles.mjs && node --check server/model-catalog.mjs && node --check server/effort.mjs && node --check server/http.mjs && node --check server/network.mjs && node --check server/web.mjs && node --check server/eventstream.mjs && node --check server/social-login.mjs && node --check server/oidc-login.mjs && node --check server/usage.mjs && node --check server/commands.mjs",
     "lint": "oxlint index.js *.mjs server test",
     "test": "node --test test/*.test.mjs",
     "auth": "node auth-cli.mjs",

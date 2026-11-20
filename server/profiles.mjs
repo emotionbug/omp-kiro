@@ -4,12 +4,15 @@ import {
   queryKiroProfiles,
   readAuthSnapshot,
   saveKiroAuth,
+  saveProfileCatalog,
 } from "./auth.mjs";
 import { fetchKiroUsage, KiroUsageError } from "./usage.mjs";
 
+/** Every listing refreshes the store's saved catalog, which names its pinned model providers. */
 async function catalog(options) {
   const credential = await loadKiroAuth({ ...options, resolveProfile: false });
   const profiles = await queryKiroProfiles(credential, options);
+  await saveProfileCatalog(profiles, { authFile: options.authFile, credential, signal: options.signal });
   return { credential, profiles };
 }
 
