@@ -229,7 +229,14 @@ test("framed text and interleaved tool fragments assemble native calls and repor
       "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
     );
     assert.equal(JSON.parse(request.body).profileArn, auth.profile_arn);
-    assert.equal(request.headers["x-amzn-kiro-profile-arn"], auth.profile_arn);
+    assert.equal(request.headers["x-amzn-kiro-profile-arn"], undefined);
+    assert.equal(request.headers["x-amzn-codewhisperer-optout"], "true");
+    assert.equal(request.headers["x-amzn-kiro-attempt"], "1;max=0");
+    assert.equal(request.headers["x-amzn-kiro-fallback"], "0;max=0");
+    assert.equal(request.headers["amz-sdk-request"], "attempt=1; max=0");
+    assert.match(request.headers["amz-sdk-invocation-id"], /^[0-9a-f-]{36}$/);
+    assert.match(request.headers["user-agent"], /aws-sdk-rust\/1\.6\.0.*md\/appVersion-3\.2\.0.*AmazonQ-For-CLI/);
+    assert.match(request.headers["x-amz-user-agent"], /api\/codewhispererstreaming\/.* m\/F /);
     assert.equal(
       JSON.parse(request.body).conversationState.currentMessage.userInputMessage.origin,
       "KIRO_CLI",
@@ -238,7 +245,9 @@ test("framed text and interleaved tool fragments assemble native calls and repor
       [
         frame("assistantResponseEvent", { content: "한글 🙂" }),
         frame("toolUseEvent", { toolUseId: "a", name: "read", input: '{"path":' }),
-        frame("toolUseEvent", { toolUseId: "b", name: "read", input: '{"path":"b"}', stop: true }),
+        frame("toolUseEvent", { toolUseId: "b", name: "read", input: '{"stale":' }),
+        frame("toolUseEvent", { toolUseId: "b", input: { path: "obsolete" } }),
+        frame("toolUseEvent", { toolUseId: "b", input: { path: "b" }, stop: true }),
         frame("toolUseEvent", { toolUseId: "a", input: '"a"}', stop: true }),
         frame("metadataEvent", {
           tokenUsage: {
@@ -256,6 +265,7 @@ test("framed text and interleaved tool fragments assemble native calls and repor
   const result = await run({
     model: "claude-sonnet-4.5",
     context,
+    retry: { maxAttempts: null },
     onText: (value) => text.push(value),
   });
   assert.deepEqual(text, ["한글 🙂"]);
@@ -309,6 +319,35 @@ test("HTTP and framed quota errors propagate without retries or secret leakage",
   await assert.rejects(streamed({ model: "model", context }), /Quota exhausted/);
 });
 
+test("runtime overflow rejections are canonical and terminal even for transient HTTP and frame statuses", async () => {
+  for (const [status, respond] of [
+    [413, () => new Response(null, { status: 413 })],
+    [429, () => Response.json({ reason: "CONTENT_LENGTH_EXCEEDS_THRESHOLD" }, { status: 429 })],
+    [503, () => new Response(`Proxy details: Input is too long. ${auth.access_token}`, { status: 503 })],
+    [429, () => Response.json({ nested: { note: "Input is too long." } }, { status: 429 })],
+    [undefined, () => response([frame("throttlingError", { reason: "CONTENT_LENGTH_EXCEEDS_THRESHOLD" })])],
+    [undefined, () => response([
+      frame("assistantResponseEvent", { content: "partial" }),
+      frame("error", { message: "Input is too long." }, "exception"),
+    ])],
+  ]) {
+    let attempts = 0;
+    const run = createHttpTransport({
+      authProvider: async () => auth,
+      retry: fastRetry,
+      fetchImpl: async () => { attempts++; return respond(); },
+    });
+    await assert.rejects(run({ model: "model", context, continuePartial: true }), (error) => {
+      assert.equal(error.contextOverflow, true);
+      assert.equal(error.status, status);
+      assert.equal(error.message, "Kiro prompt is too long.");
+      assert.ok(!JSON.stringify(error).includes(auth.access_token));
+      return true;
+    });
+    assert.equal(attempts, 1);
+  }
+});
+
 test("corrupt and truncated frames fail instead of accepting partial output", async () => {
   const valid = frame("assistantResponseEvent", { content: "text" });
   const corrupt = Buffer.from(valid);
@@ -334,6 +373,8 @@ test("incomplete or invalid tool calls are rejected", async () => {
     [{ toolUseId: "a", name: "read", input: "{}" }, /incomplete/],
     [{ toolUseId: "a", name: "read", input: "{", stop: true }, /invalid JSON/],
     [{ toolUseId: "a", name: "read", input: "[]", stop: true }, /JSON object/],
+    [{ toolUseId: "a", name: "read", input: [], stop: true }, /Invalid Kiro tool argument fragment/],
+    [{ toolUseId: "a", name: "read", input: null, stop: true }, /Invalid Kiro tool argument fragment/],
   ]) {
     await assert.rejects(
       transport(async () => response([frame("toolUseEvent", data)]))({ model: "model", context }),
@@ -418,15 +459,64 @@ test("pre-abort and unsupported regions never send authenticated requests", asyn
   assert.equal(called, false);
 });
 
-test("image input and assistant-final transcripts fail explicitly", () => {
-  assert.throws(
-    () =>
-      buildHttpRequest({
-        model: "model",
-        context: { messages: [{ role: "user", content: [{ type: "image", data: "image" }] }] },
-      }),
-    /cannot forward image/,
-  );
+const image = (mimeType, identifier) => ({ type: "image", mimeType, data: Buffer.from(identifier).toString("base64") });
+const toolResults = (message) => message.userInputMessage.userInputMessageContext.toolResults;
+const resultText = (result) => result.content[0].text;
+const toolTurn = (...ids) => ({
+  role: "assistant",
+  content: ids.map((id) => ({ type: "toolCall", id, name: "read", arguments: {} })),
+});
+const toolResult = (toolCallId, content) => ({ role: "toolResult", toolCallId, content });
+
+test("only current user and tool images carry native bytes, in user-then-tool order", async () => {
+  const historic = image("image/svg+xml", "historic bytes must never leave OMP");
+  const jpeg = image("image/JPEG", "jpeg");
+  const jpg = image("image/jpg", "jpeg alias");
+  const png = image("image/png", "png");
+  const gif = image("image/gif", "gif");
+  const webp = image("image/webp", "webp");
+  const text = (value) => ({ type: "text", text: value });
+  const messages = [
+    { role: "user", content: [historic] },
+    toolTurn("past", "mixed-past"),
+    toolResult("past", [historic]),
+    toolResult("mixed-past", [text("historical caption"), historic]),
+    toolTurn("current", "mixed-current"),
+    toolResult("current", [gif, webp]),
+    toolResult("mixed-current", [text("current caption"), png]),
+    { role: "user", content: [jpeg, text("new question"), jpg] },
+  ];
+  const run = transport(async (_url, request) => {
+    assert.ok(!request.body.includes(historic.data));
+    const { history, currentMessage } = JSON.parse(request.body).conversationState;
+    assert.equal(history[0].userInputMessage.content, "(image omitted from history)");
+    assert.ok(history.every((entry) => !entry.userInputMessage?.images));
+    assert.deepEqual(toolResults(history[2]).map(resultText), ["(image omitted from history)", "historical caption"]);
+    assert.equal(currentMessage.userInputMessage.content, "new question");
+    assert.deepEqual(toolResults(currentMessage).map(resultText), ["(see attached image)", "current caption"]);
+    assert.deepEqual(currentMessage.userInputMessage.images, [
+      { format: "jpeg", source: { bytes: jpeg.data } },
+      { format: "jpeg", source: { bytes: jpg.data } },
+      { format: "gif", source: { bytes: gif.data } },
+      { format: "webp", source: { bytes: webp.data } },
+      { format: "png", source: { bytes: png.data } },
+    ]);
+    return response([frame("assistantResponseEvent", { content: "answer" })]);
+  });
+  await run({ model: "model", context: { messages, tools: context.tools } });
+  assert.equal(messages[0].content[0], historic, "the original transcript is not rewritten");
+});
+
+test("image-only user input uses the native prompt; unsupported current MIME fails explicitly", () => {
+  const request = (mimeType) => buildHttpRequest({
+    model: "model",
+    context: { messages: [{ role: "user", content: [image(mimeType, "fixture")] }] },
+  });
+  assert.equal(request("image/png").conversationState.currentMessage.userInputMessage.content, "Please proceed with the task.");
+  assert.throws(() => request("image/bmp"), /Kiro does not support image type: image\/bmp/);
+});
+
+test("assistant-final transcripts fail explicitly", () => {
   assert.throws(
     () =>
       buildHttpRequest({
@@ -437,13 +527,85 @@ test("image input and assistant-final transcripts fail explicitly", () => {
   );
 });
 
+test("tool output is capped by UTF-8 bytes, with a code-point-safe marker included", () => {
+  const output = "🙂".repeat(200_010);
+  const { conversationState } = buildHttpRequest({
+    model: "model",
+    context: { ...context, messages: [...context.messages, toolTurn("r"), toolResult("r", output)] },
+  });
+  const value = resultText(toolResults(conversationState.currentMessage)[0]);
+  const [prefix, marker] = value.split("\n\n");
+  const kept = Buffer.byteLength(prefix);
+  assert.equal(prefix, output.slice(0, prefix.length));
+  assert.ok(kept > 799_800 && kept % 4 === 0);
+  assert.ok(Buffer.byteLength(value) <= 800_000);
+  assert.equal(marker, `[Tool result truncated: only the first ${kept} of 800040 UTF-8 bytes were sent. Re-run the tool with a narrower scope if the omitted part is needed.]`);
+});
+
+test("the scaled conversation budget shrinks oldest historical results before current results", () => {
+  const output = "z".repeat(250_000);
+  const messages = [
+    ...context.messages, toolTurn("oldest"), toolResult("oldest", output),
+    toolTurn("newer"), toolResult("newer", output),
+    toolTurn("current-first", "current-second"), toolResult("current-first", output), toolResult("current-second", output),
+  ];
+  for (const [contextWindow, shrunk] of [[undefined, 1], [150_000, 2], [100_000, 3], [50_000, 4]]) {
+    const { conversationState } = buildHttpRequest({
+      model: "model", contextWindow, context: { ...context, messages },
+    });
+    const results = [...conversationState.history, conversationState.currentMessage]
+      .flatMap((message) => message.userInputMessage?.userInputMessageContext?.toolResults ?? []);
+    assert.deepEqual(results.map(({ toolUseId }) => toolUseId), ["oldest", "newer", "current-first", "current-second"]);
+    for (const [index, result] of results.entries()) {
+      const value = resultText(result);
+      if (index < shrunk) {
+        assert.match(value, /\[Tool result truncated: only the first \d+ of 250000 UTF-8 bytes were sent\./);
+        assert.ok(Buffer.byteLength(value) >= 24_990 && Buffer.byteLength(value) <= 25_000);
+      } else assert.equal(value, output);
+    }
+  }
+});
+
+test("budget counts JSON escaping and current images, and fails locally when shrinking cannot fit", async () => {
+  const escaped = '\\"'.repeat(30_000);
+  const { conversationState } = buildHttpRequest({
+    model: "model",
+    contextWindow: 20_000,
+    context: { ...context, messages: [...context.messages, toolTurn("r"), toolResult("r", escaped)] },
+  });
+  assert.match(resultText(toolResults(conversationState.currentMessage)[0]), /of 60000 UTF-8 bytes were sent/);
+
+  let authCalls = 0;
+  let requests = 0;
+  const run = createHttpTransport({
+    authProvider: async () => { authCalls++; return auth; },
+    fetchImpl: async () => { requests++; },
+  });
+  for (const messages of [
+    [{ role: "user", content: [image("image/png", "B".repeat(4000))] }],
+    [...context.messages, toolTurn("r"), toolResult("r", "x".repeat(100_000))],
+  ]) {
+    await assert.rejects(run({ model: "model", contextWindow: 1000, context: { ...context, messages } }), {
+      contextOverflow: true, message: /^Kiro prompt is too long: request exceeds the local limit of 4250 UTF-8 bytes/,
+    });
+  }
+  assert.equal(authCalls, 0);
+  assert.equal(requests, 0);
+});
+
 test("catalog uses direct metadata, preserves reported limits and follows pagination", async () => {
   let calls = 0;
   const models = await discoverHttpModels({
     authProvider: async () => auth,
     fetchImpl: async (url, request) => {
       assert.equal(url.origin, "https://management.us-east-1.kiro.dev");
-      assert.equal(url.searchParams.get("origin"), "KIRO_CLI");
+      const input = JSON.parse(request.body);
+      assert.equal(input.origin, "KIRO_CLI");
+      assert.equal(input.profileArn, auth.profile_arn);
+      assert.equal(url.search, "");
+      assert.equal(request.headers["x-amzn-codewhisperer-optout"], "true");
+      assert.equal(request.headers["amz-sdk-request"], "attempt=1; max=1");
+      assert.match(request.headers["x-amz-user-agent"], /api\/kirocontrolplanebearer\/.* m\/F,C /);
       assert.equal(
         request.headers["x-amz-target"],
         "KiroControlPlaneBearerService.ListAvailableModels",
@@ -452,11 +614,12 @@ test("catalog uses direct metadata, preserves reported limits and follows pagina
         return Response.json({
           models: [{
             modelId: "one", modelName: "One", tokenLimits: { maxInputTokens: 200000 },
+            supportedInputTypes: ["TEXT", "IMAGE", { future: true }, null],
             additionalModelRequestFieldsSchema: effortSchema,
           }],
           nextToken: "next",
         });
-      assert.equal(url.searchParams.get("nextToken"), "next");
+      assert.equal(input.nextToken, "next");
       return Response.json({
         models: [{
           modelId: "two", modelName: "Two", tokenLimits: { maxOutputTokens: 8000 },
@@ -466,9 +629,32 @@ test("catalog uses direct metadata, preserves reported limits and follows pagina
     },
   });
   assert.deepEqual(models, [
-    { id: "one", name: "One", contextWindow: 200000, additionalModelRequestFieldsSchema: effortSchema },
+    { id: "one", name: "One", contextWindow: 200000, supportedInputTypes: ["TEXT", "IMAGE", { future: true }, null],
+      additionalModelRequestFieldsSchema: effortSchema },
     { id: "two", name: "Two", maxTokens: 8000 },
   ]);
+});
+
+test("API key runtime and model discovery use the pinned region and omit OAuth profile fields", async () => {
+  const key = { kind: "api-key", access_token: "ksk_fixture", region: "eu-central-1", profile_arn: auth.profile_arn };
+  let requests = 0;
+  const fetchImpl = async (url, request) => {
+    requests++;
+    assert.equal(request.headers.tokentype, "API_KEY");
+    assert.equal(request.headers.authorization, `Bearer ${key.access_token}`);
+    assert.equal(request.headers["x-amzn-kiro-profile-arn"], undefined);
+    assert.equal(JSON.parse(request.body).profileArn, undefined);
+    if (new URL(url).hostname.startsWith("management.")) {
+      assert.equal(String(url), "https://management.eu-central-1.kiro.dev/");
+      return Response.json({ models: [{ modelId: "model", supportedInputTypes: "IMAGE" }] });
+    }
+    assert.equal(url, "https://runtime.eu-central-1.kiro.dev/");
+    return response([frame("assistantResponseEvent", { content: "ok" })]);
+  };
+  const options = { authProvider: async () => key, fetchImpl };
+  await createHttpTransport(options)({ model: "model", context });
+  assert.deepEqual(await discoverHttpModels(options), [{ id: "model", name: "model" }]);
+  assert.equal(requests, 2);
 });
 
 test("discovery rejects malformed effort metadata rather than dropping it", async () => {
@@ -655,11 +841,16 @@ test("explicit finite generation policy can disable retries independently of cat
 
 test("temporary HTTP and framed service rejections recover within one finite attempt budget", async () => {
   const bodies = [];
+  const invocationIds = new Set();
   const run = createHttpTransport({
     authProvider: async () => auth,
     retry: fastRetry,
     fetchImpl: async (_url, init) => {
       bodies.push(init.body);
+      const attempt = bodies.length;
+      assert.equal(init.headers["x-amzn-kiro-attempt"], `${attempt};max=3`);
+      assert.equal(init.headers["amz-sdk-request"], `attempt=${attempt}; max=3`);
+      invocationIds.add(init.headers["amz-sdk-invocation-id"]);
       if (bodies.length === 1)
         return Response.json({ __type: "ServiceUnavailableException" }, {
           status: 503, headers: { "retry-after": "0" },
@@ -673,6 +864,7 @@ test("temporary HTTP and framed service rejections recover within one finite att
   await run({ model: "selected-only", context, onText: (s) => text.push(s) });
   assert.equal(bodies.length, 3);
   assert.equal(new Set(bodies).size, 1);
+  assert.equal(invocationIds.size, 3);
   assert.deepEqual(text, ["Recovered"]);
 });
 
@@ -772,6 +964,8 @@ test("OMP continuation survives repeated partial failures and preserves complete
     retry: { maxAttempts: null, baseDelayMs: 0, maxDelayMs: 0 },
     fetchImpl: async (_url, init) => {
       bodies.push(JSON.parse(init.body));
+      assert.equal(init.headers["x-amzn-kiro-attempt"], `${bodies.length};max=0`);
+      assert.equal(init.headers["amz-sdk-request"], `attempt=${bodies.length}; max=0`);
       if (bodies.length <= 5) {
         return interruptedResponse([
           frame("assistantResponseEvent", { content: `part${bodies.length} ` }),
@@ -1302,6 +1496,25 @@ test("partial token metadata merges and credit metering never becomes dollars or
   });
 });
 
+test("context percentage maps to the supplied window and only valid context events change it", async () => {
+  const run = transport(async () => response([
+    frame("contextUsageEvent", { contextUsagePercentage: 12.345 }),
+    frame("metadataEvent", { tokenUsage: { uncachedInputTokens: 7, totalTokens: 12, contextUsagePercentage: 90 } }),
+    ...[-1, 101, "19", null].map((contextUsagePercentage) => frame("contextUsageEvent", { contextUsagePercentage })),
+    frame("assistantResponseEvent", { content: "Done" }),
+  ]));
+  const { usage } = await run({ model: "model", context, contextWindow: 10_001 });
+  assert.equal(usage.contextTokens, 1235);
+  assert.equal(usage.input, 7);
+  assert.equal(usage.totalTokens, 12);
+  const zero = await transport(async () => response([
+    frame("contextUsageEvent", { contextUsagePercentage: 0 }),
+    frame("assistantResponseEvent", { content: "Done" }),
+  ]))({ model: "model", context, contextWindow: 10_001 });
+  assert.equal(zero.usage.contextTokens, 0);
+  assert.equal(zero.usage.totalTokens, 0);
+});
+
 test("native event error variants honor transient versus quota classification", async () => {
   for (const [event, reason, retryable] of [
     ["error", undefined, true], ["serviceUnavailableError", undefined, true],
@@ -1367,4 +1580,166 @@ test("native throttle delays use milliseconds and preserve the longer HTTP Retry
     await assert.rejects(run({ model: "model", context, retry: { maxAttempts: 1 } }),
       (error) => error.retryAfterMs === expected);
   }
+});
+
+const billingFrame = frame("meteringEvent", { usage: 0.5, unit: "credits" });
+const endTurn = frame("metadataEvent", { stopReason: "END_TURN" });
+const toolHandoff = frame("metadataEvent", { stopReason: "TOOL_USE" });
+
+test("metering forbids identical retries even with no visible output or an explicit reset", async () => {
+  for (const [frames, continuePartial] of [
+    [[billingFrame], true],
+    [[billingFrame, frame("assistantResponseEvent", { content: " \n" })], true],
+    [[billingFrame, frame("assistantResponseEvent", { content: "provisional" })], false],
+    [[frame("meteringEvent", { usage: 1, unit: "future-unit" })], false],
+  ]) {
+    let attempts = 0;
+    let resets = 0;
+    let retries = 0;
+    const run = createHttpTransport({
+      authProvider: async () => auth,
+      retry: fastRetry,
+      fetchImpl: async () => { attempts++; return interruptedResponse(frames); },
+    });
+    await assert.rejects(run({
+      model: "model", context,
+      ...(continuePartial ? { continuePartial } : { onRestart() { resets++; } }),
+      onRetry() { retries++; },
+    }), (error) => {
+      assert.equal(error.cause?.code, "UND_ERR_SOCKET");
+      assert.equal(error.metered, true);
+      if (frames[0] === billingFrame) assert.deepEqual(error.usage.credits, { cost: 0.5 });
+      return true;
+    });
+    assert.equal(attempts, 1);
+    assert.equal(resets, 0);
+    assert.equal(retries, 0);
+  }
+});
+
+test("metered transport cuts salvage verified terminal text and fully stopped tool handoffs only", async () => {
+  const tail = frame("metadataEvent", {}).subarray(0, -1);
+  for (const [respond, expectedStop, expectedTools] of [
+    [() => response([
+      reasoningFrame({ text: "finished", signature: "keep" }),
+      frame("assistantResponseEvent", { content: "Complete" }), endTurn, billingFrame, tail,
+    ]), "stop", []],
+    [() => interruptedResponse([toolFrame("one"), toolFrame("two"), toolHandoff, billingFrame]), "toolUse", ["one", "two"]],
+  ]) {
+    let attempts = 0;
+    const stream = streamRecorder();
+    const run = createHttpTransport({
+      authProvider: async () => auth,
+      retry: fastRetry,
+      fetchImpl: async () => { attempts++; return respond(); },
+    });
+    const outcome = await run({
+      model: "model", context, continuePartial: true, onReasoning: stream.onReasoning, onText: stream.onText,
+    });
+    assert.equal(outcome.stopReason, expectedStop);
+    assert.deepEqual((outcome.toolCalls ?? []).map(({ id }) => id), expectedTools);
+    assert.deepEqual(outcome.usage.credits, { cost: 0.5 });
+    if (expectedStop === "stop") assert.deepEqual(stream.content, [
+      { type: "thinking", thinking: "finished", thinkingSignature: "keep" }, { type: "text", text: "Complete" },
+    ]);
+    assert.equal(attempts, 1);
+  }
+});
+
+test("a metered cut never releases an unconfirmed or partial tool handoff, and CRC errors stay terminal", async () => {
+  const corrupt = frame("metadataEvent", {});
+  corrupt[corrupt.length - 5] ^= 1;
+  for (const [respond, expected] of [
+    [() => interruptedResponse([toolFrame("one"), billingFrame]), /terminated/],
+    [() => interruptedResponse([
+      toolFrame("one"), frame("toolUseEvent", { toolUseId: "unfinished", name: "read", input: '{"path":' }),
+      toolHandoff, billingFrame,
+    ]), /terminated/],
+    [() => response([toolFrame("one"), toolHandoff, billingFrame, corrupt]), /checksum/],
+    [() => response([billingFrame]), /no usable metered response/],
+    [() => interruptedResponse([
+      endTurn, frame("assistantResponseEvent", { content: "terminal marker preceded output" }), billingFrame,
+    ]), /terminated/],
+  ]) {
+    let attempts = 0;
+    const run = createHttpTransport({
+      authProvider: async () => auth,
+      retry: fastRetry,
+      fetchImpl: async () => { attempts++; return respond(); },
+    });
+    await assert.rejects(run({ model: "model", context }), expected);
+    assert.equal(attempts, 1);
+  }
+});
+
+test("metered partial text can continue with a distinct request and never reattaches prior images or failed tools", async () => {
+  const userImage = image("image/png", "user image");
+  const toolImage = image("image/gif", "tool image");
+  const messages = [
+    ...context.messages, toolTurn("r"), toolResult("r", [toolImage]),
+    { role: "user", content: [userImage] },
+  ];
+  const bodies = [];
+  const text = [];
+  const run = createHttpTransport({
+    authProvider: async () => auth,
+    retry: fastRetry,
+    fetchImpl: async (_url, init) => {
+      bodies.push(init.body);
+      if (bodies.length === 1) return interruptedResponse([
+        frame("assistantResponseEvent", { content: "Partial " }), toolFrame("discard"), billingFrame,
+      ]);
+      return response([frame("assistantResponseEvent", { content: "rest" }), endTurn]);
+    },
+  });
+  const result = await run({
+    model: "model", context: { ...context, messages }, continuePartial: true, onText: (delta) => text.push(delta),
+  });
+  assert.equal(bodies.length, 2);
+  assert.deepEqual(text, ["Partial ", "rest"]);
+  assert.equal(result.stopReason, "stop");
+  assert.equal(result.toolCalls, undefined);
+  const first = JSON.parse(bodies[0]).conversationState.currentMessage;
+  assert.equal(first.userInputMessage.images.length, 2);
+  assert.equal(resultText(toolResults(first)[0]), "(see attached image)");
+  const second = JSON.parse(bodies[1]).conversationState;
+  assert.equal(second.currentMessage.userInputMessage.images, undefined);
+  assert.equal(second.history.at(-1).assistantResponseMessage.content, "Partial ");
+  const moved = second.history.at(-2);
+  assert.equal(moved.userInputMessage.content, "(image omitted from history)");
+  assert.deepEqual(toolResults(moved).map(resultText), ["(image omitted from history)"]);
+  assert.ok(![userImage.data, toolImage.data, "discard"].some((value) => bodies[1].includes(value)));
+});
+
+test("a terminal later continuation failure retains the billed guard for OMP's outer retry loop", async () => {
+  let attempts = 0;
+  const run = createHttpTransport({
+    authProvider: async () => auth,
+    retry: { ...fastRetry, maxAttempts: 2 },
+    fetchImpl: async () => {
+      if (++attempts === 1) return interruptedResponse([
+        frame("assistantResponseEvent", { content: "Committed" }), billingFrame,
+      ]);
+      throw disconnected();
+    },
+  });
+  await assert.rejects(run({ model: "model", context, continuePartial: true }), (error) =>
+    error.metered === true && error.cause?.code === "UND_ERR_SOCKET");
+  assert.equal(attempts, 2);
+});
+
+test("a distinct continuation also fails before send if committed text overflows the conversation budget", async () => {
+  let attempts = 0;
+  const run = createHttpTransport({
+    authProvider: async () => auth,
+    retry: fastRetry,
+    fetchImpl: async () => {
+      attempts++;
+      return interruptedResponse([frame("assistantResponseEvent", { content: "a".repeat(4200) }), billingFrame]);
+    },
+  });
+  await assert.rejects(run({ model: "model", context, contextWindow: 1000, continuePartial: true }), {
+    contextOverflow: true, metered: true, message: /^Kiro prompt is too long/,
+  });
+  assert.equal(attempts, 1);
 });

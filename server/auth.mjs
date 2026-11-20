@@ -2,19 +2,33 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdir, open, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { refreshSocial } from "./social-login.mjs";
-import { refreshOidc } from "./oidc-login.mjs";
+import { isKiroOidcRegion, refreshOidc } from "./oidc-login.mjs";
 import { abortableRequest, defaultFetch, fetchWithRetry } from "./network.mjs";
+import {
+  KIRO_BOOTSTRAP_REGIONS, isKiroRegion, kiroCliServiceHeaders, kiroEndpoint, kiroProfileRegions,
+  parseKiroProfileArn,
+} from "./wire.mjs";
 
 const refreshing = new Map();
 const ACTIVE = "active";
 const PROFILES = "profiles";
-const PROFILE_ARN = /^arn:aws:codewhisperer:([^:]+):([^:]+):profile\/[^:]+$/;
+const REFRESH_LEASE = "refresh_lease";
+const LEASE_MS = 30_000;
+const LEASE_POLL_MS = 50;
+const LEASE_RENEW_MS = 5_000;
+const REFRESH_SKEW_MS = 60_000;
+const MANAGEMENT_TIMEOUT_MS = 10_000;
+const TERMINAL_REFRESH_ERRORS = new Set([
+  "invalid_credential", "invalid_region", "login_expired", "registration_expired", "missing_refresh_state",
+]);
 
 export class KiroAuthError extends Error {
-  constructor(message) {
+  constructor(message, code) {
     super(message);
     this.name = "KiroAuthError";
+    if (code) this.code = code;
   }
 }
 
@@ -79,9 +93,114 @@ async function writableDatabase(path) {
   }
 }
 
+function isApiKey(key) {
+  return typeof key === "string" && /^ksk_[!-~]+$/.test(key);
+}
+
+function apiKeyCredential(key, region) {
+  const token = typeof key === "string" ? key.trim() : key;
+  if (!isApiKey(token))
+    throw new KiroAuthError("Kiro API keys must use the ksk_… format.");
+  if (region !== undefined && !isKiroRegion(region))
+    throw new KiroAuthError("Use a valid AWS region for the Kiro API key (KIRO_API_REGION).");
+  return {
+    kind: "api-key", provider: "api-key", access_token: token,
+    ...(region === undefined ? {} : { region }),
+  };
+}
+
+function envCredential(useEnv, env) {
+  if (useEnv && env.KIRO_API_KEY !== undefined && env.KIRO_API_KEY !== "")
+    return apiKeyCredential(env.KIRO_API_KEY, env.KIRO_API_REGION);
+  return null;
+}
+
+/** Resolve an API-key region without persisting the key or disclosing probe errors. */
+export async function resolveKiroApiKeyCredential(key, {
+  region, env = process.env, fetchImpl = defaultFetch, signal,
+} = {}) {
+  signal?.throwIfAborted();
+  const credential = apiKeyCredential(key, region === undefined ? env.KIRO_API_REGION : region);
+  if (credential.region) return credential;
+  const timeout = AbortSignal.timeout(MANAGEMENT_TIMEOUT_MS);
+  const probeSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  const hits = await Promise.all(KIRO_BOOTSTRAP_REGIONS.map(async (candidate) => {
+    try {
+      const found = await fetchWithRetry(fetchImpl, kiroEndpoint({ ...credential, region: candidate }, "management"), {
+        method: "POST",
+        redirect: "error",
+        signal: probeSignal,
+        headers: kiroCliServiceHeaders("ListAvailableModels", credential.access_token),
+        body: JSON.stringify({ origin: "KIRO_CLI" }),
+      }, {
+        retry: { maxAttempts: 1 },
+        idleTimeoutMs: MANAGEMENT_TIMEOUT_MS,
+        retryNetwork: false,
+        retryStatus: () => false,
+        async consume(response) {
+          if (!response.ok) {
+            void response.body?.cancel().catch(() => {});
+            return false;
+          }
+          const data = await response.json();
+          return data !== null && typeof data === "object" && !Array.isArray(data);
+        },
+      });
+      return found ? candidate : undefined;
+    } catch {
+      return undefined;
+    }
+  }));
+  signal?.throwIfAborted();
+  const matches = hits.filter(Boolean);
+  if (matches.length !== 1)
+    throw new KiroAuthError("Kiro API key did not resolve to one region; set KIRO_API_REGION to the key's AWS region.");
+  return { ...credential, region: matches[0] };
+}
+
+function profileArnFor(credential, arn, routable = true) {
+  const profile = parseKiroProfileArn(arn);
+  const regions = kiroProfileRegions(credential);
+  const supported = profile && (routable ? regions.includes(profile.region) :
+    isKiroOidcRegion(profile.region) && regions[0].startsWith("us-gov-") === profile.region.startsWith("us-gov-"));
+  if (!supported) throw new KiroAuthError("Kiro HTTP does not support this account profile ARN or region.");
+  return profile;
+}
+
+function validateRoute(credential) {
+  if (credential.kind === "oidc" && (
+    !isKiroOidcRegion(credential.region) ||
+    (credential.provider === "builder-id" && credential.region !== "us-east-1")
+  )) throw new KiroAuthError("Unsupported AWS SSO OIDC issuer region; sign in again.");
+  if (credential.profile_arn !== undefined) profileArnFor(credential, credential.profile_arn);
+  return credential;
+}
+
+function disabledCredential() {
+  return new KiroAuthError(
+    "Kiro login can no longer be refreshed; sign in again with omp-kiro login.",
+    "credential_disabled",
+  );
+}
+
+function changedCredential() {
+  return new KiroAuthError(
+    "Kiro login changed during authentication or refresh; the newer login/logout was preserved.",
+    "credential_changed",
+  );
+}
+
 function validateCredential(value) {
   if (!value || typeof value !== "object" || value.kind === "logged-out") {
     throw new KiroAuthError("Not logged in. Run omp-kiro login for the HTTP transport.");
+  }
+  if (value.disabled !== undefined && (typeof value.disabled !== "string" || !value.disabled))
+    throw new KiroAuthError("Invalid managed credential record; run omp-kiro login again.");
+  if (value.kind === "api-key" && value.provider === "api-key") {
+    if (!isApiKey(value.access_token) || !isKiroRegion(value.region) || value.disabled !== undefined ||
+        value.profile_arn !== undefined || value.expires_at !== undefined || value.refresh_token !== undefined)
+      throw new KiroAuthError("Invalid stored Kiro API key; configure the key and its region again.");
+    return value;
   }
   const social = value.kind === "social" && ["google", "github"].includes(value.provider);
   const oidc = value.kind === "oidc" && ["builder-id", "identity-center"].includes(value.provider);
@@ -94,14 +213,8 @@ function validateCredential(value) {
   ) {
     throw new KiroAuthError("Incomplete managed Kiro credentials; run omp-kiro login again.");
   }
-  if (
-    oidc &&
-    [value.client_id, value.client_secret, value.region].some(
-      (field) => typeof field !== "string" || !field,
-    )
-  ) {
-    throw new KiroAuthError("Missing OIDC registration; run omp-kiro login again.");
-  }
+  // Registration and refresh state may be missing in an older row. Inspect
+  // those fields during the leased refresh so it can disable the exact row.
   return value;
 }
 
@@ -126,7 +239,7 @@ export async function readAuthSnapshot({ authFile = authFilePath(), signal } = {
   return readRow(ACTIVE, { authFile, signal });
 }
 
-function parseCredential(raw, { allowSignedOut = false } = {}) {
+function parseCredential(raw, { allowSignedOut = false, allowDisabled = false } = {}) {
   let credential;
   try {
     credential = raw === null ? null : JSON.parse(raw);
@@ -134,12 +247,17 @@ function parseCredential(raw, { allowSignedOut = false } = {}) {
     throw new KiroAuthError("Invalid managed credential record; run omp-kiro login again.");
   }
   if (allowSignedOut && (credential === null || credential.kind === "logged-out")) return null;
-  return validateCredential(credential);
+  credential = validateCredential(credential);
+  if (credential.disabled && !allowDisabled) throw disabledCredential();
+  return credential;
 }
 
 // Usage-source fetches must never rotate or persist a credential.
-export async function readKiroAuth({ authFile = authFilePath(), signal } = {}) {
-  return parseCredential(await readAuthSnapshot({ authFile, signal }));
+export async function readKiroAuth({
+  authFile = authFilePath(), useEnv = authFile === authFilePath(), env = process.env, signal,
+} = {}) {
+  signal?.throwIfAborted();
+  return envCredential(useEnv, env) ?? validateRoute(parseCredential(await readAuthSnapshot({ authFile, signal })));
 }
 
 export async function saveKiroAuth(
@@ -147,7 +265,7 @@ export async function saveKiroAuth(
   { authFile = authFilePath(), expectedRaw, signal, replacesLogin = false } = {},
 ) {
   signal?.throwIfAborted();
-  validateCredential(credential);
+  validateRoute(validateCredential(credential));
   const value = JSON.stringify(credential);
   const db = await writableDatabase(authFile);
   try {
@@ -168,13 +286,7 @@ export async function saveKiroAuth(
         )
         .run(ACTIVE, value);
     }
-    if (Number(result.changes) !== 1) {
-      const error = new KiroAuthError(
-        "Kiro login changed during authentication or refresh; the newer login/logout was preserved.",
-      );
-      error.code = "credential_changed";
-      throw error;
-    }
+    if (Number(result.changes) !== 1) throw changedCredential();
     // A new login must not inherit the previous login's profile catalog.
     if (replacesLogin) db.prepare("DELETE FROM credentials WHERE id = ?").run(PROFILES);
     return credential;
@@ -198,18 +310,24 @@ export async function logoutKiroAuth({ authFile = authFilePath(), signal } = {})
   }
 }
 
-export async function getKiroAuthStatus({ authFile = authFilePath(), now = Date.now } = {}) {
-  const raw = await readAuthSnapshot({ authFile });
-  const credential = parseCredential(raw, { allowSignedOut: true });
+export async function getKiroAuthStatus({
+  authFile = authFilePath(), useEnv = authFile === authFilePath(), env = process.env, now = Date.now, signal,
+} = {}) {
+  signal?.throwIfAborted();
+  const credential = envCredential(useEnv, env) ?? parseCredential(await readAuthSnapshot({ authFile, signal }), {
+    allowSignedOut: true, allowDisabled: true,
+  });
   if (!credential) return { loggedIn: false, authFile };
   return {
     loggedIn: true,
     authFile,
     kind: credential.kind,
     provider: credential.provider,
-    expiresAt: credential.expires_at,
-    expired: Date.parse(credential.expires_at) <= now(),
-    refreshable: typeof credential.refresh_token === "string" && Boolean(credential.refresh_token),
+    ...(credential.kind === "api-key" ? {} : { expiresAt: credential.expires_at }),
+    expired: credential.kind !== "api-key" && Date.parse(credential.expires_at) <= now(),
+    refreshable: !credential.disabled && credential.kind !== "api-key" &&
+      typeof credential.refresh_token === "string" && Boolean(credential.refresh_token),
+    ...(credential.disabled ? { disabled: credential.disabled } : {}),
   };
 }
 
@@ -226,7 +344,7 @@ export async function readProfileCatalog({ authFile = authFilePath(), signal } =
   if (
     value?.version !== 1 || typeof value.fetchedAt !== "string" || !Array.isArray(value.profiles) ||
     !value.profiles.every((profile) =>
-      typeof profile?.name === "string" && typeof profile.arn === "string" && PROFILE_ARN.test(profile.arn))
+      typeof profile?.name === "string" && parseKiroProfileArn(profile.arn))
   )
     return null;
   return {
@@ -254,65 +372,72 @@ export async function saveProfileCatalog(profiles, { authFile = authFilePath(), 
   }
 }
 
-function profileRecord(arn, name) {
-  const parts = PROFILE_ARN.exec(arn);
-  return { arn, name, region: parts[1], accountId: parts[2] };
+function profileRecord(arn, name, { region, accountId } = parseKiroProfileArn(arn)) {
+  return { arn, name, region, accountId };
 }
 
 export async function queryKiroProfiles(credential, {
   signal, fetchImpl = defaultFetch, retry,
 } = {}) {
   signal?.throwIfAborted();
-  // The SSO issuer region is not the Kiro service/profile region.
-  const region = credential.profile_arn?.split(":")[3] || "us-east-1";
-  if (!["us-east-1", "eu-central-1"].includes(region))
-    throw new KiroAuthError("Kiro HTTP does not support this profile region.");
-  const profiles = new Map();
-  const seenTokens = new Set();
-  let nextToken;
-  do {
-    const data = await fetchWithRetry(fetchImpl, `https://management.${region}.kiro.dev/`, {
-      method: "POST",
-      redirect: "error",
-      signal,
-      headers: {
-        authorization: `Bearer ${credential.access_token}`,
-        "content-type": "application/x-amz-json-1.0",
-        "x-amz-target": "KiroControlPlaneBearerService.ListAvailableProfiles",
-      },
-      body: JSON.stringify({ origin: "KIRO_CLI", ...(nextToken ? { nextToken } : {}) }),
-    }, {
-      retry,
-      async consume(response) {
-        if (!response.ok) {
-          await response.body?.cancel();
-          throw new KiroAuthError(`Kiro profile lookup failed (HTTP ${response.status}).`);
-        }
-        return response.json();
-      },
-    });
-    if (!Array.isArray(data.profiles))
-      throw new KiroAuthError("Kiro returned an invalid profile catalog.");
-    for (const profile of data.profiles) {
-      if (typeof profile?.arn !== "string" || !PROFILE_ARN.test(profile.arn))
-        throw new KiroAuthError("Kiro returned an invalid profile ARN.");
-      profiles.set(profile.arn, profileRecord(
-        profile.arn,
-        typeof profile.profileName === "string" ? profile.profileName : profile.arn,
-      ));
-    }
-    nextToken = data.nextToken;
-    if (nextToken) {
-      if (typeof nextToken !== "string" || seenTokens.has(nextToken))
-        throw new KiroAuthError("Kiro returned an invalid profile pagination token.");
-      seenTokens.add(nextToken);
-    }
-  } while (nextToken);
+  if (credential.disabled) throw disabledCredential();
+  if (credential.kind === "api-key")
+    throw new KiroAuthError("Kiro API keys do not use profiles.");
+  validateRoute(credential);
+  const catalogs = await Promise.allSettled(kiroProfileRegions(credential).map(async (region) => {
+    const profiles = [];
+    const seenTokens = new Set();
+    let nextToken;
+    do {
+      const timeout = AbortSignal.timeout(MANAGEMENT_TIMEOUT_MS);
+      const data = await fetchWithRetry(fetchImpl, `https://management.${region}.kiro.dev/`, {
+        method: "POST",
+        redirect: "error",
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+        headers: kiroCliServiceHeaders("ListAvailableProfiles", credential.access_token),
+        body: JSON.stringify(nextToken ? { nextToken } : {}),
+      }, {
+        retry,
+        async consume(response) {
+          if (!response.ok) {
+            await response.body?.cancel();
+            throw new KiroAuthError(`Kiro profile lookup failed (HTTP ${response.status}).`);
+          }
+          return response.json();
+        },
+      });
+      if (!Array.isArray(data?.profiles))
+        throw new KiroAuthError("Kiro returned an invalid profile catalog.");
+      for (const profile of data.profiles) {
+        const parsed = profileArnFor(credential, profile?.arn, false);
+        profiles.push(profileRecord(profile.arn,
+          typeof profile.profileName === "string" ? profile.profileName : profile.arn, parsed));
+      }
+      nextToken = data.nextToken;
+      if (nextToken) {
+        if (typeof nextToken !== "string" || seenTokens.has(nextToken))
+          throw new KiroAuthError("Kiro returned an invalid profile pagination token.");
+        seenTokens.add(nextToken);
+      }
+    } while (nextToken);
+    return profiles;
+  }));
   signal?.throwIfAborted();
+  const profiles = new Map();
+  for (const catalog of catalogs) {
+    if (catalog.status !== "fulfilled") continue;
+    for (const profile of catalog.value) {
+      if (!profiles.has(profile.arn)) profiles.set(profile.arn, profile);
+    }
+  }
+  // An empty catalog is reliable only when every allowed region answered.
+  const failure = catalogs.find(({ status }) => status === "rejected");
+  if (!profiles.size && failure) throw failure.reason;
   return [...profiles.values()];
 }
 
 async function resolveProfile(credential, { signal, fetchImpl, retry, profileArn }) {
+  if (profileArn !== undefined) profileArnFor(credential, profileArn);
   if (credential.profile_arn && (!profileArn || profileArn === credential.profile_arn))
     return credential;
   const profiles = await queryKiroProfiles(credential, { signal, fetchImpl, retry });
@@ -327,15 +452,171 @@ async function resolveProfile(credential, { signal, fetchImpl, retry, profileArn
     Object.defineProperty(error, "profiles", { value: profiles });
     throw error;
   }
-  if (!["us-east-1", "eu-central-1"].includes(selected.arn.split(":")[3]))
-    throw new KiroAuthError("Kiro HTTP does not support this profile region.");
   return { ...credential, profile_arn: selected.arn };
+}
+
+function assertExpectedCredential(credential, expected, profileArn) {
+  if (!expected) return;
+  if (credential.kind === "api-key" && expected.kind === "api-key") {
+    if (credential.access_token === expected.access_token &&
+        (!credential.region || !expected.region || credential.region === expected.region)) return;
+  } else {
+    const sameProfile = credential.profile_arn && credential.profile_arn === expected.profile_arn;
+    const sameTokens = credential.access_token === expected.access_token &&
+      credential.refresh_token === expected.refresh_token;
+    const resolvedSameLogin = !expected.profile_arn && sameTokens &&
+      authIdentity({ ...credential, profile_arn: undefined }) === authIdentity(expected);
+    if ((resolvedSameLogin || authIdentity(credential) === authIdentity(expected)) &&
+        (sameProfile || sameTokens) &&
+        (!profileArn || !expected.profile_arn || profileArn === expected.profile_arn)) return;
+  }
+  throw changedDuringRecovery();
+}
+
+function changedDuringRecovery() {
+  return new KiroAuthError("Kiro login or region changed during recovery; start a new turn.");
+}
+
+function missingOidcIssuer(credential) {
+  return credential.kind === "oidc" && !credential.region;
+}
+
+function needsRefresh(credential, now) {
+  return credential.kind !== "api-key" && (
+    missingOidcIssuer(credential) ||
+    Date.parse(credential.expires_at) <= now() + REFRESH_SKEW_MS
+  );
+}
+
+function sqliteBusy(error) {
+  return (error?.errcode & 0xff) === 5 || /^SQLITE_BUSY(?:_|$)/.test(error?.code ?? "") ||
+    error?.errno === 5;
+}
+
+async function refreshUnderLease(initial, {
+  authFile, signal, fetchImpl, now, retry, expectedCredential, profileArn, shouldResolveProfile,
+}) {
+  const owner = randomUUID();
+  const deadline = performance.now() + LEASE_MS;
+  const db = await openDatabase(authFile, false);
+  let held, renewal;
+  try {
+    db.exec(`PRAGMA busy_timeout = ${LEASE_POLL_MS}; PRAGMA secure_delete = ON`);
+    const expiresAt = `CASE WHEN json_valid(credentials.value)
+      THEN COALESCE(CAST(json_extract(credentials.value, '$.expiresAt') AS INTEGER), 0)
+      ELSE 0 END`;
+    const read = db.prepare(`
+      SELECT value, (SELECT ${expiresAt} FROM credentials WHERE id = ?) AS leaseExpiresAt
+      FROM credentials WHERE id = ?
+    `);
+    // Check the active bytes for INSERT and UPDATE alike. This single write
+    // elects one process even when several first see an absent or stale lease.
+    const acquire = db.prepare(`
+      INSERT INTO credentials (id, value)
+      SELECT ?, ? WHERE EXISTS (SELECT 1 FROM credentials WHERE id = ? AND value = ?)
+      ON CONFLICT(id) DO UPDATE SET value = excluded.value
+      WHERE (${expiresAt}) <= ?
+    `);
+    let raw, credential;
+    for (;;) {
+      signal?.throwIfAborted();
+      if (performance.now() >= deadline)
+        throw new KiroAuthError("Timed out waiting for the Kiro credential refresh; try again.", "refresh_timeout");
+      try {
+        const row = read.get(REFRESH_LEASE, ACTIVE);
+        raw = row?.value ?? null;
+        credential = parseCredential(raw);
+        assertExpectedCredential(credential, expectedCredential, profileArn);
+        if (!missingOidcIssuer(credential)) validateRoute(credential);
+        // Use a peer's newly rotated token even if it was minted with a
+        // lifetime shorter than our usual proactive refresh window.
+        if (!needsRefresh(credential, now) || (!missingOidcIssuer(credential) && raw !== initial.raw &&
+            (credential.access_token !== initial.credential.access_token ||
+              credential.refresh_token !== initial.credential.refresh_token) &&
+            Date.parse(credential.expires_at) > now())) return { credential, raw };
+        const currentTime = Date.now();
+        if (!(row.leaseExpiresAt > currentTime)) {
+          const lease = JSON.stringify({ owner, expiresAt: currentTime + LEASE_MS });
+          if (Number(acquire.run(REFRESH_LEASE, lease, ACTIVE, raw, currentTime).changes) === 1) {
+            held = lease;
+            break;
+          }
+        }
+      } catch (error) {
+        if (!sqliteBusy(error)) throw error;
+      }
+      try {
+        await delay(Math.min(LEASE_POLL_MS, Math.max(0, deadline - performance.now())), undefined, { signal });
+      } catch (error) {
+        signal?.throwIfAborted();
+        throw error;
+      }
+    }
+
+    signal?.throwIfAborted();
+    const lostLease = new AbortController();
+    const refreshSignal = signal ? AbortSignal.any([signal, lostLease.signal]) : lostLease.signal;
+    const updateIfOwned = db.prepare(`
+      UPDATE credentials SET value = ? WHERE id = ? AND value = ?
+        AND EXISTS (SELECT 1 FROM credentials WHERE id = ? AND value = ?)
+    `);
+    // The 30s lease expires after a crash. While its owner is alive, renew it
+    // through safe transport backoff without changing existing retry budgets.
+    renewal = setInterval(() => {
+      const next = JSON.stringify({ owner, expiresAt: Date.now() + LEASE_MS });
+      try {
+        if (Number(updateIfOwned.run(next, REFRESH_LEASE, held, ACTIVE, raw).changes) === 1) held = next;
+        else lostLease.abort(changedCredential());
+      } catch (error) {
+        if (!sqliteBusy(error)) lostLease.abort(error);
+      }
+    }, LEASE_RENEW_MS);
+    renewal.unref();
+    let updated;
+    try {
+      if (typeof credential.refresh_token !== "string" || !credential.refresh_token)
+        throw new KiroAuthError("Kiro login has no refresh credential.", "missing_refresh_state");
+      const update = credential.kind === "social" ? refreshSocial : refreshOidc;
+      const refreshed = await update({ credential, signal: refreshSignal, fetchImpl, now, retry });
+      if (credential.profile_arn && refreshed.profile_arn && credential.profile_arn !== refreshed.profile_arn)
+        throw new KiroAuthError("Kiro account profile changed during refresh; sign in again explicitly.");
+      updated = validateRoute({ ...credential, ...refreshed });
+      if (!shouldResolveProfile && !credential.profile_arn) delete updated.profile_arn;
+    } catch (error) {
+      signal?.throwIfAborted();
+      lostLease.signal.throwIfAborted();
+      if (!TERMINAL_REFRESH_ERRORS.has(error?.code)) throw error;
+      updated = { ...credential, disabled: error.code };
+    }
+
+    // Persist a rotated token (or terminal marker) before releasing ownership
+    // or doing profile discovery. Fence the CAS against both the old row and
+    // the exact lease, so late owners cannot overwrite a newer login or grant.
+    db.exec("PRAGMA busy_timeout = 5000");
+    const value = JSON.stringify(updated);
+    const result = updateIfOwned.run(value, ACTIVE, raw, REFRESH_LEASE, held);
+    if (Number(result.changes) !== 1) throw changedCredential();
+    if (updated.disabled) throw disabledCredential();
+    return { credential: updated, raw: value };
+  } finally {
+    clearInterval(renewal);
+    try {
+      if (held) db.prepare("DELETE FROM credentials WHERE id = ? AND value = ?").run(REFRESH_LEASE, held);
+    } catch {
+      // Cleanup cannot invalidate a committed refresh or replace its error.
+      // The ownership fence and expiry bound any lease left behind.
+    } finally {
+      db.close();
+    }
+  }
 }
 
 export async function loadKiroAuth({
   signal,
   fetchImpl = defaultFetch,
   authFile = authFilePath(),
+  useEnv = authFile === authFilePath(),
+  env = process.env,
   now = Date.now,
   retry,
   expectedCredential,
@@ -343,46 +624,42 @@ export async function loadKiroAuth({
   resolveProfile: shouldResolveProfile = true,
 } = {}) {
   signal?.throwIfAborted();
-  const raw = await readAuthSnapshot({ authFile, signal });
-  const credential = parseCredential(raw);
-  if (expectedCredential) {
-    const sameProfile = credential.profile_arn && credential.profile_arn === expectedCredential.profile_arn;
-    const sameTokens = credential.access_token === expectedCredential.access_token &&
-      credential.refresh_token === expectedCredential.refresh_token;
-    const resolvedSameLogin = !expectedCredential.profile_arn && sameTokens &&
-      authIdentity({ ...credential, profile_arn: undefined }) === authIdentity(expectedCredential);
-    if ((!resolvedSameLogin && authIdentity(credential) !== authIdentity(expectedCredential)) ||
-        (!sameProfile && !sameTokens) ||
-        (profileArn && expectedCredential.profile_arn && profileArn !== expectedCredential.profile_arn))
-      throw new KiroAuthError("Kiro login or region changed during recovery; start a new turn.");
+  const fromEnv = envCredential(useEnv, env);
+  const raw = fromEnv ? null : await readAuthSnapshot({ authFile, signal });
+  const credential = fromEnv ?? parseCredential(raw);
+  assertExpectedCredential(credential, expectedCredential, profileArn);
+  if (credential.kind === "api-key") {
+    if (profileArn !== undefined) throw new KiroAuthError("Kiro API keys do not use profiles.");
+    const resolved = credential.region ? credential : await resolveKiroApiKeyCredential(credential.access_token, {
+      env, signal, fetchImpl,
+    });
+    assertExpectedCredential(resolved, expectedCredential, profileArn);
+    return resolved;
   }
-  if (Date.parse(credential.expires_at) > now() + 60_000 &&
-      (!shouldResolveProfile || (credential.profile_arn &&
-        (!profileArn || credential.profile_arn === profileArn)))) return credential;
-  if (refreshing.has(authFile)) {
-    if (signal) await abortableRequest(() => refreshing.get(authFile), signal);
-    else await refreshing.get(authFile);
-    signal?.throwIfAborted();
+  // A missing legacy issuer is definitive when refresh is needed. An
+  // explicit but unsupported issuer/ARN must never get as far as a request.
+  if (!missingOidcIssuer(credential)) validateRoute(credential);
+  if (profileArn !== undefined) profileArnFor(credential, profileArn);
+  if (!needsRefresh(credential, now) && (!shouldResolveProfile ||
+    (credential.profile_arn && (!profileArn || credential.profile_arn === profileArn)))) return credential;
+  const inFlight = refreshing.get(authFile);
+  if (inFlight) {
+    if (signal) await abortableRequest(() => inFlight, signal);
+    else await inFlight;
     return loadKiroAuth({
-      signal, fetchImpl, authFile, now, retry, expectedCredential, profileArn,
+      signal, fetchImpl, authFile, useEnv, env, now, retry, expectedCredential, profileArn,
       resolveProfile: shouldResolveProfile,
     });
   }
   const prepare = async () => {
-    let updated = credential;
-    let expectedRaw = raw;
-    if (Date.parse(updated.expires_at) <= now() + 60_000) {
-      if (typeof updated.refresh_token !== "string" || !updated.refresh_token)
-        throw new KiroAuthError("Kiro login expired without a refresh credential; run omp-kiro login again.");
-      const update = updated.kind === "social" ? refreshSocial : refreshOidc;
-      const refreshed = await update({ credential: updated, signal, fetchImpl, now, retry });
-      if (updated.profile_arn && refreshed.profile_arn && updated.profile_arn !== refreshed.profile_arn)
-        throw new KiroAuthError("Kiro account profile changed during refresh; sign in again explicitly.");
-      updated = { ...updated, ...refreshed };
-      if (!shouldResolveProfile && !credential.profile_arn) delete updated.profile_arn;
-      // Persist single-use refresh rotation even if the subsequent profile lookup fails.
-      await saveKiroAuth(updated, { authFile, expectedRaw, signal });
-      expectedRaw = JSON.stringify(updated);
+    const { credential: updated, raw: expectedRaw } = needsRefresh(credential, now)
+      ? await refreshUnderLease({ raw, credential }, {
+        authFile, signal, fetchImpl, now, retry, expectedCredential, profileArn, shouldResolveProfile,
+      })
+      : { credential, raw };
+    if (updated.kind === "api-key") {
+      if (profileArn !== undefined) throw new KiroAuthError("Kiro API keys do not use profiles.");
+      return updated;
     }
     const resolved = shouldResolveProfile
       ? await resolveProfile(updated, { signal, fetchImpl, retry, profileArn })
@@ -408,6 +685,7 @@ export async function loadKiroAuth({
 }
 
 function authIdentity(auth) {
+  if (auth.kind === "api-key") return JSON.stringify([auth.kind, auth.region, auth.access_token]);
   return JSON.stringify([
     auth.kind, auth.provider, auth.region ?? (auth.kind === "social" ? "us-east-1" : undefined),
     auth.profile_arn, auth.client_id,
@@ -418,25 +696,33 @@ function authIdentity(auth) {
 export async function refreshExpiredKiroAuth(credential, {
   signal, fetchImpl, authFile, retry, authProvider = loadKiroAuth, now = Date.now,
 } = {}) {
-  if (!(Date.parse(credential.expires_at) <= now() + 60_000)) return credential;
+  if (credential.disabled) throw disabledCredential();
+  if (!(Date.parse(credential.expires_at) <= now() + REFRESH_SKEW_MS)) return credential;
   const refreshed = await authProvider({
     signal, fetchImpl, authFile, retry, now, expectedCredential: credential,
   });
+  if (refreshed.disabled) throw disabledCredential();
   if (authIdentity(credential) !== authIdentity(refreshed))
-    throw new KiroAuthError("Kiro login or region changed during recovery; start a new turn.");
+    throw changedDuringRecovery();
   return refreshed;
 }
 
 /**
- * Auth for one fixed profile of a store's login. Token refresh still persists,
- * but the pinned ARN never replaces the store's saved profile selection.
+ * Auth for a fixed profile, or for an API-key selection when no ARN is given.
+ * OAuth rotation may persist new tokens, but not the pinned profile selection.
  */
-export function pinnedKiroAuth({ authFile, profileArn }) {
+export function pinnedKiroAuth({ authFile, profileArn, useEnv }) {
   return async ({ expectedCredential, ...options } = {}) => {
-    const credential = await loadKiroAuth({ ...options, authFile, resolveProfile: false });
+    const selected = { ...options, authFile, useEnv, resolveProfile: false };
+    if (profileArn === undefined) {
+      const current = await readKiroAuth(selected);
+      if (current.kind !== "api-key") throw changedDuringRecovery();
+      return loadKiroAuth({ ...selected, expectedCredential: expectedCredential ?? current });
+    }
+    const credential = await loadKiroAuth({ ...selected, profileArn });
     const pinned = { ...credential, profile_arn: profileArn };
     if (expectedCredential && authIdentity(pinned) !== authIdentity(expectedCredential))
-      throw new KiroAuthError("Kiro login or region changed during recovery; start a new turn.");
+      throw changedDuringRecovery();
     return pinned;
   };
 }

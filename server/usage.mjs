@@ -1,8 +1,10 @@
 import { loadKiroAuth, refreshExpiredKiroAuth } from "./auth.mjs";
-import { defaultFetch, fetchWithRetry, isTransientNetworkError } from "./network.mjs";
+import { defaultFetch, fetchWithRetry, isTransientNetworkError, retryPolicy } from "./network.mjs";
+import { kiroCliServiceHeaders, kiroEndpoint } from "./wire.mjs";
 
 const messages = {
   AUTH_REQUIRED: "Kiro usage requires a managed login; run omp-kiro login.",
+  AUTH_DISABLED: "The managed Kiro login is disabled; sign in again with omp-kiro login.",
   AUTH_EXPIRED: "The managed Kiro login has expired; refresh it before reading usage.",
   AUTH_INVALID: "The managed Kiro login has no valid access token or expiry.",
   UNSUPPORTED_REGION: "Kiro usage does not support this account profile region.",
@@ -240,7 +242,8 @@ export async function fetchKiroUsage({
   signal,
   fetchImpl = defaultFetch,
   authFile,
-  authProvider = loadKiroAuth,
+  useEnv,
+  authProvider = (options) => loadKiroAuth({ ...options, useEnv }),
   timeoutMs,
   now = Date.now,
   retry,
@@ -254,31 +257,30 @@ export async function fetchKiroUsage({
     let auth;
     try {
       auth = await abortable(
-        () => authProvider({ authFile, signal: requestSignal, fetchImpl, retry }),
+        () => authProvider({ authFile, useEnv, signal: requestSignal, fetchImpl, retry }),
         requestSignal,
       );
-    } catch {
+    } catch (error) {
       requestSignal.throwIfAborted();
+      if (error?.code === "credential_disabled") fail("AUTH_DISABLED");
       fail("AUTH_REQUIRED");
     }
+    if (auth?.disabled) fail("AUTH_DISABLED");
     if (
       typeof auth?.access_token !== "string" ||
       !auth.access_token ||
-      !Number.isFinite(Date.parse(auth.expires_at))
+      (auth.kind !== "api-key" && !Number.isFinite(Date.parse(auth.expires_at)))
     )
       fail("AUTH_INVALID");
-    if (Date.parse(auth.expires_at) <= now()) fail("AUTH_EXPIRED");
-    const region = auth.profile_arn?.split(":")[3] || "us-east-1";
-    if (!["us-east-1", "eu-central-1"].includes(region)) fail("UNSUPPORTED_REGION");
+    if (auth.kind !== "api-key" && Date.parse(auth.expires_at) <= now()) fail("AUTH_EXPIRED");
+    let endpoint;
+    try { endpoint = kiroEndpoint(auth, "management"); } catch { fail("UNSUPPORTED_REGION"); }
+    let attempt = 0;
+    const maxAttempts = retryPolicy(retry).maxAttempts ?? 0;
     const payload = await abortable(
       () =>
-        fetchWithRetry(fetchImpl, `https://management.${region}.kiro.dev/`, {
+        fetchWithRetry(fetchImpl, endpoint, {
           method: "POST",
-          headers: {
-            authorization: `Bearer ${auth.access_token}`,
-            "content-type": "application/x-amz-json-1.0",
-            "x-amz-target": "AmazonCodeWhispererService.GetUsageLimits",
-          },
           body: JSON.stringify({
             origin: "KIRO_CLI",
             resourceType: "AGENTIC_REQUEST",
@@ -293,7 +295,9 @@ export async function fetchKiroUsage({
             auth = await refreshExpiredKiroAuth(auth, {
               signal: requestSignal, fetchImpl, authFile, retry, authProvider, now,
             });
-            return { ...init, headers: { ...init.headers, authorization: `Bearer ${auth.access_token}` } };
+            return { ...init, headers: kiroCliServiceHeaders("GetUsageLimits", auth.access_token, {
+              attempt: ++attempt, maxAttempts,
+            }) };
           },
           async consume(response) {
             if (!response.ok) {
@@ -318,6 +322,7 @@ export async function fetchKiroUsage({
   } catch (error) {
     if (signal?.aborted) throw new KiroUsageError("CANCELLED");
     if (timer.signal.aborted) throw new KiroUsageError("TIMEOUT");
+    if (error?.code === "credential_disabled") throw new KiroUsageError("AUTH_DISABLED");
     if (error instanceof KiroUsageError) throw error;
     throw new KiroUsageError("NETWORK_ERROR");
   } finally {

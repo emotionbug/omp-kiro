@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { test } from "node:test";
-import { saveKiroAuth } from "../server/auth.mjs";
+import { readKiroAuth, saveKiroAuth } from "../server/auth.mjs";
 const run = promisify(execFile);
 const entry = fileURLToPath(new URL("../auth-cli.mjs", import.meta.url));
 
@@ -77,3 +77,35 @@ test(
     assert.deepEqual(JSON.parse(result.stdout), { loggedIn: false, authFile });
   },
 );
+
+test("standalone API-key login reads stdin and never prints the key", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-kiro-api-key-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const authFile = join(directory, "auth.sqlite3");
+  const env = { ...process.env, KIRO_API_KEY: "", KIRO_API_REGION: "eu-central-1" };
+  const preload = "data:text/javascript,globalThis.fetch=()=>{throw new Error('unexpected request')}";
+  const key = "ksk_fixture-not-a-real-key";
+  const args = ["--import", preload, entry, "login", "--provider", "api-key",
+    "--account", "work", "--auth-file", authFile, "--region", "us-east-1"];
+  const child = run(process.execPath, args, { env, timeout: 10000 });
+  child.child.stdin.end(`${key}\n`);
+  const { stdout, stderr } = await child;
+  const output = stdout + stderr;
+  assert.ok(!output.includes(key));
+  assert.match(output, /kiro-work-key\/auto/);
+  const workFile = join(directory, "accounts", "work.sqlite3");
+  assert.deepEqual(await readKiroAuth({ authFile: workFile }), {
+    kind: "api-key", provider: "api-key", access_token: key, region: "us-east-1",
+  });
+  const options = { env, timeout: 10000 };
+  const status = await run(process.execPath, [entry, "auth", "status", "--account", "work",
+    "--auth-file", authFile, "--json"], options);
+  assert.equal(JSON.parse(status.stdout).kind, "api-key");
+  assert.equal(JSON.parse(status.stdout).expiresAt, undefined);
+  assert.ok(!status.stdout.includes(key));
+  await assert.rejects(run(process.execPath, [...args, `--key=${key}`], options), (error) => {
+    assert.match(error.stderr, /Invalid authentication options/);
+    assert.ok(!error.stderr.includes(key));
+    return true;
+  });
+});

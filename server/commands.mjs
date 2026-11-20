@@ -1,5 +1,5 @@
 import { getKiroAuthStatus, loadKiroAuth } from "./auth.mjs";
-import { kiroTargets, listKiroAccounts, pinnedKiroTargets } from "./accounts.mjs";
+import { DEFAULT_ACCOUNT, kiroTargets, listKiroAccounts, pinnedKiroTargets } from "./accounts.mjs";
 import { closeSession, openKiro } from "./bridge.mjs";
 import { discoverHttpModels } from "./http.mjs";
 import { fetchKiroUsage } from "./usage.mjs";
@@ -115,7 +115,8 @@ function usageText(usage) {
   );
 }
 
-function profileListText({ selectedArn, profiles }, { usage = false } = {}) {
+function profileListText({ selectedArn, profiles, apiKey }, { usage = false } = {}) {
+  if (apiKey) return "Kiro API keys have no profiles.";
   const lines = [
     `Selected profile: ${selectedArn ? singleLine(selectedArn) : "none (listing does not select one)"}`,
     "Profiles represent service/account context. API values do not establish whether credit pools are independent or shared; do not sum profile quotas.",
@@ -154,16 +155,18 @@ function accountsText(accounts) {
       lines.push("Status: signed out");
       continue;
     }
-    lines.push(`Status: ${status.expired
+    lines.push(`Status: ${status.disabled ? "signed in; sign in again" : status.expired
       ? status.refreshable ? "expired; refreshes on next use" : "expired; sign in again"
       : "signed in"} (${singleLine(status.provider)}, ${singleLine(status.kind)})`);
+    if (status.disabled) continue;
     const targets = kiroTargets([account]);
-    if (!account.catalog)
+    if (status.kind === "api-key") lines.push("Profiles: not used by API keys.");
+    else if (!account.catalog)
       lines.push(`Profiles: not listed yet; run omp-kiro auth profiles --account ${account.name}.`);
     else if (!targets.length) lines.push("Profiles: none usable over Kiro HTTP.");
     for (const target of targets)
       lines.push(
-        `${pinned.has(target.provider) ? `${target.provider}/…` : "kiro-http/…"} — ${singleLine(target.name ?? target.arn)}${target.arn === account.selectedArn ? " (saved selection)" : ""}`,
+        `${pinned.has(target.provider) ? `${target.provider}/…` : "kiro-http/…"} — ${singleLine(target.name ?? target.arn)}${target.arn && target.arn === account.selectedArn ? " (saved selection)" : ""}`,
       );
   }
   lines.push(
@@ -207,6 +210,9 @@ function safeFailure(error, transport, signal) {
     invalid_profile: "Provide an exact Kiro profile ARN or unique profile name. Use /kiro-profiles to list profiles.",
     unknown_profile: "The requested Kiro profile is not available to this login. Use /kiro-profiles to list profiles.",
     ambiguous_profile: "The Kiro profile name is ambiguous; select an exact profile ARN.",
+    api_key_no_profiles: "Kiro API keys have no profiles.",
+    credential_disabled: "This Kiro account is signed in but can't be used. Sign in again with omp-kiro login.",
+    AUTH_DISABLED: "This Kiro account is signed in but can't be used. Sign in again with omp-kiro login.",
     unsupported_profile_region: "The requested Kiro profile uses an unsupported region.",
     credential_changed: "The managed credentials changed while selecting the profile. The newer login was preserved; list profiles and try again.",
   };
@@ -271,7 +277,7 @@ async function acpCatalog({ signal, services }) {
 export async function executeKiroQuery(
   name,
   args = "",
-  { transport = "http", authFile, signal, authProvider, services = {} } = {},
+  { transport = "http", authFile, useEnv, signal, authProvider, services = {} } = {},
 ) {
   checkTransport(transport);
   signal?.throwIfAborted();
@@ -312,21 +318,21 @@ export async function executeKiroQuery(
           text: `Transport: Kiro CLI ACP\nCLI metadata handshake: ready (${models.length} models)\nNo generation was requested. Usage uses the separate managed HTTP account.`,
         };
       }
-      const status = await (services.getKiroAuthStatus ?? getKiroAuthStatus)({ authFile, signal });
+      const status = await (services.getKiroAuthStatus ?? getKiroAuthStatus)({ authFile, useEnv, signal });
       signal?.throwIfAborted();
       return {
         title: "Kiro status",
         text: [
           "Transport: direct HTTP (no Kiro CLI required)",
-          `Authentication: ${!status.loggedIn ? "signed out" : status.expired ? "expired" : "signed in"}`,
+          `Authentication: ${!status.loggedIn ? "signed out" : status.disabled ? "signed in; sign in again" : status.expired ? "expired" : "signed in"}`,
           ...(status.loggedIn
             ? [
                 `Login type: ${singleLine(status.kind)}${status.provider ? ` (${singleLine(status.provider)})` : ""}`,
-                `Expires: ${singleLine(status.expiresAt)}`,
-                `Refresh credential: ${status.refreshable ? "available" : "not available"}`,
+                ...(status.expiresAt ? [`Expires: ${singleLine(status.expiresAt)}`] : []),
+                ...(status.kind !== "api-key" ? [`Refresh credential: ${status.refreshable ? "available" : "not available"}`] : []),
               ]
             : []),
-          ...(!status.loggedIn || status.expired
+          ...(!status.loggedIn || status.expired || status.disabled
             ? [
                 "Run omp-kiro login (or import-cli) for the selected auth store. Status never refreshes or signs in automatically.",
               ]
@@ -341,7 +347,7 @@ export async function executeKiroQuery(
           ? await acpCatalog({ signal, services })
           : await (services.discoverHttpModels ?? discoverHttpModels)({
               signal,
-              authProvider: authProvider ?? ((options) => loadKiroAuth({ ...options, authFile })),
+              authProvider: authProvider ?? ((options) => loadKiroAuth({ ...options, authFile, useEnv })),
             });
       signal?.throwIfAborted();
       const filter = args.toLowerCase();
@@ -360,18 +366,20 @@ export async function executeKiroQuery(
     if (name === "kiro-profiles") {
       const profiles = await (services.fetchKiroProfileUsage ?? fetchKiroProfileUsage)({
         authFile,
+        useEnv,
         signal,
       });
       signal?.throwIfAborted();
       return { title: "Kiro profiles", text: profileListText(profiles, { usage: true }) };
     }
     if (name === "kiro-accounts") {
-      const accounts = await (services.listKiroAccounts ?? listKiroAccounts)({ authFile });
+      const accounts = await (services.listKiroAccounts ?? listKiroAccounts)({ authFile, useEnv });
       signal?.throwIfAborted();
       return { title: "Kiro accounts", text: accountsText(accounts) };
     }
     const usage = await (services.fetchKiroUsage ?? fetchKiroUsage)({
       authFile,
+      useEnv,
       signal,
       ...(authProvider ? { authProvider } : {}),
     });
@@ -406,12 +414,14 @@ export function registerKiroCommands(pi, { transport = "http", authFile, service
         let result;
         let profileChanged;
         let profileNotice;
+        const pinned = services.pinnedTarget?.(ctx.model?.provider);
+        const apiKeyTarget = pinned?.target.arn === null ? pinned.target : undefined;
+        const profileOptions = apiKeyTarget
+          ? { authFile: apiKeyTarget.authFile, useEnv: apiKeyTarget.account === DEFAULT_ACCOUNT, signal }
+          : { authFile, signal };
         // Shared by `/kiro-profile <selector>` and the no-argument picker.
         const selectProfile = async (selector) => {
-          profileChanged = await (services.selectKiroProfile ?? selectKiroProfile)(selector, {
-            authFile,
-            signal,
-          });
+          profileChanged = await (services.selectKiroProfile ?? selectKiroProfile)(selector, profileOptions);
           // Persistence has committed: invalidate local schemas even if this
           // command is cancelled before the host catalog can be refreshed.
           profileNotice = await services.onProfileChanged?.(profileChanged);
@@ -445,29 +455,28 @@ export function registerKiroCommands(pi, { transport = "http", authFile, service
         try {
           signal.throwIfAborted();
           if (command.kind === "query") {
-            // A pinned session model scopes status, models and usage to its account profile.
-            const pinned = ["kiro-status", "kiro-models", "kiro-usage"].includes(command.name)
-              ? services.pinnedTarget?.(ctx.model?.provider)
-              : undefined;
+            const accountQuery = ["kiro-status", "kiro-models", "kiro-usage"].includes(command.name);
+            if (accountQuery && !pinned && ctx.model?.api === "kiro-cli-http" && ctx.model.provider !== "kiro-http")
+              throw new KiroCommandError("This Kiro account profile is no longer usable. Sign in again or choose another Kiro model.", {
+                code: "account_unavailable",
+              });
+            const target = command.name === "kiro-profiles" ? apiKeyTarget && pinned : accountQuery && pinned;
             result = await executeKiroQuery(command.name, args, {
               transport,
-              authFile: pinned ? pinned.target.authFile : authFile,
-              ...(pinned ? { authProvider: pinned.authProvider } : {}),
+              authFile: target ? target.target.authFile : authFile,
+              ...(target ? { authProvider: target.authProvider, useEnv: target.target.account === DEFAULT_ACCOUNT } : {}),
               signal,
               services,
             });
-            if (pinned)
-              result.text += `\nAccount profile: ${singleLine(pinned.target.label)} (${pinned.target.provider})`;
+            if (target)
+              result.text += `\nAccount profile: ${singleLine(target.target.label)} (${target.target.provider})`;
             if (command.name === "kiro-status" && ctx.model)
               result.text += `\nSession model: ${singleLine(ctx.model.provider)}/${singleLine(ctx.model.id)}`;
           } else if (command.name === "kiro-profile" && !String(args).trim()) {
             const interactive = ctx.hasUI === true && typeof ctx.ui?.select === "function";
             // Picking changes shared state: refuse before any dialog is shown.
             if (interactive) requireIdle(ctx);
-            const profiles = await (services.listKiroProfiles ?? listKiroProfiles)({
-              authFile,
-              signal,
-            });
+            const profiles = await (services.listKiroProfiles ?? listKiroProfiles)(profileOptions);
             signal.throwIfAborted();
             if (!interactive || !profiles.profiles.length) {
               result = { title: "Kiro profile selection", text: profileListText(profiles) };

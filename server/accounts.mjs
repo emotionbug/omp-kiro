@@ -7,12 +7,12 @@ import {
   readKiroAuth,
   readProfileCatalog,
 } from "./auth.mjs";
+import { kiroProfileRegions, parseKiroProfileArn } from "./wire.mjs";
 
 export const DEFAULT_ACCOUNT = "default";
 const ACCOUNT_NAME = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
 // `kiro-http` and `kiro-cli` are the unpinned model providers.
 const RESERVED = new Set(["http", "cli"]);
-const HTTP_REGIONS = new Set(["us-east-1", "eu-central-1"]);
 
 function validName(name) {
   return typeof name === "string" && ACCOUNT_NAME.test(name) && !RESERVED.has(name);
@@ -37,20 +37,26 @@ export function kiroAccountAuthFile(name, { authFile = authFilePath() } = {}) {
  * The profile ID is the ARN's final segment, lowercased and reduced to
  * letters and digits, so it stays stable when Kiro renames the profile.
  */
-export function kiroTargetProvider(account, arn) {
-  const id = /:profile\/([^:]+)$/.exec(arn)?.[1].toLowerCase().replace(/[^a-z0-9]/g, "");
+export function kiroTargetProvider(account, arn, kind) {
+  const id = kind === "api-key" ? "key" :
+    parseKiroProfileArn(arn)?.profileId.toLowerCase().replace(/[^a-z0-9]/g, "");
   return id ? `kiro-${account}-${id}` : undefined;
 }
 
-async function readAccount(name, authFile, now) {
+async function readAccount(name, authFile, now, useEnv) {
   try {
-    const status = await getKiroAuthStatus({ authFile, now });
-    if (!status.loggedIn) return { name, authFile, status, selectedArn: null, catalog: null };
+    const status = await getKiroAuthStatus({ authFile, now, useEnv });
+    if (!status.loggedIn || status.disabled || status.kind === "api-key")
+      return { name, authFile, status, selectedArn: null, catalog: null };
     const [credential, catalog] = await Promise.all([
-      readKiroAuth({ authFile }),
+      readKiroAuth({ authFile, useEnv }),
       readProfileCatalog({ authFile }),
     ]);
-    return { name, authFile, status, selectedArn: credential.profile_arn ?? null, catalog };
+    return {
+      name, authFile,
+      status: credential.provider === "identity-center" ? { ...status, region: credential.region } : status,
+      selectedArn: credential.profile_arn ?? null, catalog,
+    };
   } catch (error) {
     return {
       name,
@@ -61,7 +67,7 @@ async function readAccount(name, authFile, now) {
 }
 
 /** Local, network-free inventory: the default store first, then named stores by name. */
-export async function listKiroAccounts({ authFile = authFilePath(), now = Date.now } = {}) {
+export async function listKiroAccounts({ authFile = authFilePath(), now = Date.now, useEnv = authFile === authFilePath() } = {}) {
   const directory = kiroAccountsDirectory(authFile);
   let entries = [];
   try {
@@ -74,8 +80,8 @@ export async function listKiroAccounts({ authFile = authFilePath(), now = Date.n
     .filter((name) => name && name !== DEFAULT_ACCOUNT && validName(name))
     .sort();
   return Promise.all([
-    readAccount(DEFAULT_ACCOUNT, authFile, now),
-    ...names.map((name) => readAccount(name, join(directory, `${name}.sqlite3`), now)),
+    readAccount(DEFAULT_ACCOUNT, authFile, now, useEnv),
+    ...names.map((name) => readAccount(name, join(directory, `${name}.sqlite3`), now, false)),
   ]);
 }
 
@@ -92,10 +98,22 @@ export function kiroTargets(accounts) {
   const targets = [];
   const seen = new Set();
   for (const account of accounts) {
-    if (!account.status?.loggedIn) continue;
+    if (!account.status?.loggedIn || account.status.disabled) continue;
+    if (account.status.kind === "api-key") {
+      const provider = kiroTargetProvider(account.name, null, "api-key");
+      if (!seen.has(provider)) {
+        seen.add(provider);
+        targets.push({
+          provider, account: account.name, authFile: account.authFile,
+          arn: null, name: "API key", label: account.name,
+        });
+      }
+      continue;
+    }
     const listed = account.catalog?.profiles ?? (account.selectedArn ? [{ arn: account.selectedArn }] : []);
+    const regions = kiroProfileRegions(account.status);
     const profiles = listed
-      .filter((profile) => HTTP_REGIONS.has(profile.arn.split(":")[3]))
+      .filter((profile) => regions.includes(parseKiroProfileArn(profile.arn)?.region))
       .sort((left, right) => (left.arn < right.arn ? -1 : left.arn > right.arn ? 1 : 0));
     for (const profile of profiles) {
       const provider = kiroTargetProvider(account.name, profile.arn);

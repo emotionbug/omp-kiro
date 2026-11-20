@@ -11,6 +11,7 @@ import {
   loadKiroAuth,
   logoutKiroAuth,
   readAuthSnapshot,
+  resolveKiroApiKeyCredential,
   saveKiroAuth,
 } from "./server/auth.mjs";
 import { loginSocial } from "./server/social-login.mjs";
@@ -39,10 +40,10 @@ Commands:
   auth import-cli       Explicitly import an existing CLI social login
 
 Login options:
-  --provider <name>     google (default), github, builder-id, identity-center
+  --provider <name>     google (default), github, builder-id, identity-center, api-key
   --flow <name>         device (default); social accounts also loopback or manual
   --start-url <url>     Identity Center start URL
-  --region <region>     OIDC issuer region (default: us-east-1)
+  --region <region>     OIDC issuer region (default: us-east-1) or API-key service region
   --profile <arn|name>  Select an assigned Kiro profile (login accepts an ARN)
   --usage               Include per-profile plan, credits and reset (auth profiles)
   --timeout <seconds>   Overall deadline (default: 600)
@@ -61,6 +62,7 @@ profiles, every account profile gets its own OMP model provider
 No browser is launched automatically. Open the displayed authorization link on
 any device for the default device flow. Passwords and tokens are never requested
 on the command line. HTTP generation uses this plugin's login, not CLI storage.`);
+  console.log("API-key login reads one secret line from stdin (hidden on a terminal), never from arguments.");
 }
 
 function instructions(info) {
@@ -85,25 +87,59 @@ async function requestCallback({ signal }) {
   }
 }
 
+async function readApiKey(signal) {
+  signal.throwIfAborted();
+  const tty = process.stdin.isTTY === true;
+  // A terminal interface with no output handles editing and raw input
+  // without echoing the secret. Piped input has no prompt at all.
+  const input = createInterface({ input: process.stdin, terminal: tty });
+  let interrupted = false;
+  const close = () => input.close();
+  signal.addEventListener("abort", close, { once: true });
+  input.on("SIGINT", () => { interrupted = true; close(); });
+  if (tty) process.stderr.write("Kiro API key: ");
+  try {
+    for await (const line of input) {
+      signal.throwIfAborted();
+      return line.trim();
+    }
+    signal.throwIfAborted();
+    if (interrupted) throw new DOMException("Authentication cancelled", "AbortError");
+    throw new Error("No Kiro API key was supplied on stdin.");
+  } finally {
+    input.close();
+    signal.removeEventListener("abort", close);
+    if (tty) process.stderr.write("\n");
+  }
+}
+
 export async function runAuthCli(argv = process.argv.slice(2)) {
-  const { values, positionals } = parseArgs({
-    args: argv,
-    allowPositionals: true,
-    options: {
-      provider: { type: "string", default: "google" },
-      flow: { type: "string", default: "device" },
-      "start-url": { type: "string" },
-      region: { type: "string", default: "us-east-1" },
-      profile: { type: "string" },
-      timeout: { type: "string", default: "600" },
-      "auth-file": { type: "string" },
-      account: { type: "string" },
-      database: { type: "string" },
-      json: { type: "boolean" },
-      help: { type: "boolean", short: "h" },
-      usage: { type: "boolean" },
-    },
-  });
+  let parsed;
+  try {
+    parsed = parseArgs({
+      args: argv,
+      allowPositionals: true,
+      options: {
+        provider: { type: "string", default: "google" },
+        flow: { type: "string", default: "device" },
+        "start-url": { type: "string" },
+        region: { type: "string" },
+        profile: { type: "string" },
+        timeout: { type: "string", default: "600" },
+        "auth-file": { type: "string" },
+        account: { type: "string" },
+        database: { type: "string" },
+        json: { type: "boolean" },
+        help: { type: "boolean", short: "h" },
+        usage: { type: "boolean" },
+      },
+    });
+  } catch {
+    // Option parser errors may quote arbitrary arguments. Never echo a
+    // mistakenly supplied key, even when rejecting unsupported flags.
+    throw new Error("Invalid authentication options; use --help.");
+  }
+  const { values, positionals } = parsed;
   if (values.help || positionals.length === 0) {
     usage();
     return;
@@ -124,6 +160,8 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
   const defaultAuthFile = values["auth-file"] ? resolve(values["auth-file"]) : authFilePath();
   const account = values.account ?? DEFAULT_ACCOUNT;
   const authFile = kiroAccountAuthFile(account, { authFile: defaultAuthFile });
+  const useEnv = account === DEFAULT_ACCOUNT && defaultAuthFile === authFilePath();
+  const authOptions = { authFile, useEnv };
   if (command === "accounts") {
     if (values.json) {
       const accounts = await listKiroAccounts({ authFile: defaultAuthFile });
@@ -134,11 +172,12 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
     return;
   }
   if (command === "auth status") {
-    const status = await getKiroAuthStatus({ authFile });
+    const status = await getKiroAuthStatus(authOptions);
     if (values.json) console.log(JSON.stringify(status));
     else if (status.loggedIn)
       console.log(
-        `Logged in: ${status.provider} (${status.kind}); expires ${status.expiresAt}${status.expired ? " (expired)" : ""}`,
+        status.disabled ? `Signed in: ${status.provider} (${status.kind}); sign in again to use this account.`
+          : `Logged in: ${status.provider} (${status.kind})${status.expiresAt ? `; expires ${status.expiresAt}${status.expired ? " (expired)" : ""}` : ""}`,
       );
     else console.log("Not logged in. Run omp-kiro login.");
     return;
@@ -146,6 +185,7 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
   if (command === "auth logout") {
     await logoutKiroAuth({ authFile });
     console.log("Plugin login removed. Kiro CLI login was not changed.");
+    if (useEnv && process.env.KIRO_API_KEY) console.log("Unset KIRO_API_KEY to stop using the environment key.");
     return;
   }
   const controller = new AbortController();
@@ -168,12 +208,16 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
     if (command === "auth profiles") {
       if (values.json) {
         const query = values.usage ? fetchKiroProfileUsage : listKiroProfiles;
-        console.log(JSON.stringify(await query({ authFile, signal })));
+        console.log(JSON.stringify(await query({ ...authOptions, signal })));
       } else if (values.usage) {
-        const result = await executeKiroQuery("kiro-profiles", "", { authFile, signal });
+        const result = await executeKiroQuery("kiro-profiles", "", { ...authOptions, signal });
         console.log(result.text);
       } else {
-        const catalog = await listKiroProfiles({ authFile, signal });
+        const catalog = await listKiroProfiles({ ...authOptions, signal });
+        if (catalog.apiKey) {
+          console.log("Kiro API keys have no profiles.");
+          return;
+        }
         for (const profile of catalog.profiles)
           console.log(`${profile.arn === catalog.selectedArn ? "* " : "  "}${JSON.stringify(profile.name)}\n  ${profile.arn}\n  pinned models: ${kiroTargetProvider(account, profile.arn) ?? "unavailable"}/…`);
         if (!catalog.selectedArn) console.log("No profile selected.");
@@ -182,11 +226,12 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
     }
     if (command === "auth profile") {
       const profile = values.profile
-        ? await selectKiroProfile(values.profile, { authFile, signal })
-        : { arn: (await listKiroProfiles({ authFile, signal })).selectedArn ?? null };
+        ? await selectKiroProfile(values.profile, { ...authOptions, signal })
+        : await listKiroProfiles({ ...authOptions, signal }).then(({ selectedArn, apiKey }) =>
+          apiKey ? { arn: null, apiKey: true } : { arn: selectedArn ?? null });
       if (values.json) console.log(JSON.stringify(profile));
       else {
-        console.log(`Selected Kiro profile: ${JSON.stringify(profile.arn)}`);
+        console.log(profile.apiKey ? "Kiro API keys have no profiles." : `Selected Kiro profile: ${JSON.stringify(profile.arn)}`);
         if (values.profile)
           console.log("Applies to all sessions sharing this auth store. Refresh the Kiro model catalog in other sessions before their next turn.");
       }
@@ -206,7 +251,11 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
     const expectedRaw = await readAuthSnapshot({ authFile, signal });
     const provider = values.provider;
     let credential;
-    if (["google", "github"].includes(provider)) {
+    if (provider === "api-key") {
+      if (values["start-url"] || values.profile || values.flow !== "device")
+        throw new Error("API-key login does not use a start URL, profile, or OAuth flow.");
+      credential = await resolveKiroApiKeyCredential(await readApiKey(signal), { region: values.region, signal });
+    } else if (["google", "github"].includes(provider)) {
       if (values["start-url"])
         throw new Error("--start-url is for Identity Center, not social login.");
       if (!["device", "loopback", "manual"].includes(values.flow))
@@ -224,19 +273,32 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
       credential = await loginDevice({
         provider,
         startUrl: values["start-url"],
-        region: values.region,
+        region: values.region ?? "us-east-1",
         signal,
         onVerification: instructions,
       });
     } else
       throw new Error(
-        "Unsupported provider; choose google, github, builder-id, or identity-center.",
+        "Unsupported provider; choose google, github, builder-id, identity-center, or api-key.",
       );
     await saveKiroAuth(credential, { authFile, expectedRaw, signal, replacesLogin: true });
+    if (provider === "api-key") {
+      console.log(`Authenticated API key. Credentials saved to ${authFile}.`);
+      if (account === DEFAULT_ACCOUNT) {
+        if (useEnv && process.env.KIRO_API_KEY)
+          console.log("KIRO_API_KEY takes precedence over the saved default. Unset it to use this key.");
+        console.log(`For this store, set OMP_KIRO_AUTH_FILE to ${authFile}.`);
+        console.log("Use: omp --model kiro-http/auto");
+      } else {
+        console.log(`Named accounts are found beside ${defaultAuthFile}; OMP and Passession must use that same default store.`);
+        console.log(`Use: omp --model ${kiroTargetProvider(account, null, "api-key")}/auto`);
+      }
+      return;
+    }
     let unselected = false;
     try {
       await loadKiroAuth({
-        authFile, signal, profileArn: values.profile,
+        authFile, signal, profileArn: values.profile, useEnv: false,
         expectedCredential: { ...credential, profile_arn: undefined },
       });
     } catch (error) {
@@ -247,8 +309,10 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
     console.log(`Authenticated ${credential.provider}. Credentials saved to ${authFile}.`);
     let targets = [];
     try {
-      const { profiles } = await listKiroProfiles({ authFile, signal });
-      targets = kiroTargets([{ name: account, authFile, status: { loggedIn: true }, catalog: { profiles } }]);
+      const { profiles } = await listKiroProfiles({ authFile, signal, useEnv: false });
+      targets = kiroTargets([{ name: account, authFile, status: {
+        loggedIn: true, kind: credential.kind, provider, region: credential.region,
+      }, catalog: { profiles } }]);
     } catch {
       console.log(`Profiles could not be listed; run omp-kiro auth profiles --account ${account} to name its model providers.`);
     }

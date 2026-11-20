@@ -26,6 +26,11 @@ test("Kiro search retries a temporary rejection with one RPC identity and preser
   assert.equal(requests[1].url, "https://runtime.us-east-1.kiro.dev/mcp");
   assert.equal(requests[1].init.headers.authorization, "Bearer private-access");
   assert.equal(requests[1].init.headers["x-amzn-kiro-profile-arn"], auth.profile_arn);
+  assert.equal(requests[1].init.headers["x-amzn-codewhisperer-optout"], "true");
+  assert.match(requests[1].init.headers["user-agent"], /aws-sdk-rust\/1\.6\.0.*appVersion-3\.2\.0/);
+  assert.equal(requests[0].init.headers["amz-sdk-request"], "attempt=1; max=3");
+  assert.equal(requests[1].init.headers["amz-sdk-request"], "attempt=2; max=3");
+  assert.notEqual(requests[0].init.headers["amz-sdk-invocation-id"], requests[1].init.headers["amz-sdk-invocation-id"]);
   const body = JSON.parse(requests[1].init.body);
   assert.equal(body.method, "tools/call");
   assert.deepEqual(body.params, { name: "web_search", arguments: { query: "Kiro documentation" } });

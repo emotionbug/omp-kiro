@@ -53,6 +53,9 @@ async function upstream(t, handle) {
       assert.equal(new URL(url).origin, AUTH);
       assert.equal(options.redirect, "error");
       assert.equal(options.headers["content-type"], "application/json");
+      assert.equal(options.headers["user-agent"], "Kiro-CLI");
+      assert.equal(options.headers["accept-encoding"], "gzip");
+      assert.equal(options.headers["x-amzn-codewhisperer-optout"], "true");
       assert.ok(options.signal);
       return fetch(`${origin}${new URL(url).pathname}`, options);
     },
@@ -88,10 +91,10 @@ function clock() {
 test("social device flow uses real mock HTTP, provider-specific initiation and pending/slow_down timing", async (t) => {
   const f = await upstream(t, (path, body, count) => {
     if (path.endsWith("authorization")) {
-      assert.deepEqual(body, { clientId: "kiro-cli", loginProvider: "Github" });
+      assert.deepEqual(body, { clientId: "Kiro-CLI", loginProvider: "Github" });
       return { body: device };
     }
-    assert.deepEqual(body, { clientId: "kiro-cli", deviceCode: device.deviceCode });
+    assert.deepEqual(body, { clientId: "Kiro-CLI", deviceCode: device.deviceCode });
     return {
       body:
         count === 2
@@ -392,6 +395,20 @@ test("refresh sanitizes HTTP and transport failures and rejects malformed token 
   ]) {
     await assert.rejects(refreshSocial({ credential, fetchImpl }), (error) => {
       assert.doesNotMatch(error.message, /fixture-private/);
+      return error instanceof SocialLoginError;
+    });
+  }
+});
+
+test("social refresh treats HTTP 400 and 401 as definitive even without JSON", async () => {
+  const credential = { kind: "social", provider: "github", refresh_token: token.refreshToken };
+  for (const status of [400, 401, 403]) {
+    await assert.rejects(refreshSocial({
+      credential,
+      fetchImpl: async () => new Response(String(token.refreshToken), { status }),
+    }), (error) => {
+      assert.equal(error.code, status === 403 ? undefined : "login_expired");
+      assert.doesNotMatch(error.message, new RegExp(token.refreshToken));
       return error instanceof SocialLoginError;
     });
   }

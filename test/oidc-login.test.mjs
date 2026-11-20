@@ -61,6 +61,10 @@ function fixture(replies = [registration, device, issued]) {
         assert.equal(request.redirect, "error");
         assert.equal(request.method, "POST");
         assert.equal(request.headers.authorization, undefined);
+        assert.equal(request.headers["content-type"], "application/json");
+        assert.match(request.headers["user-agent"], /aws-sdk-rust.*api\/ssooidc/);
+        assert.match(request.headers["x-amz-user-agent"], /api\/ssooidc/);
+        assert.match(request.headers["amz-sdk-invocation-id"], /^[\da-f-]{36}$/);
         const next = replies.shift();
         assert.notEqual(next, undefined, "unexpected request");
         if (typeof next === "function") return next(request);
@@ -125,6 +129,23 @@ for (const provider of ["builder-id", "identity-center"]) {
     assert.equal(credential.refresh_token, issued.refreshToken);
     assert.equal(credential.expires_at, "2026-01-01T01:00:01.000Z");
     assert.equal(credential.device_code, undefined);
+  });
+}
+
+for (const startUrl of [
+  "https://start.us-gov-home.awsapps.com/directory/fixture",
+  "https://ssoins-fixture.portal.us-gov-west-1.app.aws",
+]) {
+  test(`GovCloud Identity Center accepts ${new URL(startUrl).hostname} and uses its issuer`, async () => {
+    const verificationUri = "https://device.sso.us-gov-west-1.amazonaws.com/";
+    const f = fixture([registration, { ...device, verificationUri, verificationUriComplete: verificationUri }, issued]);
+    const credential = await loginDevice({
+      ...f.options, provider: "identity-center", region: "us-gov-west-1", startUrl,
+    });
+    assert.equal(credential.region, "us-gov-west-1");
+    assert.equal(f.requests[1].body.startUrl, startUrl);
+    assert.equal(f.instructions[0].verificationUri, verificationUri);
+    assert.ok(f.requests.every(({ url }) => url.startsWith("https://oidc.us-gov-west-1.amazonaws.com/")));
   });
 }
 
@@ -279,6 +300,9 @@ for (const overrides of [
   { region: "localhost" },
   { region: "us-east-1.evil.test" },
   { provider: "builder-id", region: "eu-west-1" },
+  { provider: "builder-id", region: "us-gov-west-1" },
+  { provider: "identity-center", region: "us-gov-west-1", startUrl: "https://fixture.awsapps.com/start" },
+  { provider: "identity-center", region: "us-gov-west-1", startUrl: "https://fixture.portal.us-gov-east-1.app.aws" },
   { provider: "identity-center" },
   { provider: "builder-id", startUrl: "https://fixture.awsapps.com/start" },
   { provider: "identity-center", startUrl: "http://fixture.awsapps.com/start" },
@@ -368,6 +392,7 @@ for (const [upstream, code] of [
   ["invalid_client", "registration_expired"],
   ["unauthorized_client", "registration_expired"],
   ["invalid_grant", "login_expired"],
+  ["expired_token", "login_expired"],
 ]) {
   test(`refresh maps ${upstream} to actionable ${code}`, async () => {
     const f = fixture([error(upstream)]);
@@ -463,6 +488,8 @@ test("OIDC refresh retries explicit unavailability but never replays a lost rota
   assert.equal(value.access_token, issued.accessToken);
   assert.equal(f.requests.length, 2);
   assert.deepEqual(f.requests[0].body, f.requests[1].body);
+  assert.deepEqual(f.requests.map((request) => request.headers["amz-sdk-request"]), ["attempt=1; max=3", "attempt=2; max=3"]);
+  assert.notEqual(f.requests[0].headers["amz-sdk-invocation-id"], f.requests[1].headers["amz-sdk-invocation-id"]);
   let calls = 0;
   await assert.rejects(refreshOidc({
     credential: existing,
@@ -536,4 +563,18 @@ test("OIDC refresh reports a permanent grant failure immediately even when HTTP 
     },
   }), { code: "login_expired" });
   assert.equal(calls, 1);
+});
+
+test("OIDC refresh treats namespaced expired grant errors as definitive on temporary HTTP status", async () => {
+  const replies = [
+    Response.json({ __type: "com.amazonaws.ssooidc#ExpiredTokenException" }, { status: 503 }),
+    new Response(null, { status: 503, headers: { "x-amzn-errortype": "ExpiredTokenException" } }),
+  ];
+  for (const reply of replies) {
+    const f = fixture([reply]);
+    await assert.rejects(refreshOidc({
+      ...f.options, credential: existing, retry: { maxAttempts: 3, baseDelayMs: 0 },
+    }), { code: "login_expired" });
+    assert.equal(f.requests.length, 1);
+  }
 });

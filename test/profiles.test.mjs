@@ -70,21 +70,25 @@ test("profile listing collects every page, deduplicates ARNs, and preserves sele
   const report = await listKiroProfiles({
     ...f.options,
     fetchImpl: async (url, request) => {
-      assert.equal(url, "https://management.us-east-1.kiro.dev/");
+      assert.match(url, /^https:\/\/management\.(us-east-1|eu-central-1)\.kiro\.dev\/$/);
       assert.equal(request.redirect, "error");
       assert.ok(isCatalog(request));
       assert.equal(request.headers.authorization, `Bearer ${credential.access_token}`);
+      assert.equal(request.headers["x-amzn-codewhisperer-optout"], "true");
+      assert.equal(request.headers["x-amz-target"], "AmazonCodeWhispererService.ListAvailableProfiles");
       const body = JSON.parse(request.body);
-      pages.push(body);
+      pages.push({ url, body });
+      if (url.includes("eu-central-1")) return Response.json({ profiles: [profiles[1]] });
       return Response.json(body.nextToken
-        ? { profiles: [profiles[0], profiles[1]] }
+        ? { profiles: [profiles[0]] }
         : { profiles: [profiles[0]], nextToken: "second-page" });
     },
   });
-  assert.deepEqual(pages, [
-    { origin: "KIRO_CLI" },
-    { origin: "KIRO_CLI", nextToken: "second-page" },
+  assert.deepEqual(pages.filter(({ url }) => url.includes("us-east-1")).map(({ body }) => body), [
+    {},
+    { nextToken: "second-page" },
   ]);
+  assert.deepEqual(pages.filter(({ url }) => url.includes("eu-central-1")).map(({ body }) => body), [{}]);
   assert.deepEqual(report, {
     selectedArn: A,
     profiles: [
@@ -116,14 +120,16 @@ test("OIDC issuer region does not replace the selected profile service region", 
     ...credential, kind: "oidc", provider: "identity-center", region: "ap-southeast-2",
     client_id: "fixture-client", client_secret: "fixture-client-secret", profile_arn: B,
   });
+  const urls = [];
   const report = await listKiroProfiles({
     ...f.options,
     fetchImpl: async (url) => {
-      assert.equal(url, "https://management.eu-central-1.kiro.dev/");
+      urls.push(url);
       return Response.json({ profiles });
     },
   });
   assert.equal(report.selectedArn, B);
+  assert.deepEqual(new Set(urls), new Set(["https://management.us-east-1.kiro.dev/", "https://management.eu-central-1.kiro.dev/"]));
 });
 
 test("catalog pagination cycles and malformed profiles fail without modifying credentials", async (t) => {
@@ -221,7 +227,8 @@ test("cancellation during pagination or quota comparison aborts the whole report
     let calls = 0;
     const pending = (comparing ? fetchKiroProfileUsage : listKiroProfiles)({
       ...f.options, signal: controller.signal,
-      fetchImpl: async (_url, request) => {
+      fetchImpl: async (url, request) => {
+        if (isCatalog(request) && url.includes("eu-central-1")) return Response.json({ profiles: [] });
         calls++;
         if (calls === 1)
           return Response.json({ profiles, ...(comparing ? {} : { nextToken: "next" }) });
@@ -318,7 +325,7 @@ test("listing refreshes without resolving or adopting a refresh-returned profile
     },
   });
   assert.equal(refreshes, 1);
-  assert.equal(catalogs, 1);
+  assert.equal(catalogs, 2);
   assert.equal(report.selectedArn, null);
   const saved = await f.read();
   assert.equal(saved.profile_arn, undefined);
@@ -418,4 +425,41 @@ test("comparison recovery refuses a concurrent stored-profile change", async (t)
   assert.ok(report.profiles.every((profile) => profile.error && !profile.usage));
   assert.deepEqual(await f.read(), replacement);
   noSecrets(report);
+});
+
+test("profile commands require no service request for an unresolved environment API key", async (t) => {
+  const f = await fixture(t);
+  const options = { ...f.options, useEnv: true, env: { KIRO_API_KEY: "ksk_fixture-key" },
+    fetchImpl: async () => assert.fail("profile-only operations must not probe key regions") };
+  const expected = { selectedArn: null, profiles: [], apiKey: true };
+  assert.deepEqual(await listKiroProfiles(options), expected);
+  assert.deepEqual(await fetchKiroProfileUsage(options), expected);
+  await assert.rejects(selectKiroProfile(A, options), { code: "api_key_no_profiles" });
+  assert.deepEqual(await f.read(), credential);
+});
+
+test("GovCloud selection respects issuer partition and uses the selected profile region", async (t) => {
+  const gov = {
+    ...credential, kind: "oidc", provider: "identity-center", region: "us-gov-west-1",
+    client_id: "test-client", client_secret: "test-secret", profile_arn: undefined,
+  };
+  const f = await fixture(t, gov);
+  const arn = "arn:aws-us-gov:codewhisperer:us-gov-east-1:123456789012:profile/gov";
+  const regions = [];
+  const options = { ...f.options, fetchImpl: async (url, request) => {
+    if (isCatalog(request)) {
+      regions.push(new URL(url).hostname);
+      return Response.json({ profiles: url.includes("us-gov-east-1") ? [{ arn }] : [] });
+    }
+    assert.equal(url, "https://management.us-gov-east-1.kiro.dev/");
+    assert.equal(JSON.parse(request.body).profileArn, arn);
+    return Response.json(usagePayload());
+  } };
+  assert.deepEqual(await selectKiroProfile(arn, options), {
+    arn, name: arn, region: "us-gov-east-1", accountId: "123456789012",
+  });
+  assert.deepEqual(new Set(regions), new Set(["management.us-gov-west-1.kiro.dev", "management.us-gov-east-1.kiro.dev"]));
+  const report = await fetchKiroProfileUsage(options);
+  assert.equal(report.profiles[0].usage.status, "available");
+  assert.equal((await f.read()).profile_arn, arn);
 });

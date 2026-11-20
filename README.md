@@ -56,7 +56,7 @@ kiro-cli login
 OMP_KIRO_TRANSPORT=acp omp --model kiro-cli/auto
 ```
 
-HTTP is an unofficial, version-dependent protocol. Selecting it does not fall back to ACP on errors and does not bypass account quota. Do not put bearer or refresh tokens in environment variables, OMP configuration, or this repository.
+HTTP is an unofficial, version-dependent protocol. Selecting it does not fall back to ACP on errors and does not bypass account quota. Never place OAuth access or refresh tokens in environment variables, OMP configuration, or this repository. For API keys, see the supported secret inputs below.
 
 `kiro-cli` and `kiro-http` have separate OMP catalog caches and authentication stores. Both use the current `KIRO_CLI` origin, but different accounts and enterprise policies can return different model sets. HTTP never falls back to the CLI's account or catalog.
 
@@ -95,6 +95,9 @@ npx github:emotionbug/omp-kiro login --provider builder-id
 # IAM Identity Center: --region is the OIDC issuer region, not inference routing
 npx github:emotionbug/omp-kiro login --provider identity-center \
   --start-url https://your-portal.awsapps.com/start --region us-east-1
+
+# Kiro API key; type or paste the key at the hidden prompt
+npx github:emotionbug/omp-kiro login --provider api-key --account work --region eu-central-1
 ```
 
 From a checkout, use `npm run auth -- login ...` or `node auth-cli.mjs login ...`. GitHub installation through OMP does not necessarily put the command on your shell's `PATH`; the `npx` form works independently.
@@ -113,9 +116,15 @@ Manual mode does not bind a local port. A browser on another host may show a con
 
 This removes local browser-launch, callback-port, CLI installation, and keychain dependencies. It does not bypass corporate network restrictions, TLS validation, disabled provider features, or organization approval policies. The user's original environment-specific CLI failure was not reproduced, so no particular cause is claimed.
 
+### Kiro API keys
+
+API-key login reads one `ksk_…` key from stdin, either a hidden terminal prompt or a pipe from a secret manager. Never put the key in command-line arguments. Region precedence is `--region`, then `KIRO_API_REGION`, then a non-generating model-list probe in `us-east-1` and `eu-central-1`. Exactly one region must accept an unpinned key; otherwise specify its region explicitly. A saved key retains its resolved region.
+
+`KIRO_API_KEY`, supplied through your environment or secret manager, overrides the saved **default** account without writing it to SQLite. `KIRO_API_REGION` pins that environment key; otherwise HTTP resolves its region on demand. Named accounts continue to use their saved credentials. `auth logout` clears the selected store, not the environment; unset `KIRO_API_KEY` to stop using that key. Keys do not expire on a timer, refresh, or have Kiro profiles. Model discovery, generation, usage and web search use the key directly.
+
 ### IAM profile resolution
 
-Since 0.4.7, login and HTTP authentication resolve a missing Kiro profile through `ListAvailableProfiles` before requesting models or generation. A single assigned profile is selected and persisted automatically, including for older managed logins that lack `profile_arn`; another browser approval is not required while the login remains valid. The OIDC issuer region stays unchanged and is distinct from the Kiro region encoded in the selected profile ARN.
+HTTP OAuth authentication resolves a missing Kiro profile through `ListAvailableProfiles` before requesting models or generation. A single assigned profile is selected and persisted automatically, including for older managed logins that lack `profile_arn`; another browser approval is not required while the login remains valid. The OIDC issuer region stays unchanged and is distinct from the Kiro region encoded in the selected profile ARN. OAuth accounts list commercial profiles in `us-east-1` and `eu-central-1`; Identity Center logins with a `us-gov-` OIDC issuer instead use `us-gov-west-1` and `us-gov-east-1` profiles with `arn:aws-us-gov:` ARNs. Social and Builder ID logins stay commercial.
 
 Multiple profiles are never resolved by arbitrarily picking the first. Inspect and compare them inside OMP (HTTP transport only):
 
@@ -158,6 +167,8 @@ npx github:emotionbug/omp-kiro auth logout
 
 Status never prints tokens. On POSIX the credential file is mode `0600`, with newly created directories mode `0700`; on Windows use a private user directory and appropriate ACLs. Refreshes persist rotation with compare-and-swap. Login/logout racing a refresh cannot be undone by that old operation. Logout changes only this plugin's store, not CLI or other service sessions.
 
+Refreshes of a given store share an in-process operation and a short SQLite lease across processes. If refresh is permanently rejected (for example `invalid_grant`, a revoked social login, or missing refresh state), the account remains listed as signed in but unusable until a new login replaces it. No future command tries to refresh that dead grant.
+
 Version 0.2 read CLI SQLite directly; 0.3 is a clean cutover. To migrate an existing social login explicitly instead of authenticating again:
 
 ```bash
@@ -188,6 +199,8 @@ npx github:emotionbug/omp-kiro accounts
 The existing store is account `default`. A named account lives in `accounts/<name>.sqlite3` beside the default store (`~/.config/omp-kiro/accounts/work.sqlite3` by default), so OMP and Passession find it through the same `OMP_KIRO_AUTH_FILE` or `XDG_CONFIG_HOME` that locates the default store. Names use 1–32 lowercase letters, digits or inner hyphens; `http` and `cli` are reserved. `--account` works with `login`, `auth status`, `auth logout`, `auth profiles`, `auth profile` and `auth import-cli`; `accounts --json` lists every account and provider without credentials.
 
 Once a named account is signed in, or one account has several profiles, every account profile also gets its own OMP model provider: `kiro-<account>-<profile id>`, where the profile ID is the ARN's final segment reduced to lowercase letters and digits, for example `kiro-work-ehga3grvqmuk/claude-sonnet-4.5`. The ID does not change when Kiro renames the profile. Its models are named `Kiro · <account> · <profile> · <model>`; the profile part is left out when the account has one profile. With a single account and a single profile nothing is added, so `kiro-http/…` is the only provider, as before.
+
+An API-key account contributes one profileless target. Where pinning is available under the same rule, its provider is `kiro-<account>-key`. A lone default API key uses `kiro-http/…`.
 
 Choosing such a model pins that session to the account and profile. Generation, `/kiro-status`, `/kiro-models`, `/kiro-usage` and Kiro web search then use that login's tokens with that profile ARN. Token refresh is saved to that account's store, but its saved profile selection is never changed, so sessions on different accounts and profiles run side by side. `kiro-http/…` keeps following the default account's saved selection (`/kiro-profile`).
 
@@ -263,7 +276,7 @@ Available in OMP, including OMP-backed Passession sessions:
 | `/kiro-accounts`        | HTTP only: list local accounts, their profiles and pinned providers; re-read the stores |
 | `/kiro-reset`           | ACP only: close this connection, retaining OMP history       |
 
-On a pinned model, `/kiro-status`, `/kiro-models` and `/kiro-usage` report that account profile. `/kiro-profiles` and `/kiro-profile` always act on the default account.
+On a pinned model, `/kiro-status`, `/kiro-models` and `/kiro-usage` report that account. `/kiro-profiles` and `/kiro-profile` act on the default account, except that a pinned API-key model explains that keys have no profiles.
 
 These commands do not start model generation. ACP and HTTP can be logged into different accounts; ACP `/kiro-usage` explicitly identifies the separate managed HTTP login. Commands do not log in automatically, purchase credits, enable overage billing, change host tool trust, or delete history. OMP's existing `/model`, `/compact`, and other host commands are not replaced.
 
@@ -285,7 +298,11 @@ Generation uses the current Kiro runtime HTTPS endpoint; model discovery uses th
 
 Since 0.4.8, system-prompt arrays are joined and prepended once to the first wire user input. Developer instructions retain their role labels and conversation positions instead of being moved ahead of earlier turns. The feature-gated top-level `systemPrompt` field is not sent: it caused HTTP 400 `ValidationException: Improperly formed request` on the live Identity Center account. Instructions are preserved as an explicit text projection, **not upstream-enforced system/developer channels**; host tool permission decisions remain authoritative.
 
-The transport decodes checksum-validated AWS event-stream frames, assembles interleaved tool argument fragments, and forwards text, native reasoning, reported usage, errors, and cancellation. OMP performs approved tool execution; the transport never executes tools, replaces the selected model, or falls back to ACP. Region routing is restricted to the artifact-backed US East and EU Central Kiro endpoint families.
+The transport decodes checksum-validated AWS event-stream frames, assembles interleaved tool argument fragments or object snapshots, and forwards text, native reasoning, reported usage, errors, and cancellation. OMP performs approved tool execution; the transport never executes tools, replaces the selected model, or falls back to ACP. Requests use the regional Kiro hosts and Kiro CLI 3.2.0 SDK identity where applicable, always sending `x-amzn-codewhisperer-optout: true`.
+
+HTTP models advertise image input when the service's `supportedInputTypes` contains `IMAGE`. Kiro receives JPEG, PNG, GIF and WebP attachments from current-turn user messages and tool results; tool-result images are labeled `(see attached image)`, and history keeps only the marker `(image omitted from history)`.
+
+Each tool result is limited to 800,000 UTF-8 bytes with an omission marker. A conversation budget of 850,000 bytes per 200,000 context tokens counts serialized history and current content; when it is exceeded, tool results are cut to 25,000 bytes, oldest historical results first, then current ones. If this cannot fit, the provider reports context overflow without sending the oversized request. Kiro's HTTP 413, `CONTENT_LENGTH_EXCEEDS_THRESHOLD`, and `Input is too long.` rejections (even on HTTP 429) also trigger OMP compaction rather than transport retries.
 
 **Reasoning display:** HTTP `reasoningContentEvent.text` streams through OMP's thinking blocks, separately from the answer. When the model schema advertises both adaptive thinking and summarized display, an explicit positive effort requests `thinking: {type: "adaptive", display: "summarized"}`. Auto does so when adaptive thinking is the declared default/only mode; optional thinking without an advertised default is not forcibly enabled. Mandatory-effort models still use their native minimum for OMP Auto/off. A supported explicit native off takes precedence. This consumes the existing generation stream; there is no separate reasoning-generation request.
 
@@ -301,7 +318,8 @@ Other native response handling:
 | `meteringEvent` | Map an explicit `credit`/`credits` unit to `usage.credits.cost`, not dollar cost or token counts. Other units remain unmapped. |
 | Native error variants / exception frames | Surface errors; daily/monthly request-count limits are terminal. Native `retryAfterMilliseconds` and `x-amzn-kiro-ratelimit-retry-after` are milliseconds; the longer native/HTTP retry delay wins. |
 | `toolResultEvent` | Reject server-side tool results rather than impersonating actual OMP-executed results. |
-| `contextUsageEvent`, code references, document citations | Not mapped to OMP's current generic output contract. Percentages and normalized usage are not guessed into occupied token counts; citations are not injected into answer text. |
+| `contextUsageEvent` | Map the reported occupancy percentage against the model's context window as `usage.contextTokens`. Billed input/output/cache token counts still come only from `metadataEvent`. |
+| Code references and document citations | Not injected into answer text. |
 
 `PAUSE_TURN`, model-handoff compaction requests, unknown stop reasons, and `TOOL_USE` without actual calls fail explicitly rather than claiming completion. Automatic paused-turn resumption/model handoff is not implemented.
 
@@ -311,7 +329,7 @@ Tool names are dispatched by OMP, not the transport. A complete tool call whose 
 
 **Retry ownership (0.4.2):** HTTP recovery stays inside the shared transport, including actual OMP generation. Transient failures retry **until caller cancellation**, waiting **30 seconds after each failure** by default. OMP enables the explicit `continuePartial: true` turn option: after published text is interrupted, the transport moves the current input and completed tool results into local wire history once, appends the assistant fragment, and requests only continuation. The continuation retains model, origin, conversation ID, system instructions, workspace context, and tool schema, but never copies old `toolResults` into its current message. Subsequent text appends to the same OMP assistant message; repeated outages do not depend on OMP's bounded host recovery.
 
-The standalone transport supports explicit `onRestart` for consumers that can genuinely replace provisional output; without continuation or restart, failure after published text or reasoning is terminal. Before new answer text, retries retain the exact serialized request.
+The standalone transport supports explicit `onRestart` for consumers that can genuinely replace provisional output; without continuation or restart, failure after published text or reasoning is terminal. Before new answer text, unbilled retries retain the exact serialized request. Once `meteringEvent` arrives, a request can never restart with the same body. If a transport cutoff follows a validated terminal stop and complete output, keep that output; otherwise fail, except when transient recovery can send a distinct committed-text continuation. This avoids a second charge for an identical request without pretending incomplete calls are complete.
 
 Transient network failures include offline DNS (`ENOTFOUND`, `EAI_AGAIN`), unreachable/refused connections, socket drops, and response-data timeouts. HTTP 408/429/500/502/503/504 and selected framed temporary service errors are retryable. `retry.maxAttempts: null` explicitly means unlimited attempts until abort (the default); a numeric 1–5 retains an explicitly finite policy. `OMP_KIRO_HTTP_MAX_ATTEMPTS` accepts `unlimited` or 1–5. `baseDelayMs`/`maxDelayMs` (environment: `OMP_KIRO_HTTP_RETRY_BASE_MS`/`OMP_KIRO_HTTP_RETRY_MAX_MS`) accept 0–30000; custom policies retain exponential backoff capped at `maxDelayMs`, while both defaults are 30000 for fixed cadence. A longer server `Retry-After` extends the wait instead of causing an early retry or failure, and all waits are abortable. The per-attempt response-data timeout defaults to 45 seconds (`OMP_KIRO_HTTP_IDLE_TIMEOUT_MS`: 1–300000). Catalog/search/usage and command wrappers impose no shorter default total deadline; usage callers may still set an explicit `timeoutMs`.
 
@@ -327,7 +345,7 @@ The Bun bundle must be a readable regular UTF-8 PEM file containing only certifi
 
 **Offline startup integration (0.4.3):** a packaged host can set the absolute `OMP_KIRO_MODEL_CATALOG_FILE` path to its real account snapshot written by `models.cmd`. Before registering HTTP models, the async OMP factory reads current managed auth **without refreshing it** and validates that snapshot. The configured snapshot is authoritative: OMP does not register a dynamic discovery callback, so host offline/background refresh cannot erase its account rows or initiate a detached live discovery. Run `models.cmd` and reload/restart the packaged OMP session to refresh registered metadata; `/kiro-models` remains an explicitly requested live query. With no explicit path, OMP retains live discovery. A bad, missing, or wrong-account configured snapshot fails closed and asks you to refresh `models.cmd`, never silently using live discovery or invented models.
 
-The shared `server/model-catalog.mjs` API exports `kiroCatalogAccountId(auth)` and `readKiroModelCatalog(file, { auth })`. The latter returns unchanged raw model rows from a bounded (4 MiB) JSON envelope `{version:1,fetchedAt,accountId,models:[{id,name,contextWindow?,maxTokens?,additionalModelRequestFieldsSchema?}]}`. `accountId` is a SHA-256 binding to managed provider/auth kind, region, client registration, and profile ARN; without an ARN it conservatively binds the refresh token, or access token if no refresh token exists. No token is written to the catalog. Renewal under the same profile preserves the binding; no-profile refresh-token rotation requires a new snapshot. IDs, names, advertised limits, and native capability schemas are preserved; unknown envelope/model-row fields, malformed rows, duplicate IDs, and account mismatches are rejected. An empty account catalog stays empty. Do not invent capability schemas to enable controls the account did not advertise.
+The shared `server/model-catalog.mjs` API exports `kiroCatalogAccountId(auth)` and `readKiroModelCatalog(file, { auth })`. The latter returns unchanged raw model rows from a bounded (4 MiB) JSON envelope `{version:1,fetchedAt,accountId,models:[{id,name,contextWindow?,maxTokens?,supportedInputTypes?,additionalModelRequestFieldsSchema?}]}`. `accountId` is a SHA-256 binding to managed provider/auth kind, region, client registration, and profile ARN; without an ARN it conservatively binds the refresh token, or access token if no refresh token exists. API keys bind the key and its configured region. No token is written to the catalog. Renewal under the same profile preserves the binding; no-profile refresh-token rotation requires a new snapshot. Unknown fields, malformed or duplicate rows, and account mismatches are rejected. An empty account catalog stays empty.
 
 Snapshot age is not credential validity: genuine metadata has no synthetic TTL fallback, and expired managed auth can seed offline startup. Generation still loads/refreshes current managed credentials normally, retries only transient failures on the 30-second policy, and retains the account-change guard. The snapshot never supplies HTTP credentials or guarantees quota/model availability. Package login/logout/import must invalidate it and `models.cmd` must bind metadata to the same auth used for discovery. Hosts without a snapshot must keep readiness pending during transient live discovery outages, while retaining process-exit and caller-cancellation cleanup.
 
@@ -335,13 +353,13 @@ Snapshot age is not credential validity: genuine metadata has no synthetic TTL f
 
 In HTTP mode, the OMP extension registers one `web_search` override using the host's extension-tool contract; it does not delegate to OMP's native external search provider. Queries contain 1–200 Unicode characters.
 
-The search client sends authenticated JSON-RPC `tools/call` requests for `web_search` to the selected Kiro runtime's `/mcp`, using the managed bearer login and the profile header. Returned source URLs, snippets, dates, and `maxVerbatimWordLimit` are retained. It does **not** open or fetch those URLs, follow redirects, or fall back to Exa, Brave, or direct website retrieval. This is backend search, **not arbitrary-URL full-page fetch**. The observed remote tool inventory advertised `web_search` only, not `web_fetch`; the plugin does not invent that capability. Account/organization web-tool policy can reject search independently of model catalog access.
+The search client sends authenticated JSON-RPC `tools/call` requests for `web_search` to the selected Kiro runtime's `/mcp`, using the selected OAuth bearer and profile header, or the API key and `tokentype: API_KEY`. Returned source URLs, snippets, dates, and `maxVerbatimWordLimit` are retained. It does **not** open or fetch those URLs, follow redirects, or fall back to Exa, Brave, or direct website retrieval. This is backend search, **not arbitrary-URL full-page fetch**. The observed remote tool inventory advertised `web_search` only, not `web_fetch`; the plugin does not invent that capability. Account/organization web-tool policy can reject search independently of model catalog access.
 
 The target machine still needs approved Kiro service/proxy/gateway access and any login/refresh access its credentials require. Kiro's service performs the web search; external result websites need not be reachable from the search client. This restriction describes this search implementation, not a network sandbox for other host tools or user-configured MCP servers.
 
 ### Shared limits
 
-- **Text only:** images and unsupported content are rejected. Thinking blocks are not forwarded as conversation text.
+- **Attachments:** ACP remains text-only. HTTP handles current-turn images as described above. Thinking blocks are not forwarded as conversation text.
 - **Reasoning output:** HTTP displays native readable reasoning and preserves eligible signed/opaque history as described above. ACP reasoning forwarding remains unchanged. Live generation entitlement and readable-summary availability are not guaranteed by catalog access.
 - **Usage:** unreported token/cost fields remain numeric defaults, not a claim of free usage. HTTP forwards token counts only when upstream reports them.
 - **Planning limits:** ACP supplies no numeric limits, so it uses conservative 128,000-token context and 16,000-token output metadata. HTTP uses the live advertised limits, with conservative defaults for missing fields.

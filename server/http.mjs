@@ -4,8 +4,11 @@ import { decodeEventStream } from "./eventstream.mjs";
 import { kiroEffortFields, kiroThinkingConfig } from "./effort.mjs";
 import {
   abortableRequest, defaultFetch, fetchWithRetry, isPermanentServiceError, isTransientNetworkError, isTransientStatus,
-  requestScope, retryAfterMs, retryOperation,
+  requestScope, retryAfterMs, retryOperation, retryPolicy,
 } from "./network.mjs";
+import { kiroCliServiceHeaders, kiroEndpoint as endpointFor } from "./wire.mjs";
+
+export { endpointFor };
 
 // Native ChatResponseStream union error members, named by `:exception-type`
 // on exception frames or by `:event-type` when sent as event variants.
@@ -28,28 +31,96 @@ export class KiroHttpError extends Error {
   }
 }
 
-export function endpointFor(auth, service = "runtime") {
-  const region = auth.profile_arn?.split(":")[3] || "us-east-1";
-  if (region === "us-east-1" || region === "eu-central-1")
-    return `https://${service}.${region}.kiro.dev/`;
-  throw new KiroHttpError("Kiro HTTP transport does not support this account profile region.");
+const INPUT_TOO_LONG = "Input is too long";
+const CONTENT_LENGTH_EXCEEDS_THRESHOLD = "CONTENT_LENGTH_EXCEEDS_THRESHOLD";
+const TOOL_RESULT_MAX_BYTES = 800_000;
+const TOOL_RESULT_SHRUNK_BYTES = 25_000;
+const BUDGET_BASE_BYTES = 850_000;
+const BUDGET_BASE_TOKENS = 200_000;
+const UTF8 = new TextEncoder();
+const CONTINUATION_PROMPT = "Please proceed with the task.";
+const CURRENT_TOOL_RESULT_IMAGE = "(see attached image)";
+const HISTORICAL_IMAGE = "(image omitted from history)";
+const IMAGE_FORMATS = new Map([
+  ["image/jpeg", "jpeg"], ["image/jpg", "jpeg"], ["image/png", "png"],
+  ["image/gif", "gif"], ["image/webp", "webp"],
+]);
+
+function contextOverflow(detail, properties) {
+  const error = new KiroHttpError(`Kiro prompt is too long${detail ? `: ${detail}` : "."}`, properties);
+  error.contextOverflow = true;
+  return error;
+}
+
+function isOverflowRejection(code, reason, body) {
+  return reason === CONTENT_LENGTH_EXCEEDS_THRESHOLD ||
+    (typeof code === "string" && code.split("#").at(-1) === CONTENT_LENGTH_EXCEEDS_THRESHOLD) ||
+    body.includes(INPUT_TOO_LONG);
 }
 
 const isKiroHttpMessage = (message) => message.provider === "kiro-http" && message.api === "kiro-cli-http";
 
 function textContent(message) {
-  if (typeof message.content === "string") return message.content;
+  if (typeof message.content === "string") return message.content.toWellFormed();
   const text = [];
   for (const block of message.content ?? []) {
     if (block.type === "text") text.push(block.text);
+    else if (block.type === "image" && message.role !== "assistant") continue;
     else if (!["toolCall", "thinking", "redactedThinking"].includes(block.type)) {
       throw new KiroHttpError(
-        `Kiro HTTP transport cannot forward ${block.type} content; only text and tool calls are supported.`,
+        `Kiro HTTP transport cannot forward ${block.type} content.`,
       );
     }
   }
   // Kiro HTTP text blocks split by reasoning phases were one native text stream.
-  return text.join(message.role === "assistant" && isKiroHttpMessage(message) ? "" : "\n");
+  return text.join(message.role === "assistant" && isKiroHttpMessage(message) ? "" : "\n").toWellFormed();
+}
+
+// Historical images are never encoded or validated; only the current turn carries bytes.
+function collectImages(message, output) {
+  if (!Array.isArray(message.content)) return false;
+  let found = false;
+  for (const block of message.content) {
+    if (block.type !== "image") continue;
+    if (!output) return true;
+    const format = typeof block.mimeType === "string" && IMAGE_FORMATS.get(block.mimeType.toLowerCase());
+    if (!format) throw new KiroHttpError(`Kiro does not support image type: ${block.mimeType}`);
+    found = true;
+    output.push({ format, source: { bytes: block.data } });
+  }
+  return found;
+}
+
+function truncateToolText(text, totalBytes, limit) {
+  if (totalBytes <= limit) return text;
+  const marker = (keptBytes) =>
+    `\n\n[Tool result truncated: only the first ${keptBytes} of ${totalBytes} UTF-8 bytes were sent. Re-run the tool with a narrower scope if the omitted part is needed.]`;
+  // Reserve room for the marker's widest kept-byte count. encodeInto never splits a code point.
+  const { read, written } = UTF8.encodeInto(text, new Uint8Array(limit - marker(limit).length));
+  return text.slice(0, read) + marker(written);
+}
+
+const jsonBytes = (value) => Buffer.byteLength(JSON.stringify(value), "utf8");
+
+function enforceRequestBudget({ body, contextWindow, historicalResults, currentResults }) {
+  const { history, currentMessage: { userInputMessage: current } } = body.conversationState;
+  const tokens = Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : BUDGET_BASE_TOKENS;
+  const limit = Math.floor(BUDGET_BASE_BYTES * (tokens / BUDGET_BASE_TOKENS));
+  // Match Kiro's conversation budget: history, current text, images, and tool result text.
+  let total = jsonBytes(history) + jsonBytes(current.content) + jsonBytes(current.images ?? []);
+  for (const { part } of currentResults) total += jsonBytes(part.text);
+  if (total <= limit) return;
+  for (const results of [historicalResults, currentResults]) {
+    for (const result of results) {
+      if (result.shrunk || result.fullBytes <= TOOL_RESULT_SHRUNK_BYTES) continue;
+      const before = jsonBytes(result.part.text);
+      result.part.text = truncateToolText(result.full, result.fullBytes, TOOL_RESULT_SHRUNK_BYTES);
+      result.shrunk = true;
+      total += jsonBytes(result.part.text) - before;
+      if (total <= limit) return;
+    }
+  }
+  throw contextOverflow(`request exceeds the local limit of ${limit} UTF-8 bytes`);
 }
 
 function conversationId(sessionId) {
@@ -90,13 +161,20 @@ const PLACEHOLDER_TOOL = {
   inputSchema: { json: { type: "object", properties: {}, required: [] } },
 };
 
-export function buildHttpRequest({
-  model, context, cwd, sessionId, modelRequestFieldsSchema, reasoning, disableReasoning, forceReasoningOff,
+function prepareHttpRequest({
+  model, context, contextWindow, cwd, sessionId, modelRequestFieldsSchema, reasoning, disableReasoning, forceReasoningOff,
 }) {
   const additionalModelRequestFields = kiroEffortFields(modelRequestFieldsSchema, {
     reasoning, disableReasoning, forceReasoningOff,
   });
   const messages = [];
+  const historicalResults = [];
+  const currentResults = [];
+  const historicalImageUsers = new Set();
+  const currentImages = [];
+  const toolImages = [];
+  const lastAssistant = context.messages.findLastIndex((message) => message.role === "assistant");
+  let currentUserHasImages = false;
   const advertised = new Set((context.tools ?? []).map((tool) => tool.name));
   let placeholderUsed = false;
   const systemPrompt = Array.isArray(context.systemPrompt)
@@ -104,14 +182,22 @@ export function buildHttpRequest({
     : context.systemPrompt;
   const userMessage = (content = "") => ({ content, modelId: model, origin: "KIRO_CLI" });
   for (const [index, message] of context.messages.entries()) {
+    const isCurrent = index > lastAssistant;
     const content = textContent(message);
     if (message.role === "user" || message.role === "developer") {
       const input = message.role === "developer"
         ? `[Developer instructions at conversation message ${index + 1}]\n${content}`
         : content;
-      const previous = messages.at(-1)?.userInputMessage;
+      let previous = messages.at(-1)?.userInputMessage;
       if (previous) previous.content += `${previous.content && input ? "\n\n" : ""}${input}`;
-      else messages.push({ userInputMessage: userMessage(input) });
+      else {
+        previous = userMessage(input);
+        messages.push({ userInputMessage: previous });
+      }
+      if (collectImages(message, isCurrent ? currentImages : undefined)) {
+        if (isCurrent) currentUserHasImages = true;
+        else historicalImageUsers.add(previous);
+      }
     } else if (message.role === "assistant") {
       const toolUses =
         typeof message.content === "string"
@@ -149,9 +235,14 @@ export function buildHttpRequest({
       }
       previous.userInputMessageContext ??= {};
       previous.userInputMessageContext.toolResults ??= [];
+      const imageOnly = collectImages(message, isCurrent ? toolImages : undefined) && !content;
+      const full = content || (imageOnly ? (isCurrent ? CURRENT_TOOL_RESULT_IMAGE : HISTORICAL_IMAGE) : "");
+      const fullBytes = Buffer.byteLength(full, "utf8");
+      const part = { text: truncateToolText(full, fullBytes, TOOL_RESULT_MAX_BYTES) };
+      (isCurrent ? currentResults : historicalResults).push({ part, full, fullBytes, imageOnly });
       previous.userInputMessageContext.toolResults.push({
         toolUseId: message.toolCallId,
-        content: [{ text: content }],
+        content: [part],
         status: message.isError ? "error" : "success",
       });
     } else {
@@ -163,6 +254,8 @@ export function buildHttpRequest({
   if (!currentMessage?.userInputMessage || !["user", "toolResult"].includes(lastInput?.role))
     throw new KiroHttpError("Kiro HTTP turn must end with a user message or actual tool results.");
   const current = currentMessage.userInputMessage;
+  for (const user of historicalImageUsers) if (!user.content) user.content = HISTORICAL_IMAGE;
+  const imageOnlyCurrentUser = currentUserHasImages && !current.content;
   if (systemPrompt) {
     // GenerateAssistantResponse rejects the feature-gated top-level systemPrompt
     // for ordinary accounts. Preserve host instructions in supported user text,
@@ -170,6 +263,10 @@ export function buildHttpRequest({
     const firstInput = messages.find((message) => message.userInputMessage)?.userInputMessage ?? current;
     firstInput.content = `[System instructions]\n${systemPrompt}\n\n${firstInput.content}`;
   }
+  const historicalImageContent = imageOnlyCurrentUser ? current.content + HISTORICAL_IMAGE : undefined;
+  if (!current.content.trim() && !currentResults.length) current.content = CONTINUATION_PROMPT;
+  for (const image of toolImages) currentImages.push(image);
+  if (currentImages.length) current.images = currentImages;
   current.userInputMessageContext ??= {};
   const tools = (context.tools ?? []).map((tool) => ({
     toolSpecification: {
@@ -190,7 +287,7 @@ export function buildHttpRequest({
       },
     ];
   }
-  return {
+  const body = {
     ...(additionalModelRequestFields === undefined ? {} : { additionalModelRequestFields }),
     conversationState: {
       conversationId: conversationId(sessionId),
@@ -199,6 +296,13 @@ export function buildHttpRequest({
       currentMessage,
     },
   };
+  const prepared = { body, contextWindow, historicalResults, currentResults, historicalImageContent };
+  enforceRequestBudget(prepared);
+  return prepared;
+}
+
+export function buildHttpRequest(options) {
+  return prepareHttpRequest(options).body;
 }
 
 function safeMessage(value, auth) {
@@ -281,7 +385,40 @@ function runtimeRetryAfterMs(response, data) {
   return delays.length ? Math.max(...delays) : undefined;
 }
 
+async function httpResponseError(response, auth, signal) {
+  const status = response.status;
+  if (status === 413) {
+    void response.body?.cancel().catch(() => {});
+    return contextOverflow(undefined, { status });
+  }
+  let text = "";
+  let data;
+  try {
+    text = await abortableRequest(() => response.text(), signal);
+    data = JSON.parse(text);
+  } catch {
+    // Plain-text and empty responses carry no structured error metadata.
+  }
+  const code = data?.__type ?? data?.code ?? response.headers.get("x-amzn-errortype");
+  const message = data?.message ?? data?.Message;
+  const details = {
+    status,
+    code: safeMessage(code ?? "HttpError", auth),
+    reason: typeof data?.reason === "string" ? safeMessage(data.reason, auth) : undefined,
+  };
+  if (isOverflowRejection(code, data?.reason, text) ||
+    (typeof message === "string" && message.includes(INPUT_TOO_LONG))) {
+    // Do not include HTTP status or untrusted body text in OMP's overflow evidence.
+    return contextOverflow(undefined, details);
+  }
+  return new KiroHttpError(
+    `Kiro HTTP ${status}${code ? ` (${safeMessage(code, auth)})` : ""}: ${safeMessage(message, auth)}`,
+    { ...details, retryAfter: runtimeRetryAfterMs(response, data) },
+  );
+}
+
 function isTransientHttpError(error) {
+  if (error?.contextOverflow) return false;
   if (isTransientNetworkError(error)) return true;
   if (!(error instanceof KiroHttpError)) return false;
   if (isPermanentServiceError(error.code, error.message)) return false;
@@ -291,13 +428,23 @@ function isTransientHttpError(error) {
       .includes(error.code?.split("#").at(-1));
 }
 
-function continueHttpRequest(body, text) {
-  const state = body.conversationState;
+function continueHttpRequest(prepared, text) {
+  const state = prepared.body.conversationState;
   const current = state.currentMessage.userInputMessage;
-  // Move the accepted input/results once. Never copy prior toolResults into a
-  // continuation, and never manufacture tool uses from a failed response.
+  // Move accepted input/results once. Images and tool specifications belong
+  // only on the current turn; failed response tool calls never enter history.
+  const { toolResults, ...userInputMessageContext } = current.userInputMessageContext ?? {};
+  delete current.images;
+  if (prepared.historicalImageContent !== undefined) current.content = prepared.historicalImageContent;
+  if (toolResults) current.userInputMessageContext = { toolResults };
+  else delete current.userInputMessageContext;
   state.history.push(state.currentMessage, { assistantResponseMessage: { content: text } });
-  const { toolResults: _completed, ...userInputMessageContext } = current.userInputMessageContext ?? {};
+  for (const result of prepared.currentResults) {
+    if (result.imageOnly) result.part.text = HISTORICAL_IMAGE;
+    prepared.historicalResults.push(result);
+  }
+  prepared.currentResults = [];
+  prepared.historicalImageContent = undefined;
   state.currentMessage = {
     userInputMessage: {
       content: "Continue your response exactly where it stopped. Do not repeat already provided text or completed tools.",
@@ -306,6 +453,7 @@ function continueHttpRequest(body, text) {
       userInputMessageContext,
     },
   };
+  enforceRequestBudget(prepared);
 }
 
 export function createHttpTransport({
@@ -315,23 +463,28 @@ export function createHttpTransport({
   idleTimeoutMs,
 } = {}) {
   return async function runHttpTurn({
-    model, context, cwd, signal, onText = () => {}, onReasoning = () => {}, sessionId, retry: turnRetry,
+    model, context, contextWindow, cwd, signal, onText = () => {}, onReasoning = () => {}, sessionId, retry: turnRetry,
     onRestart, continuePartial = false, onRetry,
     modelRequestFieldsSchema, reasoning, disableReasoning, forceReasoningOff,
   }) {
     signal?.throwIfAborted();
-    const body = buildHttpRequest({
-      model, context, cwd, sessionId, modelRequestFieldsSchema, reasoning, disableReasoning, forceReasoningOff,
+    const prepared = prepareHttpRequest({
+      model, context, contextWindow, cwd, sessionId, modelRequestFieldsSchema, reasoning, disableReasoning, forceReasoningOff,
     });
+    const { body } = prepared;
     if (continuePartial && onRestart)
       throw new KiroHttpError("Choose committed-text continuation or provisional-text restart, not both.");
     const policy = turnRetry ?? retry;
     let auth = await authProvider({ signal, fetchImpl, retry: policy });
     signal?.throwIfAborted();
-    if (auth.profile_arn) body.profileArn = auth.profile_arn;
+    if (auth.kind !== "api-key" && auth.profile_arn) body.profileArn = auth.profile_arn;
     let requestBody = JSON.stringify(body);
+    const maxAttempts = retryPolicy(policy).maxAttempts ?? 0;
+    let attempt = 0;
     let attemptText = "";
     let attemptReasoned = false;
+    let attemptMetered = false;
+    let turnMetered = false;
     let upstreamModel;
     return retryOperation(async () => {
       // Refresh can itself wait through an outage; do it outside socket timeout.
@@ -341,6 +494,28 @@ export function createHttpTransport({
       const reasoningBlocks = [];
       let thinking;
       let usage;
+      const calls = new Map();
+      let stoppedCalls = 0;
+      let stopReason;
+      let outputEnded = false;
+      const finish = () => {
+        const toolCalls = [...calls.values()].map((call) => {
+          if (!call.stopped || !call.name)
+            throw new KiroHttpError("Kiro returned an incomplete tool call.");
+          return { type: "toolCall", id: call.id, name: call.name, arguments: call.arguments };
+        });
+        if (stopReason === "toolUse" && !toolCalls.length)
+          throw new KiroHttpError("Kiro reported TOOL_USE without a tool call.", { code: "InvalidToolStop" });
+        if (attemptMetered && !toolCalls.length && !attemptText.trim())
+          throw new KiroHttpError("Kiro returned no usable metered response.", { code: "EmptyMeteredResponse" });
+        endThinking();
+        return {
+          ...(toolCalls.length ? { toolCalls } : {}),
+          ...(usage ? { usage } : {}),
+          ...(upstreamModel ? { upstreamModel } : {}),
+          stopReason: toolCalls.length ? "toolUse" : stopReason ?? "stop",
+        };
+      };
       const endThinking = () => {
         if (!thinking) return;
         const block = thinking;
@@ -352,38 +527,11 @@ export function createHttpTransport({
         method: "POST",
         redirect: "error",
         signal: request.signal,
-        headers: {
-          authorization: `Bearer ${auth.access_token}`,
-          "content-type": "application/x-amz-json-1.0",
-          accept: "application/vnd.amazon.eventstream",
-          "x-amz-target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-          ...(auth.profile_arn ? { "x-amzn-kiro-profile-arn": auth.profile_arn } : {}),
-          "user-agent": "omp-kiro",
-        },
+        headers: kiroCliServiceHeaders("GenerateAssistantResponse", auth.access_token, { attempt: ++attempt, maxAttempts }),
         body: requestBody,
       }), request.signal);
       request.touch();
-      if (!response.ok) {
-        let error;
-        try {
-          error = await response.json();
-        } catch {
-          /* Status still identifies non-JSON errors. */
-        }
-        signal?.throwIfAborted();
-        const code = error?.__type ?? error?.code ?? response.headers.get("x-amzn-errortype");
-        throw new KiroHttpError(
-          `Kiro HTTP ${response.status}${code ? ` (${safeMessage(code, auth)})` : ""}: ${safeMessage(error?.message ?? error?.Message, auth)}`,
-          {
-            status: response.status,
-            code: safeMessage(code ?? "HttpError", auth),
-            reason: typeof error?.reason === "string" ? safeMessage(error.reason, auth) : undefined,
-            retryAfter: runtimeRetryAfterMs(response, error),
-          },
-        );
-      }
-      const calls = new Map();
-      let stopReason = "stop";
+      if (!response.ok) throw await httpResponseError(response, auth, request.signal);
       let seenEvent = false;
       for await (const { headers, data } of decodeEventStream(response.body, request.signal, request.touch)) {
         seenEvent = true;
@@ -393,9 +541,14 @@ export function createHttpTransport({
           // Exception frames name the union member (`:exception-type: error` is
           // InternalServerException, for example transient model overload).
           const type = headers[":exception-type"] ?? headers[":error-code"];
-          const code = STREAM_ERRORS.get(type ?? event) ?? type ?? "StreamError";
+          const code = STREAM_ERRORS.get(type ?? event) ?? type ?? data.code ?? data.__type ?? "StreamError";
+          const message = data.message ?? data.Message ?? headers[":error-message"];
+          if (isOverflowRejection(code, data.reason, JSON.stringify(data)) ||
+            (typeof message === "string" && message.includes(INPUT_TOO_LONG))) {
+            throw contextOverflow(undefined, { code: safeMessage(code, auth) });
+          }
           throw new KiroHttpError(
-            `Kiro ${safeMessage(code, auth)}: ${safeMessage(data.message ?? data.Message ?? headers[":error-message"], auth)}`,
+            `Kiro ${safeMessage(code, auth)}: ${safeMessage(message, auth)}`,
             {
               code: safeMessage(code, auth),
               reason: typeof data.reason === "string" ? safeMessage(data.reason, auth) : undefined,
@@ -408,6 +561,7 @@ export function createHttpTransport({
           if (typeof data.modelId === "string" && data.modelId && data.modelId !== model)
             upstreamModel = data.modelId;
           if (typeof data.content === "string" && data.content) {
+            outputEnded = false;
             endThinking();
             attemptText += data.content;
             onText(data.content);
@@ -417,6 +571,7 @@ export function createHttpTransport({
           if ([text, signature, redactedContent].some((value) => value != null && typeof value !== "string"))
             throw new KiroHttpError("Invalid Kiro reasoning event.");
           if (text) {
+            outputEnded = false;
             // A signature seals its phase; later text is a new phase, never re-signed.
             if (thinking && Object.hasOwn(thinking, "thinkingSignature")) endThinking();
             if (!thinking) {
@@ -431,6 +586,7 @@ export function createHttpTransport({
           // Native signatures are complete values: replace, never concatenate or display.
           if (signature && thinking) thinking.thinkingSignature = signature;
           if (redactedContent) {
+            outputEnded = false;
             endThinking();
             const block = { type: "redactedThinking", data: redactedContent };
             reasoningBlocks.push(block);
@@ -438,6 +594,7 @@ export function createHttpTransport({
             onReasoning({ type: "redacted", block });
           }
         } else if (event === "toolUseEvent") {
+          outputEnded = false;
           endThinking();
           // Tools stay buffered until this entire attempt decodes and validates.
           // Retrying here cannot repeat a tool execution in the host.
@@ -456,25 +613,39 @@ export function createHttpTransport({
               throw new KiroHttpError("Kiro changed a tool name during streaming.");
             call.name = data.name;
           }
-          if (data.input !== undefined) {
-            if (typeof data.input !== "string")
-              throw new KiroHttpError("Invalid Kiro tool argument fragment.");
-            call.input += data.input;
+          if (typeof data.input === "string") {
+            if (!call.snapshot) call.input += data.input;
+          } else if (data.input && typeof data.input === "object" && !Array.isArray(data.input)) {
+            call.snapshot = data.input;
+            call.input = "";
+          } else if (data.input !== undefined) {
+            throw new KiroHttpError("Invalid Kiro tool argument fragment.");
           }
-          if (data.stop) {
-            call.stopped = true;
-            if (!call.name) throw new KiroHttpError("Kiro returned an incomplete tool call.");
+          if (data.stop === true) {
+            if (typeof call.name !== "string" || !call.name)
+              throw new KiroHttpError("Kiro returned an incomplete tool call.");
             try {
-              call.arguments = JSON.parse(call.input || "{}");
+              call.arguments = call.snapshot ?? JSON.parse(call.input.trim() || "{}");
             } catch {
               throw new KiroHttpError("Kiro returned invalid JSON tool arguments.");
             }
             if (!call.arguments || typeof call.arguments !== "object" || Array.isArray(call.arguments))
               throw new KiroHttpError("Kiro tool arguments must be a JSON object.");
+            call.stopped = true;
+            stoppedCalls++;
           }
         } else if (event === "metadataEvent") {
           usage = reportedUsage(data.tokenUsage, usage);
+        } else if (event === "contextUsageEvent") {
+          const percentage = data.contextUsagePercentage;
+          if (Number.isFinite(contextWindow) && contextWindow > 0 &&
+            Number.isFinite(percentage) && percentage >= 0 && percentage <= 100) {
+            (usage ??= emptyUsage()).contextTokens = Math.round((percentage / 100) * contextWindow);
+          }
         } else if (event === "meteringEvent") {
+          // The event itself acknowledges billing, even if its units are unrecognized.
+          attemptMetered = true;
+          turnMetered = true;
           // Credits are not dollars or token counts. Unknown meter units stay unmapped.
           if (Number.isFinite(data.usage) && data.usage >= 0 &&
             typeof data.unit === "string" && /^credits?$/i.test(data.unit)) {
@@ -485,33 +656,36 @@ export function createHttpTransport({
             code: "UnsupportedServerToolResult",
           });
         } else if (event === "invalidStateEvent") {
+          if (isOverflowRejection(data.code, data.reason, JSON.stringify(data)))
+            throw contextOverflow(undefined, { code: "InvalidState" });
           throw new KiroHttpError(
             `Kiro invalid state: ${safeMessage(data.reason ?? data.message, auth)}`,
             { code: "InvalidState" },
           );
         }
-        if ((event === "metadataEvent" || event === "assistantResponseEvent") && data.stopReason !== undefined)
-          stopReason = reportedStop(data, auth);
+        if (event === "metadataEvent" || event === "initial-response" || event === "assistantResponseEvent") {
+          if (data.stopReason !== undefined) {
+            stopReason = reportedStop(data, auth);
+            outputEnded = true;
+          } else if (data.stopDetails?.refusal) {
+            reportedStop({ ...data, stopReason: "refusal" }, auth);
+          }
+        }
       }
       signal?.throwIfAborted();
       if (!seenEvent)
         throw new KiroHttpError("Kiro returned no response events.", { code: "EmptyResponse" });
-      const toolCalls = [...calls.values()].map((call) => {
-        if (!call.stopped || !call.name)
-          throw new KiroHttpError("Kiro returned an incomplete tool call.");
-        return { type: "toolCall", id: call.id, name: call.name, arguments: call.arguments };
-      });
-      if (stopReason === "toolUse" && !toolCalls.length)
-        throw new KiroHttpError("Kiro reported TOOL_USE without a tool call.", { code: "InvalidToolStop" });
-      endThinking();
-      return {
-        ...(toolCalls.length ? { toolCalls } : {}),
-        ...(usage ? { usage } : {}),
-        ...(upstreamModel ? { upstreamModel } : {}),
-        stopReason: toolCalls.length ? "toolUse" : stopReason,
-      };
+      return finish();
       } catch (error) {
-        if (error instanceof KiroHttpError) {
+        // Only a transport cut after an explicit, validated stop can count as
+        // complete. A paid but unfinished attempt may not release buffered tools.
+        if (attemptMetered && outputEnded && !signal?.aborted &&
+          (isTransientNetworkError(error) || error?.message === "Truncated AWS event stream") &&
+          stoppedCalls === calls.size &&
+          (calls.size ? stopReason === "toolUse" : stopReason !== "toolUse" && attemptText.trim())) {
+          return finish();
+        }
+        if (error instanceof Error && !signal?.aborted) {
           if (usage) error.usage = usage;
           if (upstreamModel) error.upstreamModel = upstreamModel;
         }
@@ -533,19 +707,30 @@ export function createHttpTransport({
       signal,
       retry: policy,
       shouldRetry(error) {
+        if (attemptMetered && !(continuePartial && attemptText.trim())) return false;
         if ((attemptText || attemptReasoned) && !continuePartial && typeof onRestart !== "function") return false;
         return isTransientHttpError(error);
       },
       async onRetry(info) {
         if (attemptText && continuePartial) {
-          continueHttpRequest(body, attemptText);
+          continueHttpRequest(prepared, attemptText);
           requestBody = JSON.stringify(body);
         } else if (onRestart) await onRestart(info);
         if (onRetry) await onRetry(info);
         signal?.throwIfAborted();
         attemptText = "";
         attemptReasoned = false;
+        attemptMetered = false;
       },
+    }).catch((error) => {
+      // The outer OMP retry loop must not replay this turn either, including
+      // when a distinct continuation failed after an earlier paid attempt.
+      if (turnMetered && !signal?.aborted) {
+        const billedError = error instanceof Error ? error : new KiroHttpError("Kiro did not finish the billed response.");
+        billedError.metered = true;
+        throw billedError;
+      }
+      throw error;
     });
   };
 }
@@ -566,26 +751,20 @@ export async function discoverHttpModels({
     signal?.throwIfAborted();
     const input = {
       origin: "KIRO_CLI",
-      ...(auth.profile_arn ? { profileArn: auth.profile_arn } : {}),
+      ...(auth.kind !== "api-key" && auth.profile_arn ? { profileArn: auth.profile_arn } : {}),
       ...(nextToken ? { nextToken } : {}),
     };
     const url = new URL(endpointFor(auth, "management"));
-    for (const [key, value] of Object.entries(input)) url.searchParams.set(key, value);
     const data = await fetchWithRetry(fetchImpl, url, {
       method: "POST",
       redirect: "error",
       signal,
-      headers: {
-        authorization: `Bearer ${auth.access_token}`,
-        "content-type": "application/x-amz-json-1.0",
-        "x-amz-target": "KiroControlPlaneBearerService.ListAvailableModels",
-      },
       body: JSON.stringify(input),
     }, {
       retry,
       async prepareRequest(init) {
         auth = await refreshExpiredKiroAuth(auth, { signal, fetchImpl, retry, authProvider });
-        return { ...init, headers: { ...init.headers, authorization: `Bearer ${auth.access_token}` } };
+        return { ...init, headers: kiroCliServiceHeaders("ListAvailableModels", auth.access_token) };
       },
       async consume(response) {
         if (!response.ok) {
@@ -611,6 +790,7 @@ export async function discoverHttpModels({
         name: model.modelName || model.modelId,
         ...(Number.isFinite(inputLimit) && inputLimit > 0 ? { contextWindow: inputLimit } : {}),
         ...(Number.isFinite(outputLimit) && outputLimit > 0 ? { maxTokens: outputLimit } : {}),
+        ...(Array.isArray(model.supportedInputTypes) ? { supportedInputTypes: model.supportedInputTypes } : {}),
         ...(schema == null ? {} : { additionalModelRequestFieldsSchema: schema }),
       });
     }

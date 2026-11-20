@@ -3,14 +3,20 @@ import {
   loadKiroAuth,
   queryKiroProfiles,
   readAuthSnapshot,
+  readKiroAuth,
   saveKiroAuth,
   saveProfileCatalog,
 } from "./auth.mjs";
 import { fetchKiroUsage, KiroUsageError } from "./usage.mjs";
+import { kiroProfileRegions } from "./wire.mjs";
 
 /** Every listing refreshes the store's saved catalog, which names its pinned model providers. */
 async function catalog(options) {
+  // A key has no profiles regardless of whether its API region has been
+  // resolved yet. Do not probe its region for a profile-only command.
+  if ((await readKiroAuth(options)).kind === "api-key") return { profiles: [], apiKey: true };
   const credential = await loadKiroAuth({ ...options, resolveProfile: false });
+  if (credential.kind === "api-key") return { profiles: [], apiKey: true };
   const profiles = await queryKiroProfiles(credential, options);
   await saveProfileCatalog(profiles, { authFile: options.authFile, credential, signal: options.signal });
   return { credential, profiles };
@@ -18,13 +24,14 @@ async function catalog(options) {
 
 /** Enumerate the complete assigned catalog without choosing a default profile. */
 export async function listKiroProfiles(options = {}) {
-  const { credential, profiles } = await catalog(options);
-  return { selectedArn: credential.profile_arn ?? null, profiles };
+  const { credential, profiles, apiKey } = await catalog(options);
+  return { selectedArn: credential?.profile_arn ?? null, profiles, ...(apiKey ? { apiKey } : {}) };
 }
 
 /** Compare quotas with an in-memory selection; refresh only the stored identity. */
 export async function fetchKiroProfileUsage(options = {}) {
-  let { credential, profiles } = await catalog(options);
+  let { credential, profiles, apiKey } = await catalog(options);
+  if (apiKey) return { selectedArn: null, profiles, apiKey };
   const selectedArn = credential.profile_arn ?? null;
   const reports = [];
   for (const profile of profiles) {
@@ -64,7 +71,9 @@ export async function selectKiroProfile(selector, options = {}) {
       new KiroAuthError("Provide an exact Kiro profile ARN or unique profile name."),
       { code: "invalid_profile" },
     );
-  const { credential, profiles } = await catalog(options);
+  const { credential, profiles, apiKey } = await catalog(options);
+  if (apiKey)
+    throw Object.assign(new KiroAuthError("Kiro API keys have no profiles."), { code: "api_key_no_profiles" });
   const exactArn = profiles.find((profile) => profile.arn === selector);
   const matches = exactArn ? [exactArn] : profiles.filter((profile) => profile.name === selector);
   if (!matches.length)
@@ -78,7 +87,7 @@ export async function selectKiroProfile(selector, options = {}) {
       { code: "ambiguous_profile" },
     );
   const selected = matches[0];
-  if (!["us-east-1", "eu-central-1"].includes(selected.region))
+  if (!kiroProfileRegions(credential).includes(selected.region))
     throw Object.assign(
       new KiroAuthError("Kiro HTTP does not support this profile region."),
       { code: "unsupported_profile_region" },

@@ -72,6 +72,9 @@ test("current management usage returns precise SDK balances without exposing ide
         assert.equal(init.redirect, "error");
         assert.equal(init.headers["x-amz-target"], "AmazonCodeWhispererService.GetUsageLimits");
         assert.equal(init.headers.authorization, `Bearer ${auth.access_token}`);
+        assert.equal(init.headers["x-amzn-codewhisperer-optout"], "true");
+        assert.match(init.headers["user-agent"], /md\/appVersion-3\.2\.0/);
+        assert.equal(init.headers["amz-sdk-request"], "attempt=1; max=3");
         assert.deepEqual(JSON.parse(init.body), {
           origin: "KIRO_CLI",
           resourceType: "AGENTIC_REQUEST",
@@ -388,6 +391,7 @@ test("invalid JSON and network exceptions never expose upstream text", async () 
 
 for (const [name, credential, code] of [
   ["expired", { ...auth, expires_at: "2026-10-24T00:00:00Z" }, "AUTH_EXPIRED"],
+  ["disabled", { ...auth, disabled: "invalid_grant" }, "AUTH_DISABLED"],
   ["missing expiry", { ...auth, expires_at: undefined }, "AUTH_INVALID"],
   ["missing token", { ...auth, access_token: "" }, "AUTH_INVALID"],
   [

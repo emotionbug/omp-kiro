@@ -2,15 +2,18 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { defaultFetch, fetchWithRetry, isPreconnectNetworkError, isTlsError, isTransientResponse } from "./network.mjs";
+import { KIRO_CLI_SOCIAL_HEADERS } from "./wire.mjs";
 
 const AUTH = "https://prod.us-east-1.auth.desktop.kiro.dev";
 const PORTAL = "https://app.kiro.dev/signin";
+const CLIENT_ID = "Kiro-CLI";
 const PROVIDERS = { google: "Google", github: "Github" };
 
 export class SocialLoginError extends Error {
-  constructor(message) {
+  constructor(message, code) {
     super(message);
     this.name = "SocialLoginError";
+    if (code) this.code = code;
   }
 }
 
@@ -65,7 +68,7 @@ async function post(path, body, { signal, fetchImpl, requestTimeoutMs, retry }) 
       method: "POST",
       redirect: "error",
       signal,
-      headers: { "content-type": "application/json", "user-agent": "omp-kiro" },
+      headers: KIRO_CLI_SOCIAL_HEADERS,
       body: JSON.stringify(body),
     }, {
       retry,
@@ -76,6 +79,14 @@ async function post(path, body, { signal, fetchImpl, requestTimeoutMs, retry }) 
       retryStatus: (status, response) => path === "/refreshToken" && (status === 429 || status === 503) &&
         isTransientResponse(status, response),
       async consume(response) {
+        if (path === "/refreshToken" && (response.status === 400 || response.status === 401)) {
+          // The status alone is definitive, even if there is no parseable body.
+          void response.body?.cancel().catch(() => {});
+          throw new SocialLoginError(
+            `Kiro credential refresh failed (HTTP ${response.status}); sign in again.`,
+            "login_expired",
+          );
+        }
         let result;
         try {
           result = await response.json();
@@ -142,7 +153,7 @@ export async function refreshSocial({
 } = {}) {
   providerName(credential?.provider);
   if (credential.kind !== "social" || !requiredString(credential.refresh_token))
-    throw fail("No social refresh credential is available; sign in again.");
+    throw new SocialLoginError("No social refresh credential is available; sign in again.", "invalid_credential");
   const { response, result } = await post(
     "/refreshToken",
     {
@@ -151,7 +162,7 @@ export async function refreshSocial({
     { signal, fetchImpl, requestTimeoutMs, retry },
   );
   if (!response.ok)
-    throw fail(`Kiro credential refresh failed (HTTP ${response.status}); sign in again.`);
+    throw fail(`Kiro credential refresh failed (HTTP ${response.status}).`);
   signal?.throwIfAborted();
   return credentials(result, credential.provider, now, credential);
 }
@@ -179,7 +190,7 @@ async function deviceLogin(options) {
   const { response, result } = await post(
     "/oauth/device/authorization",
     {
-      clientId: "kiro-cli",
+      clientId: CLIENT_ID,
       loginProvider: providerName(provider),
     },
     options,
@@ -220,7 +231,7 @@ async function deviceLogin(options) {
       const poll = await post(
         "/oauth/device/poll",
         {
-          clientId: "kiro-cli",
+          clientId: CLIENT_ID,
           deviceCode: result.deviceCode,
         },
         deviceOptions,

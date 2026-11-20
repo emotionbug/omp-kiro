@@ -1,17 +1,23 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   KiroAuthError,
   getKiroAuthStatus,
   importCliAuth,
   loadKiroAuth,
   logoutKiroAuth,
+  pinnedKiroAuth,
+  queryKiroProfiles,
   readAuthSnapshot,
   refreshExpiredKiroAuth,
   readKiroAuth,
+  resolveKiroApiKeyCredential,
   saveKiroAuth,
 } from "../server/auth.mjs";
 import { discoverHttpModels } from "../server/http.mjs";
@@ -45,6 +51,20 @@ async function fixture(t, record = original) {
     read: async () => JSON.parse(await readAuthSnapshot({ authFile })),
     replace: (value) => saveKiroAuth(value, { authFile }),
   };
+}
+
+async function withDatabase(authFile, operation) {
+  const db = await sqlite(authFile);
+  try {
+    return operation(db);
+  } finally {
+    db.close();
+  }
+}
+
+function leaseRow(authFile) {
+  return withDatabase(authFile, (db) =>
+    db.prepare("SELECT value FROM credentials WHERE id = ?").get("refresh_lease")?.value ?? null);
 }
 
 // No fixture contains a real account credential or contacts a real provider.
@@ -134,6 +154,93 @@ test("concurrent requests share one credential refresh", async (t) => {
   assert.equal(b.refresh_token, "fixture-new-refresh");
 });
 
+test("a refresh lease held by a different process is honored and cleaned up", { timeout: 10_000 }, async (t) => {
+  const f = await fixture(t);
+  const script = `
+    (async () => {
+      const { once } = await import("node:events");
+      const { loadKiroAuth } = await import(${JSON.stringify(new URL("../server/auth.mjs", import.meta.url).href)});
+      const value = await loadKiroAuth({
+        authFile: process.env.FIXTURE_AUTH_FILE, useEnv: false,
+        now: () => ${now()},
+        fetchImpl: async () => {
+          const release = once(process.stdin, "data");
+          process.stdout.write("holding");
+          await release;
+          process.stdin.pause();
+          return Response.json({ accessToken: "child-access", refreshToken: "child-refresh", expiresIn: 3600 });
+        },
+      });
+      if (value.refresh_token !== "child-refresh") process.exitCode = 1;
+    })().catch(error => { console.error(error); process.exitCode = 1; });
+  `;
+  const child = spawn(process.execPath, ["-e", script], {
+    env: { ...process.env, FIXTURE_AUTH_FILE: f.authFile },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const exit = once(child, "exit");
+  t.after(() => child.kill());
+  let errors = "";
+  child.stderr.on("data", (chunk) => { errors += chunk; });
+  const [message] = await once(child.stdout, "data", { signal: AbortSignal.timeout(5000) });
+  assert.equal(message.toString(), "holding");
+  const held = JSON.parse(await leaseRow(f.authFile));
+  assert.equal(typeof held.owner, "string");
+  assert.ok(held.expiresAt > Date.now() && held.expiresAt <= Date.now() + 30_000);
+
+  let localRequests = 0;
+  const contender = loadKiroAuth({
+    authFile: f.authFile, now,
+    fetchImpl: async () => {
+      localRequests++;
+      assert.fail("contender must not spend the child's rotating token");
+    },
+  });
+  const earlyCompletion = contender.then(() => "finished", () => "rejected");
+  assert.equal(await Promise.race([earlyCompletion, delay(120, "waiting")]), "waiting");
+  assert.equal(JSON.parse(await leaseRow(f.authFile)).owner, held.owner);
+  child.stdin.end("release");
+  const [[code], token] = await Promise.all([exit, contender]);
+  assert.equal(code, 0, errors);
+  assert.equal(localRequests, 0);
+  assert.equal(token.refresh_token, "child-refresh");
+  assert.deepEqual(await f.read(), token);
+  assert.equal(await leaseRow(f.authFile), null);
+});
+
+test("an expired lease can be taken over, and a failed exchange releases it", async (t) => {
+  const f = await fixture(t);
+  await withDatabase(f.authFile, (db) => db.prepare("INSERT INTO credentials (id, value) VALUES (?, ?)")
+    .run("refresh_lease", JSON.stringify({ owner: "stale-owner", expiresAt: Date.now() - 1 })));
+  let owner;
+  await assert.rejects(loadKiroAuth({
+    authFile: f.authFile, now,
+    fetchImpl: async () => {
+      owner = JSON.parse(await leaseRow(f.authFile)).owner;
+      return Response.json({ error: "temporarily_unavailable" }, { status: 502 });
+    },
+  }), /HTTP 502/);
+  assert.notEqual(owner, "stale-owner");
+  assert.equal(typeof owner, "string");
+  assert.equal(await leaseRow(f.authFile), null);
+  assert.deepEqual(await f.read(), original);
+});
+
+test("an old lease owner cannot commit a refresh or remove a different owner's lease", async (t) => {
+  const f = await fixture(t);
+  const nextOwner = JSON.stringify({ owner: "other-process", expiresAt: Date.now() + 30_000 });
+  await assert.rejects(loadKiroAuth({
+    authFile: f.authFile, now,
+    fetchImpl: async () => {
+      await withDatabase(f.authFile, (db) => db.prepare("UPDATE credentials SET value = ? WHERE id = ?")
+        .run(nextOwner, "refresh_lease"));
+      return Response.json({ accessToken: "stale-result", expiresIn: 3600 });
+    },
+  }), { code: "credential_changed" });
+  assert.deepEqual(await f.read(), original);
+  assert.equal(await leaseRow(f.authFile), nextOwner);
+});
+
 test("refresh cannot overwrite a concurrent independent login", async (t) => {
   const f = await fixture(t);
   const replacement = {
@@ -205,17 +312,87 @@ test("missing managed login fails locally without silently using CLI credentials
   assert.equal((await getKiroAuthStatus({ authFile: f.authFile })).loggedIn, false);
 });
 
-test("refresh rejection does not expose token values or damage the stored login", async (t) => {
+test("definitive social rejection CAS-disables the grant without exposing tokens", async (t) => {
   const f = await fixture(t);
-  await assert.rejects(
-    loadKiroAuth({
-      authFile: f.authFile,
-      now,
-      fetchImpl: async () => Response.json({ message: original.refresh_token }, { status: 401 }),
-    }),
-    (error) => !error.message.includes(original.refresh_token),
-  );
-  assert.deepEqual(await f.read(), original);
+  let calls = 0;
+  const options = {
+    authFile: f.authFile, now,
+    fetchImpl: async () => {
+      calls++;
+      return new Response(original.refresh_token, { status: 401 });
+    },
+  };
+  for (const access of [() => loadKiroAuth(options), () => readKiroAuth(options), () => loadKiroAuth(options)]) {
+    await assert.rejects(access(), (error) => {
+      assert.equal(error.code, "credential_disabled");
+      assert.match(error.message, /sign in again/);
+      assert.ok(!error.message.includes(original.refresh_token));
+      return true;
+    });
+  }
+  assert.equal(calls, 1);
+  assert.deepEqual(await f.read(), { ...original, disabled: "login_expired" });
+  assert.equal(await leaseRow(f.authFile), null);
+  const status = await getKiroAuthStatus(options);
+  assert.equal(status.loggedIn, true);
+  assert.equal(status.refreshable, false);
+  assert.equal(status.disabled, "login_expired");
+  assert.ok(!JSON.stringify(status).includes(original.access_token));
+  assert.ok(!JSON.stringify(status).includes(original.refresh_token));
+
+  const replacement = { ...original, access_token: "new-login", expires_at: "2026-02-01T00:00:00Z" };
+  await saveKiroAuth(replacement, {
+    authFile: f.authFile, expectedRaw: await readAuthSnapshot(options), replacesLogin: true,
+  });
+  assert.deepEqual(await readKiroAuth(options), replacement);
+  assert.equal((await getKiroAuthStatus(options)).disabled, undefined);
+});
+
+test("terminal refresh cannot disable a newer login", async (t) => {
+  const f = await fixture(t);
+  const replacement = { ...original, access_token: "new-login", expires_at: "2026-02-01T00:00:00Z" };
+  await assert.rejects(loadKiroAuth({
+    authFile: f.authFile, now,
+    fetchImpl: async () => {
+      await f.replace(replacement);
+      return Response.json({ error: "invalid_grant" }, { status: 400 });
+    },
+  }), { code: "credential_changed" });
+  assert.deepEqual(await f.read(), replacement);
+  assert.equal(await leaseRow(f.authFile), null);
+});
+
+test("expired OAuth grants with missing refresh state are disabled without network", async (t) => {
+  for (const [record, reason] of [
+    [{ ...original, refresh_token: undefined }, "missing_refresh_state"],
+    [{ ...unresolvedOidc(), client_secret: undefined, expires_at: original.expires_at }, "invalid_credential"],
+  ]) {
+    const f = await fixture(t, record);
+    let calls = 0;
+    await assert.rejects(loadKiroAuth({
+      authFile: f.authFile, now,
+      fetchImpl: async () => { calls++; return Response.json({}); },
+    }), { code: "credential_disabled" });
+    assert.equal(calls, 0);
+    assert.equal((await f.read()).disabled, reason);
+  }
+});
+
+test("an OIDC modeled grant rejection disables the login, but an unknown HTTP 400 does not", async (t) => {
+  for (const [body, reason] of [
+    [{ error: "unknown_failure" }, undefined],
+    [{ __type: "com.amazonaws.ssooidc#ExpiredTokenException" }, "login_expired"],
+    [{ error: "InvalidGrantException" }, "login_expired"],
+    [{ error: "invalid_client" }, "registration_expired"],
+  ]) {
+    const f = await fixture(t, { ...unresolvedOidc(), expires_at: original.expires_at });
+    await assert.rejects(loadKiroAuth({
+      authFile: f.authFile, now,
+      fetchImpl: async () => Response.json(body, { status: 400 }),
+    }), { code: reason ? "credential_disabled" : "request_failed" });
+    assert.equal((await f.read()).disabled, reason);
+    assert.equal(await leaseRow(f.authFile), null);
+  }
 });
 
 test("invalid refresh responses leave the current record untouched", async (t) => {
@@ -370,8 +547,10 @@ test("IAM model discovery resolves and persists its Kiro profile independently o
   const fetchImpl = async (url, request) => {
     if (request.headers["x-amz-target"].endsWith(".ListAvailableProfiles")) {
       profileCalls++;
-      assert.equal(url, "https://management.us-east-1.kiro.dev/");
-      return Response.json({ profiles: [{ arn: assignedProfile, profileName: "Team" }] });
+      assert.equal(request.headers["x-amz-target"], "AmazonCodeWhispererService.ListAvailableProfiles");
+      assert.deepEqual(JSON.parse(request.body), {});
+      return Response.json({ profiles: url === "https://management.us-east-1.kiro.dev/"
+        ? [{ arn: assignedProfile, profileName: "Team" }] : [] });
     }
     const input = JSON.parse(request.body);
     if (input.profileArn !== assignedProfile)
@@ -384,7 +563,7 @@ test("IAM model discovery resolves and persists its Kiro profile independently o
   const options = { fetchImpl, authProvider };
   assert.deepEqual((await discoverHttpModels(options)).map((m) => m.id), ["auto", "claude-opus-5.5"]);
   assert.deepEqual((await discoverHttpModels(options)).map((m) => m.id), ["auto", "claude-opus-5.5"]);
-  assert.equal(profileCalls, 1);
+  assert.equal(profileCalls, 2);
   assert.deepEqual(await f.read(), { ...unresolvedOidc(), profile_arn: assignedProfile });
 });
 
@@ -406,7 +585,7 @@ test("parallel metadata requests share one initial profile lookup", async (t) =>
   const second = loadKiroAuth(options);
   release.resolve();
   const values = await Promise.all([first, second]);
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
   assert.deepEqual(values[0], values[1]);
   assert.equal(values[0].profile_arn, assignedProfile);
 });
@@ -417,7 +596,8 @@ test("an identical profile commit from another process is accepted without repla
   const f = await fixture(t, credential);
   const result = await loadKiroAuth({
     authFile: f.authFile, now,
-    fetchImpl: async () => {
+    fetchImpl: async (url) => {
+      if (url !== "https://management.us-east-1.kiro.dev/") return Response.json({ profiles: [] });
       await f.replace(resolved);
       return Response.json({ profiles: [{ arn: assignedProfile }] });
     },
@@ -432,7 +612,8 @@ test("profile lookup cannot overwrite an independent login or resurrect a logout
     const replacement = { ...unresolvedOidc(), access_token: "independent-login" };
     await assert.rejects(loadKiroAuth({
       authFile: f.authFile, now,
-      fetchImpl: async () => {
+      fetchImpl: async (url) => {
+        if (url !== "https://management.us-east-1.kiro.dev/") return Response.json({ profiles: [] });
         if (logout) await logoutKiroAuth({ authFile: f.authFile });
         else await f.replace(replacement);
         return Response.json({ profiles: [{ arn: assignedProfile }] });
@@ -493,4 +674,189 @@ test("failed profile resolution retains a successfully rotated OIDC refresh cred
   assert.equal(saved.access_token, "rotated-access");
   assert.equal(saved.refresh_token, "rotated-refresh");
   assert.equal(saved.profile_arn, undefined);
+});
+
+test("API-key region uses explicit, environment, or one pass across commercial candidates", async () => {
+  const key = "ksk_fixture-api-key";
+  const noNetwork = async () => assert.fail("a known region should not need a probe");
+  assert.deepEqual(await resolveKiroApiKeyCredential(` ${key} `, {
+    region: "us-gov-east-1", env: { KIRO_API_REGION: "eu-central-1" }, fetchImpl: noNetwork,
+  }), { kind: "api-key", provider: "api-key", access_token: key, region: "us-gov-east-1" });
+  assert.equal((await resolveKiroApiKeyCredential(key, {
+    env: { KIRO_API_REGION: "eu-central-1" }, fetchImpl: noNetwork,
+  })).region, "eu-central-1");
+
+  const targets = [];
+  const resolved = await resolveKiroApiKeyCredential(key, {
+    env: {},
+    fetchImpl: async (url, request) => {
+      targets.push(url);
+      assert.equal(request.redirect, "error");
+      assert.equal(request.headers.authorization, `Bearer ${key}`);
+      assert.equal(request.headers.tokentype, "API_KEY");
+      assert.equal(request.headers["x-amz-target"], "KiroControlPlaneBearerService.ListAvailableModels");
+      assert.equal(request.headers["amz-sdk-request"], "attempt=1; max=1");
+      assert.deepEqual(JSON.parse(request.body), { origin: "KIRO_CLI" });
+      if (url.includes("eu-central-1")) return Response.json({ models: [] });
+      return new Response(key, { status: 503 });
+    },
+  });
+  assert.deepEqual(targets.sort(), ["https://management.eu-central-1.kiro.dev/", "https://management.us-east-1.kiro.dev/"]);
+  assert.equal(resolved.region, "eu-central-1");
+});
+
+test("API-key probes reject ambiguity, redact transport errors, and observe cancellation", async () => {
+  const key = "ksk_fixture-secret";
+  for (const fetchImpl of [async () => Response.json({ models: [] }), async () => { throw new Error(key); }]) {
+    await assert.rejects(resolveKiroApiKeyCredential(key, { env: {}, fetchImpl }), (error) => {
+      assert.match(error.message, /set KIRO_API_REGION/);
+      assert.ok(!error.message.includes(key));
+      assert.equal(error.cause, undefined);
+      return error instanceof KiroAuthError;
+    });
+  }
+  await assert.rejects(resolveKiroApiKeyCredential(key, { region: `${key}.invalid`, env: {} }), (error) =>
+    /valid AWS region/.test(error.message) && !error.message.includes(key));
+  await assert.rejects(resolveKiroApiKeyCredential("fixture-not-a-key", { env: {} }), /ksk_/);
+  const started = Promise.withResolvers();
+  const controller = new AbortController();
+  const pending = resolveKiroApiKeyCredential(key, {
+    env: {}, signal: controller.signal,
+    fetchImpl: () => {
+      started.resolve();
+      return new Promise(() => {});
+    },
+  });
+  await started.promise;
+  const reason = new Error("canceled probe");
+  controller.abort(reason);
+  await assert.rejects(pending, (error) => error === reason);
+});
+
+test("API-key env override is local for read/status; load probes without mutating the saved login", async (t) => {
+  const key = "ksk_fixture-environment";
+  const env = { KIRO_API_KEY: key };
+  const record = { kind: "api-key", provider: "api-key", access_token: key };
+  assert.deepEqual(await readKiroAuth({ env }), record);
+  const defaultStatus = await getKiroAuthStatus({ env });
+  assert.equal(defaultStatus.kind, "api-key");
+  assert.equal(defaultStatus.expiresAt, undefined);
+  assert.equal(defaultStatus.expired, false);
+  assert.equal(defaultStatus.refreshable, false);
+  assert.ok(!JSON.stringify(defaultStatus).includes(key));
+
+  const f = await fixture(t);
+  const explicit = { authFile: f.authFile, env };
+  assert.deepEqual(await readKiroAuth(explicit), original);
+  assert.equal((await getKiroAuthStatus(explicit)).kind, "social");
+  const options = { ...explicit, useEnv: true };
+  assert.deepEqual(await readKiroAuth(options), record);
+  assert.equal((await getKiroAuthStatus(options)).kind, "api-key");
+  let probes = 0;
+  const fetchImpl = async (url) => {
+    probes++;
+    return url.includes("us-east-1") ? Response.json({ models: [] }) : new Response(null, { status: 403 });
+  };
+  const resolved = { ...record, region: "us-east-1" };
+  assert.deepEqual(await loadKiroAuth({ ...options, fetchImpl }), resolved);
+  assert.equal(probes, 2);
+  assert.deepEqual(await f.read(), original);
+});
+
+test("profile-free pin selects only API keys and preserves key identity during recovery", async (t) => {
+  const key = { kind: "api-key", provider: "api-key", access_token: "ksk_fixture", region: "eu-central-1" };
+  const f = await fixture(t, key);
+  const pinned = pinnedKiroAuth({ authFile: f.authFile, useEnv: false, profileArn: undefined });
+  const fetchImpl = async () => assert.fail("a stored API key has no expiry or profile lookup");
+  assert.deepEqual(await pinned({ fetchImpl }), key);
+  assert.deepEqual(await refreshExpiredKiroAuth(key, { fetchImpl }), key);
+  assert.equal((await getKiroAuthStatus({ authFile: f.authFile, now })).expired, false);
+  await assert.rejects(queryKiroProfiles(key, { fetchImpl }), /API keys do not use profiles/);
+  await assert.rejects(f.replace({ ...key, region: undefined }), /Invalid stored Kiro API key/);
+  await assert.rejects(f.replace({ ...key, profile_arn: assignedProfile }), /Invalid stored Kiro API key/);
+  await assert.rejects(f.replace({ ...key, expires_at: original.expires_at }), /Invalid stored Kiro API key/);
+
+  const envPinned = pinnedKiroAuth({ authFile: f.authFile, useEnv: true, profileArn: undefined });
+  assert.deepEqual(await envPinned({
+    fetchImpl, env: { KIRO_API_KEY: "ksk_fixture-env", KIRO_API_REGION: "us-east-1" },
+  }), { ...key, access_token: "ksk_fixture-env", region: "us-east-1" });
+  await f.replace({ ...key, access_token: "ksk_fixture-replacement" });
+  await assert.rejects(pinned({ fetchImpl, expectedCredential: key }), /login or region changed/);
+  await f.replace(original);
+  await assert.rejects(pinned({ fetchImpl }), /login or region changed/);
+});
+
+test("GovCloud Identity Center discovers only GovCloud profiles and preserves the selected ARN", async (t) => {
+  const credential = { ...unresolvedOidc(), region: "us-gov-west-1" };
+  const arn = "arn:aws-us-gov:codewhisperer:us-gov-east-1:123456789012:profile/team";
+  const f = await fixture(t, credential);
+  const urls = [];
+  const result = await loadKiroAuth({
+    authFile: f.authFile, now,
+    fetchImpl: async (url, request) => {
+      urls.push(url);
+      assert.equal(request.headers["x-amz-target"], "AmazonCodeWhispererService.ListAvailableProfiles");
+      assert.equal(request.headers.authorization, `Bearer ${credential.access_token}`);
+      assert.deepEqual(JSON.parse(request.body), {});
+      return Response.json({ profiles: url.includes("us-gov-east-1") ? [{ arn, profileName: "Gov team" }] : [] });
+    },
+  });
+  assert.deepEqual(urls.sort(), ["https://management.us-gov-east-1.kiro.dev/", "https://management.us-gov-west-1.kiro.dev/"]);
+  assert.deepEqual(result, { ...credential, profile_arn: arn });
+  assert.deepEqual(await f.read(), result);
+  const pin = pinnedKiroAuth({ authFile: f.authFile, profileArn: arn });
+  assert.deepEqual(await pin({ now, fetchImpl: async () => assert.fail("valid cached profile needs no lookup") }), result);
+});
+
+test("cached and listed profiles cannot cross the OAuth partition or use unsupported regions", async (t) => {
+  const scenarios = [
+    [unresolvedOidc(), "arn:aws-us-gov:codewhisperer:us-gov-east-1:123456789012:profile/team"],
+    [{ ...unresolvedOidc(), region: "us-gov-west-1" }, assignedProfile],
+    [{ ...unresolvedOidc(), region: "us-gov-west-1" }, "arn:aws:codewhisperer:us-gov-east-1:123456789012:profile/team"],
+    [unresolvedOidc(), "arn:aws:codewhisperer:cn-north-1:123456789012:profile/team"],
+    [original, "arn:aws-us-gov:codewhisperer:us-gov-west-1:123456789012:profile/team"],
+  ];
+  for (const [credential, arn] of scenarios) {
+    const f = await fixture(t, credential);
+    await assert.rejects(queryKiroProfiles(credential, {
+      fetchImpl: async () => Response.json({ profiles: [{ arn }] }),
+    }), /profile ARN or region/);
+    const malformed = { ...credential, profile_arn: arn };
+    await assert.rejects(f.replace(malformed), /profile ARN or region/);
+    await withDatabase(f.authFile, (db) => db.prepare("UPDATE credentials SET value = ? WHERE id = ?")
+      .run(JSON.stringify(malformed), "active"));
+    await assert.rejects(readKiroAuth({ authFile: f.authFile }), /profile ARN or region/);
+    let calls = 0;
+    await assert.rejects(loadKiroAuth({
+      authFile: f.authFile, now,
+      fetchImpl: async () => { calls++; return Response.json({}); },
+    }), /profile ARN or region/);
+    assert.equal(calls, 0);
+  }
+});
+
+test("same-partition profiles outside supported service regions can be listed but not selected", async (t) => {
+  const credential = unresolvedOidc();
+  const arn = "arn:aws:codewhisperer:ap-southeast-2:123456789012:profile/team";
+  const f = await fixture(t, credential);
+  const fetchImpl = async () => Response.json({ profiles: [{ arn, profileName: "Other region" }] });
+  assert.deepEqual(await queryKiroProfiles(credential, { fetchImpl }), [
+    { arn, name: "Other region", region: "ap-southeast-2", accountId: "123456789012" },
+  ]);
+  await assert.rejects(loadKiroAuth({ authFile: f.authFile, now, fetchImpl }), /profile ARN or region/);
+  await assert.rejects(f.replace({ ...credential, profile_arn: arn }), /profile ARN or region/);
+  assert.deepEqual(await f.read(), credential);
+});
+
+test("replay preparation cannot use a disabled bearer from an injected reader", async () => {
+  const disabled = { ...original, expires_at: "2026-02-01T00:00:00Z", disabled: "login_expired" };
+  let reloads = 0;
+  const authProvider = async () => {
+    reloads++;
+    return disabled;
+  };
+  await assert.rejects(refreshExpiredKiroAuth(disabled, { now, authProvider }), { code: "credential_disabled" });
+  assert.equal(reloads, 0);
+  await assert.rejects(refreshExpiredKiroAuth(original, { now, authProvider }), { code: "credential_disabled" });
+  assert.equal(reloads, 1);
 });

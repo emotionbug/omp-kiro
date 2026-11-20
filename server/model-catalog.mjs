@@ -15,6 +15,13 @@ function invalid(reason) {
 
 /** Stable account binding; the digest never includes tokens when a profile ARN exists. */
 export function kiroCatalogAccountId(auth) {
+  if (auth?.kind === "api-key" && auth.provider === "api-key") {
+    if (typeof auth.access_token !== "string" || !auth.access_token.startsWith("ksk_"))
+      throw invalid("has no managed account binding");
+    return createHash("sha256")
+      .update(JSON.stringify([auth.kind, auth.region ?? null, auth.access_token]))
+      .digest("hex");
+  }
   const social = auth?.kind === "social" && ["google", "github"].includes(auth.provider);
   const oidc = auth?.kind === "oidc" && ["builder-id", "identity-center"].includes(auth.provider);
   if (!social && !oidc) throw invalid("has no supported managed account identity");
@@ -76,8 +83,10 @@ export async function readKiroModelCatalog(file, { auth } = {}) {
   const ids = new Set();
   for (const model of data.models) {
     if (
-      !record(model) || !onlyKeys(model, ["id", "name", "contextWindow", "maxTokens", "additionalModelRequestFieldsSchema"]) ||
+      !record(model) || !onlyKeys(model, ["id", "name", "contextWindow", "maxTokens", "additionalModelRequestFieldsSchema", "supportedInputTypes"]) ||
       !nonempty(model.id) || !nonempty(model.name) || ids.has(model.id) ||
+      (model.supportedInputTypes !== undefined && (!Array.isArray(model.supportedInputTypes) ||
+        !model.supportedInputTypes.every(nonempty))) ||
       ["contextWindow", "maxTokens"].some((key) =>
         Object.hasOwn(model, key) && (!Number.isSafeInteger(model[key]) || model[key] <= 0))
     ) throw invalid("contains invalid or duplicate model metadata");

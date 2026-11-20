@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { loadKiroAuth, refreshExpiredKiroAuth } from "./auth.mjs";
-import { endpointFor } from "./http.mjs";
-import { defaultFetch, fetchWithRetry, isTlsError } from "./network.mjs";
+import { defaultFetch, fetchWithRetry, isTlsError, retryPolicy } from "./network.mjs";
+import { kiroCliWebHeaders, kiroEndpoint } from "./wire.mjs";
 
 const MAX_RESPONSE = 1024 * 1024;
 export class KiroWebError extends Error {
@@ -48,24 +48,19 @@ export function createKiroWebClient({
     let auth = await authProvider({ signal, fetchImpl, retry });
     const id = randomUUID();
     const body = JSON.stringify({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) });
+    let attempt = 0;
+    const maxAttempts = retryPolicy(retry).maxAttempts ?? 0;
     try {
-      const payload = await fetchWithRetry(fetchImpl, new URL("mcp", endpointFor(auth)), {
+      const payload = await fetchWithRetry(fetchImpl, new URL("mcp", kiroEndpoint(auth)), {
         method: "POST",
         redirect: "error",
         signal,
-        headers: {
-          authorization: `Bearer ${auth.access_token}`,
-          "content-type": "application/json",
-          accept: "application/json",
-          "user-agent": "omp-kiro",
-          ...(auth.profile_arn ? { "x-amzn-kiro-profile-arn": auth.profile_arn } : {}),
-        },
         body,
       }, {
         retry,
         async prepareRequest(init) {
           auth = await refreshExpiredKiroAuth(auth, { signal, fetchImpl, retry, authProvider });
-          return { ...init, headers: { ...init.headers, authorization: `Bearer ${auth.access_token}` } };
+          return { ...init, headers: kiroCliWebHeaders(auth, { attempt: ++attempt, maxAttempts }) };
         },
         async consume(response, touch) {
           if (!response.ok) {
@@ -87,6 +82,7 @@ export function createKiroWebClient({
     } catch (error) {
       signal?.throwIfAborted();
       if (error instanceof KiroWebError) throw error;
+      if (error?.code === "credential_disabled") throw error;
       if (isTlsError(error))
         throw new KiroWebError("Kiro TLS certificate verification failed; check the approved CA configuration.", { code: "TLS_ERROR" });
       throw new KiroWebError("Kiro web service request failed; check approved connectivity and account configuration.", { code: "NETWORK_ERROR" });

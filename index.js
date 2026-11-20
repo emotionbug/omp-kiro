@@ -5,9 +5,12 @@ import { registerKiroCommands } from "./server/commands.mjs";
 import { abortableRequest, isTransientNetworkError, isTlsError } from "./server/network.mjs";
 import { registerKiroWebSearch } from "./server/web.mjs";
 import { pinnedKiroAuth, readKiroAuth } from "./server/auth.mjs";
-import { kiroTargets, listKiroAccounts, pinnedKiroTargets } from "./server/accounts.mjs";
+import { DEFAULT_ACCOUNT, kiroTargets, listKiroAccounts, pinnedKiroTargets } from "./server/accounts.mjs";
 import { kiroCatalogAccountId, readKiroModelCatalog } from "./server/model-catalog.mjs";
 import { kiroThinkingConfig } from "./server/effort.mjs";
+
+const unavailableAccount = () =>
+  new Error("This Kiro account profile is no longer usable. Sign in again or choose another Kiro model; no replacement model was selected.");
 
 function streamKiro(model, context, options = {}, transport, route) {
   const stream = new AssistantMessageEventStream();
@@ -50,8 +53,7 @@ function streamKiro(model, context, options = {}, transport, route) {
     stream.push({ type: "start", partial: message });
     try {
       options.signal?.throwIfAborted();
-      if (!route)
-        throw new Error("This Kiro account profile is no longer signed in. Choose another Kiro model; no replacement model was selected.");
+      if (!route) throw unavailableAccount();
       const modelRequestFieldsSchema = transport === "http"
         ? await route.resolveModelSchema(model.id, options.signal)
         : undefined;
@@ -68,6 +70,7 @@ function streamKiro(model, context, options = {}, transport, route) {
         signal: options.signal,
         sessionId: options.sessionId,
         ...(transport === "http" ? {
+          contextWindow: model.contextWindow,
           continuePartial: true,
           modelRequestFieldsSchema,
           reasoning: useMinimumEffort ? thinkingConfig.efforts[0] : options.reasoning,
@@ -131,23 +134,31 @@ function streamKiro(model, context, options = {}, transport, route) {
       endText();
       endThinking();
       message.stopReason = options.signal?.aborted ? "aborted" : "error";
+      const billedFailure = transport === "http" && message.stopReason === "error" &&
+        error?.metered && !error.contextOverflow;
       if (transport === "http") {
         if (error?.stopDetails) message.stopDetails = error.stopDetails;
         if (error?.usage) message.usage = error.usage;
         if (error?.upstreamModel) message.upstreamModel = error.upstreamModel;
-        if (Number.isFinite(error?.status)) message.errorStatus = error.status;
+        // Both OMP 18.22.1 and upstream classify "prompt is too long" as
+        // context overflow, but an HTTP 429 status vetoes that text evidence.
+        if (!error?.contextOverflow && !billedFailure && Number.isFinite(error?.status))
+          message.errorStatus = error.status;
       }
-      // Transient HTTP recovery/committed-text continuation stays inside the
-      // transport. Terminal errors remain sanitized for the host.
-      message.errorMessage =
-        transport === "http" && !options.signal?.aborted && isTransientNetworkError(error)
-          ? "Kiro HTTP network error: The socket connection was closed unexpectedly before the response completed."
-          : transport === "http" && isTlsError(error)
-            ? "Kiro TLS certificate verification failed; check the approved CA configuration."
-            : error instanceof Error
-              ? error.message
-              : String(error);
-      if (transport === "http" && Number.isFinite(error?.retryAfterMs) && error.retryAfterMs >= 0)
+      // OMP treats socket/HTTP failures as replayable. Do not relay any
+      // retry evidence for a billed failure; explicit overflows can compact.
+      if (error?.contextOverflow)
+        message.errorMessage = error.message;
+      else if (billedFailure)
+        message.errorMessage = "Kiro did not finish the billed response. It was not replayed.";
+      else if (transport === "http" && !options.signal?.aborted && isTransientNetworkError(error))
+        message.errorMessage = "Kiro HTTP network error: The socket connection was closed unexpectedly before the response completed.";
+      else if (transport === "http" && isTlsError(error))
+        message.errorMessage = "Kiro TLS certificate verification failed; check the approved CA configuration.";
+      else
+        message.errorMessage = error instanceof Error ? error.message : String(error);
+      if (transport === "http" && !billedFailure && !error?.contextOverflow &&
+          Number.isFinite(error?.retryAfterMs) && error.retryAfterMs >= 0)
         message.errorMessage += ` retry-after-ms=${Math.ceil(error.retryAfterMs)}`;
       stream.push({ type: "error", reason: message.stopReason, error: message });
     } finally {
@@ -159,14 +170,14 @@ function streamKiro(model, context, options = {}, transport, route) {
 }
 
 function providerModels(models, transport, label) {
-  return models.map(({ id, name, contextWindow, maxTokens, additionalModelRequestFieldsSchema }) => {
+  return models.map(({ id, name, contextWindow, maxTokens, additionalModelRequestFieldsSchema, supportedInputTypes }) => {
     const thinking = transport === "http" ? kiroThinkingConfig(additionalModelRequestFieldsSchema) : undefined;
     return {
       id,
       name: `Kiro · ${label ? `${label} · ` : ""}${name}`,
       reasoning: Boolean(thinking),
       ...(thinking ? { thinking } : {}),
-      input: ["text"],
+      input: transport === "http" && supportedInputTypes?.includes("IMAGE") ? ["text", "image"] : ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       // ACP omits numeric limits; HTTP uses advertised limits when supplied.
       contextWindow: contextWindow ?? 128000,
@@ -177,7 +188,11 @@ function providerModels(models, transport, label) {
 
 /** One account profile with its own auth, model catalog and native schemas. */
 function pinnedProvider(target) {
-  const authProvider = pinnedKiroAuth({ authFile: target.authFile, profileArn: target.arn });
+  const authProvider = pinnedKiroAuth({
+    authFile: target.authFile,
+    profileArn: target.arn ?? undefined,
+    useEnv: target.account === DEFAULT_ACCOUNT,
+  });
   const schemas = new Map();
   let ids;
   let pending;
@@ -362,9 +377,15 @@ export default async function kiroExtension(pi) {
   const catalogFile = process.env.OMP_KIRO_MODEL_CATALOG_FILE;
   let models;
   if (transport === "http" && catalogFile !== undefined) {
-    const auth = await readKiroAuth();
-    models = rememberModels(await readKiroModelCatalog(catalogFile, { auth }), kiroCatalogAccountId(auth), catalogVersion);
-    snapshotActive = true;
+    try {
+      const auth = await readKiroAuth();
+      models = rememberModels(await readKiroModelCatalog(catalogFile, { auth }), kiroCatalogAccountId(auth), catalogVersion);
+      snapshotActive = true;
+    } catch (error) {
+      // Keep status and healthy pinned accounts visible without using a
+      // credential marked dead or accepting its previous model catalog.
+      if (error?.code !== "credential_disabled") throw error;
+    }
   }
   // Startup snapshots remain authoritative until a profile change invalidates
   // their account binding; only then do we replace them with live discovery.
@@ -372,7 +393,12 @@ export default async function kiroExtension(pi) {
   if (transport === "http") {
     // Local store reads only: startup never contacts Kiro for account inventory.
     await syncPinnedProviders();
-    registerKiroWebSearch(pi, { authProviderFor: (model) => pinned.get(model?.provider)?.authProvider });
+    registerKiroWebSearch(pi, {
+      authProviderFor(model) {
+        if (model?.api !== "kiro-cli-http" || model.provider === provider) return undefined;
+        return pinned.get(model.provider)?.authProvider ?? (() => { throw unavailableAccount(); });
+      },
+    });
   }
   registerKiroCommands(pi, {
     transport,

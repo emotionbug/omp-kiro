@@ -871,3 +871,68 @@ test("ordinary answer tags and orphan signatures never manufacture thinking outp
     "start", ["text_start", 0], ["text_delta", 0, literal], ["text_end", 0, literal], "done",
   ]);
 });
+
+test("offline API-key snapshots retain image capability and bind the key and region", async (t) => {
+  const key = { kind: "api-key", provider: "api-key", access_token: "ksk_fixture-key", region: "eu-central-1" };
+  const f = await fixture(t, key);
+  noNetwork(t);
+  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_AUTH_FILE", f.authFile);
+  setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", f.file);
+  setEnv(t, "KIRO_API_KEY", undefined);
+  for (const changed of [{ ...key, region: "us-east-1" }, { ...key, access_token: "ksk_other-key" }])
+    await assert.rejects(readKiroModelCatalog(f.file, { auth: changed }), /different managed account/);
+  const rows = [
+    { ...models[0], supportedInputTypes: ["TEXT", "IMAGE"] },
+    { ...models[1], supportedInputTypes: ["TEXT"] },
+  ];
+  await writeFile(f.file, JSON.stringify({ ...f.snapshot, models: rows }));
+  const h = registrationHost();
+  await kiroExtension(h.pi);
+  assert.deepEqual(h.providers[0].config.models.map((model) => model.input), [["text", "image"], ["text"]]);
+});
+
+test("Kiro HTTP 429 overflow reaches OMP as an overflow error without rate-limit replay cues", async (t) => {
+  const p = await reasoningProvider(t, [new Response("Input is too long.", {
+    status: 429, headers: { "retry-after": "30" },
+  })]);
+  const result = await p.stream(turnContext).result();
+  assert.equal(result.type, "error");
+  assert.equal(result.error.stopReason, "error");
+  assert.equal(result.error.errorStatus, undefined);
+  assert.match(result.error.errorMessage, /prompt is too long/i);
+  assert.doesNotMatch(result.error.errorMessage, /429|retry-after/i);
+  assert.equal(p.requests.length, 1);
+});
+
+test("a terminal metered disconnect does not hand OMP a replayable network error", async (t) => {
+  const body = Buffer.concat([
+    frame("meteringEvent", { usage: 0.5, unit: "credits" }),
+    answer("unfinished").subarray(0, 20),
+  ]);
+  const p = await reasoningProvider(t, [new Response(body)]);
+  const result = await p.stream(turnContext).result();
+  assert.equal(result.type, "error");
+  assert.equal(result.error.stopReason, "error");
+  assert.equal(result.error.errorStatus, undefined);
+  assert.equal(result.error.errorMessage, "Kiro did not finish the billed response. It was not replayed.");
+  assert.deepEqual(result.error.usage.credits, { cost: 0.5 });
+  assert.equal(p.requests.length, 1);
+});
+
+test("a disabled default account does not load its old snapshot or hide commands", async (t) => {
+  const f = await fixture(t, { ...auth, disabled: "invalid_grant" });
+  noNetwork(t);
+  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_AUTH_FILE", f.authFile);
+  setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", f.file);
+  setEnv(t, "KIRO_API_KEY", undefined);
+  const h = profileCommandHost();
+  await kiroExtension(h.pi);
+  assert.ok(!h.providers[0].config.models);
+  await h.commands.get("kiro-status").handler("", h.ctx);
+  assert.match(h.messages[0].content, /signed in; sign in again/);
+  const result = await h.providers[0].config.streamSimple(cachedModel, turnContext).result();
+  assert.equal(result.type, "error");
+  assert.match(result.error.errorMessage, /sign in again/);
+});

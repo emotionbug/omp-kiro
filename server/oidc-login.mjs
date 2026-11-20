@@ -1,5 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { defaultFetch, fetchWithRetry, isPreconnectNetworkError, isTlsError, isTransientResponse } from "./network.mjs";
+import { defaultFetch, fetchWithRetry, isPreconnectNetworkError, isTlsError, isTransientResponse, retryPolicy } from "./network.mjs";
+import { kiroCliOidcHeaders } from "./wire.mjs";
 
 const BUILDER_START_URL = "https://view.awsapps.com/start";
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
@@ -44,7 +45,37 @@ const REGIONS = new Set([
   "me-south-1",
   "me-central-1",
   "sa-east-1",
+  "us-gov-west-1",
+  "us-gov-east-1",
 ]);
+const ERROR_CODES = new Map([
+  ["authorization_pending", "authorization_pending"],
+  ["AuthorizationPendingException", "authorization_pending"],
+  ["slow_down", "slow_down"],
+  ["SlowDownException", "slow_down"],
+  ["access_denied", "access_denied"],
+  ["AccessDeniedException", "access_denied"],
+  ["expired_token", "expired_token"],
+  ["ExpiredTokenException", "expired_token"],
+  ["invalid_client", "invalid_client"],
+  ["InvalidClientException", "invalid_client"],
+  ["invalid_grant", "invalid_grant"],
+  ["InvalidGrantException", "invalid_grant"],
+  ["unauthorized_client", "unauthorized_client"],
+  ["UnauthorizedClientException", "unauthorized_client"],
+]);
+
+function responseCode(response, data) {
+  for (const code of [data?.error, data?.__type, response.headers.get("x-amzn-errortype")]) {
+    if (typeof code !== "string") continue;
+    const mapped = ERROR_CODES.get(code.split("#").at(-1).split(":")[0]);
+    if (mapped) return mapped;
+  }
+}
+
+export function isKiroOidcRegion(region) {
+  return REGIONS.has(region);
+}
 
 export class OidcLoginError extends Error {
   constructor(code, message) {
@@ -58,34 +89,47 @@ function invalid(message) {
   return new OidcLoginError("invalid_response", message);
 }
 
-function endpoint(region) {
-  if (!REGIONS.has(region))
+function endpoint(region, provider) {
+  if (!isKiroOidcRegion(region))
     throw new OidcLoginError("invalid_region", "Unsupported AWS SSO OIDC region.");
+  if (provider === "builder-id" && region !== "us-east-1")
+    throw new OidcLoginError("invalid_region", "Builder ID device login uses us-east-1.");
   return `https://oidc.${region}.amazonaws.com`;
 }
 
-function portalUrl(value) {
+function inPartitionPortal(host, region) {
+  const portalSuffix = `.portal.${region}.app.aws`;
+  const regionalPortal = host.endsWith(portalSuffix) &&
+    /^[a-z0-9-]+$/.test(host.slice(0, -portalSuffix.length));
+  if (region.startsWith("us-gov-"))
+    return regionalPortal || host === "start.us-gov-home.awsapps.com" ||
+      host === `start.${region}.us-gov-home.awsapps.com`;
+  return regionalPortal || /^[a-z0-9-]+\.awsapps\.com$/.test(host);
+}
+
+function portalUrl(value, region) {
   let url;
   try {
     url = new URL(value);
   } catch {
     /* Handled below without echoing input. */
   }
+  const legacy = url?.hostname.endsWith(".awsapps.com");
+  const path = region.startsWith("us-gov-")
+    ? /^\/directory\/[a-zA-Z0-9-]+\/?$/
+    : /^\/start\/?$/;
   if (
     !url ||
     url.protocol !== "https:" ||
     url.username ||
     url.password ||
     url.port ||
-    !/^[a-z0-9-]+\.awsapps\.com$/.test(url.hostname) ||
-    !/^\/start\/?$/.test(url.pathname) ||
+    !inPartitionPortal(url.hostname, region) ||
+    !(legacy ? path.test(url.pathname) : url.pathname === "/") ||
     url.search ||
     url.hash
   )
-    throw new OidcLoginError(
-      "invalid_start_url",
-      "Use an HTTPS AWS access portal URL ending in /start.",
-    );
+    throw new OidcLoginError("invalid_start_url", "Use the HTTPS AWS access portal URL for the selected region.");
   return url.href.replace(/\/$/, "");
 }
 
@@ -103,7 +147,7 @@ function verificationUrl(value, region) {
     url.password ||
     url.port ||
     !(
-      /^[a-z0-9-]+\.awsapps\.com$/.test(url.hostname) ||
+      inPartitionPortal(url.hostname, region) ||
       url.hostname === `device.sso.${region}.amazonaws.com`
     )
   )
@@ -142,26 +186,35 @@ async function post(base, path, body, opts, deadline = Infinity) {
     throw new OidcLoginError("expired_token", "Device authorization expired; start login again.");
   const expiry = Number.isFinite(remaining) ? AbortSignal.timeout(Math.max(1, remaining)) : undefined;
   const signal = expiry && opts.signal ? AbortSignal.any([opts.signal, expiry]) : expiry ?? opts.signal;
+  let attempt = 0;
+  const maxAttempts = retryPolicy(opts.retry).maxAttempts ?? 0;
   try {
     const responseData = await fetchWithRetry(opts.fetchImpl, base + path, {
       method: "POST",
       redirect: "error",
       signal,
-      headers: { "content-type": "application/json", "user-agent": "omp-kiro" },
       body: JSON.stringify(body),
     }, {
       retry: opts.retry,
+      prepareRequest: (request) => ({
+        ...request, headers: kiroCliOidcHeaders({ attempt: ++attempt, maxAttempts }),
+      }),
       idleTimeoutMs: Math.min(opts.requestTimeoutMs, remaining),
       // Only proven pre-connect failures or explicit rejection are replay-safe.
       retryNetwork: (error, { responseReceived }) => !responseReceived && isPreconnectNetworkError(error),
-      retryStatus: (status, response) => body.grantType === "refresh_token" && (status === 429 || status === 503) &&
-        isTransientResponse(status, response),
+      async retryStatus(status, response) {
+        if (body.grantType !== "refresh_token" || (status !== 429 && status !== 503)) return false;
+        if (!await isTransientResponse(status, response)) return false;
+        const data = await response.clone().json().catch(() => undefined);
+        return responseCode(response, data) !== "expired_token";
+      },
       async consume(response) {
         let result;
         try {
           result = await response.json();
         } catch {
           signal?.throwIfAborted();
+          if (!response.ok && responseCode(response)) return { response, result: undefined };
           throw invalid("OIDC returned invalid JSON.");
         }
         opts.signal?.throwIfAborted();
@@ -172,28 +225,8 @@ async function post(base, path, body, opts, deadline = Infinity) {
     });
     const { response, result } = responseData;
     if (!response.ok) {
-      const known = new Map([
-        ["authorization_pending", "authorization_pending"],
-        ["AuthorizationPendingException", "authorization_pending"],
-        ["slow_down", "slow_down"],
-        ["SlowDownException", "slow_down"],
-        ["access_denied", "access_denied"],
-        ["AccessDeniedException", "access_denied"],
-        ["expired_token", "expired_token"],
-        ["ExpiredTokenException", "expired_token"],
-        ["invalid_client", "invalid_client"],
-        ["InvalidClientException", "invalid_client"],
-        ["invalid_grant", "invalid_grant"],
-        ["InvalidGrantException", "invalid_grant"],
-        ["unauthorized_client", "unauthorized_client"],
-        ["UnauthorizedClientException", "unauthorized_client"],
-      ]);
-      const type = typeof result.__type === "string" ? result.__type.split("#").at(-1) : undefined;
-      const code =
-        known.get(result.error ?? type) ??
-        (response.status === 503 || response.status === 429
-          ? "temporarily_unavailable"
-          : "request_failed");
+      const code = responseCode(response, result) ??
+        (response.status === 503 || response.status === 429 ? "temporarily_unavailable" : "request_failed");
       throw new OidcLoginError(code, `OIDC request failed (${code}, HTTP ${response.status}).`);
     }
     return result;
@@ -268,25 +301,23 @@ export async function loginDevice({
   sleep = (ms, signal) => delay(ms, undefined, { signal }),
 } = {}) {
   const opts = options({ signal, fetchImpl, now, requestTimeoutMs });
-  const base = endpoint(region);
   if (provider !== "builder-id" && provider !== "identity-center")
     throw new OidcLoginError(
       "invalid_provider",
       "Device login supports Builder ID or IAM Identity Center.",
     );
+  const base = endpoint(region, provider);
   if (typeof onVerification !== "function")
     throw new OidcLoginError(
       "verification_required",
       "Device login requires a verification-instructions callback.",
     );
-  const start = portalUrl(startUrl ?? (provider === "builder-id" ? BUILDER_START_URL : ""));
+  const start = portalUrl(startUrl ?? (provider === "builder-id" ? BUILDER_START_URL : ""), region);
   if ((provider === "builder-id") !== (start === BUILDER_START_URL))
     throw new OidcLoginError(
       "invalid_start_url",
       "The access portal must match the selected account provider.",
     );
-  if (provider === "builder-id" && region !== "us-east-1")
-    throw new OidcLoginError("invalid_region", "Builder ID device login uses us-east-1.");
   const registration = await post(
     base,
     "/client/register",
@@ -405,7 +436,7 @@ export async function refreshOidc({ credential, signal, fetchImpl, now, requestT
       "invalid_credential",
       "OIDC refresh needs a registered client and refresh credential; log in again.",
     );
-  const base = endpoint(credential.region);
+  const base = endpoint(credential.region, credential.provider);
   if (
     credential.registration_expires_at !== undefined &&
     !(Date.parse(credential.registration_expires_at) > opts.now())
@@ -437,7 +468,7 @@ export async function refreshOidc({ credential, signal, fetchImpl, now, requestT
         "registration_expired",
         "OIDC client registration is expired or invalid; log in again.",
       );
-    if (error.code === "invalid_grant")
+    if (error.code === "invalid_grant" || error.code === "expired_token")
       throw new OidcLoginError(
         "login_expired",
         "OIDC refresh credential expired or was revoked; log in again.",

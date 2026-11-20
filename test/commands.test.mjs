@@ -276,7 +276,7 @@ test("HTTP catalog loads the explicitly selected store without changing environm
   const before = process.env.OMP_KIRO_AUTH_FILE;
   t.mock.method(globalThis, "fetch", async (_url, options) => {
     assert.equal(options.headers.authorization, "Bearer chosen-store-secret");
-    if (options.headers["x-amz-target"] === "KiroControlPlaneBearerService.ListAvailableProfiles")
+    if (options.headers["x-amz-target"] === "AmazonCodeWhispererService.ListAvailableProfiles")
       return Response.json({
         profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/chosen" }],
       });
