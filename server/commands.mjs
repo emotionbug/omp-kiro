@@ -1,5 +1,5 @@
 import { getKiroAuthStatus, loadKiroAuth } from "./auth.mjs";
-import { DEFAULT_ACCOUNT, kiroTargets, listKiroAccounts, pinnedKiroTargets } from "./accounts.mjs";
+import { DEFAULT_ACCOUNT, kiroAccountTargets, listKiroAccounts, pinnedKiroTargets } from "./accounts.mjs";
 import { closeSession, openKiro } from "./bridge.mjs";
 import { discoverHttpModels } from "./http.mjs";
 import { fetchKiroUsage } from "./usage.mjs";
@@ -115,13 +115,15 @@ function usageText(usage) {
   );
 }
 
-function profileListText({ selectedArn, profiles, apiKey }, { usage = false } = {}) {
+function profileListText({ selectedArn, profiles, complete, apiKey }, { usage = false } = {}) {
   if (apiKey) return "Kiro API keys have no profiles.";
   const lines = [
     `Selected profile: ${selectedArn ? singleLine(selectedArn) : "none (listing does not select one)"}`,
     "Profiles represent service/account context. API values do not establish whether credit pools are independent or shared; do not sum profile quotas.",
     "Selection persists for all sessions sharing this managed auth store.",
   ];
+  if (complete === false)
+    lines.push("Profile lookup was incomplete; some profiles may be missing. The saved catalog was not replaced.");
   for (const profile of profiles) {
     lines.push(
       "",
@@ -133,7 +135,7 @@ function profileListText({ selectedArn, profiles, apiKey }, { usage = false } = 
       else lines.push(`Usage: unknown, not zero.${profile.error ? ` ${singleLine(profile.error)}` : ""}`);
     }
   }
-  if (!profiles.length) lines.push("No profiles were reported for this login.");
+  if (!profiles.length && complete !== false) lines.push("No profiles were reported for this login.");
   lines.push(
     "",
     "Switch while idle with /kiro-profile <exact-name-or-arn>. No generation is requested.",
@@ -142,7 +144,8 @@ function profileListText({ selectedArn, profiles, apiKey }, { usage = false } = 
 }
 
 function accountsText(accounts) {
-  const pinned = new Set(pinnedKiroTargets(kiroTargets(accounts)).map((target) => target.provider));
+  const { targets, collisions } = kiroAccountTargets(accounts);
+  const pinned = new Set(pinnedKiroTargets(targets).map((target) => target.provider));
   const lines = ["Each account is a separate login; each of its profiles can have its own model provider."];
   for (const account of accounts) {
     lines.push("", `${account.name} — ${singleLine(account.authFile)}`);
@@ -159,19 +162,25 @@ function accountsText(accounts) {
       ? status.refreshable ? "expired; refreshes on next use" : "expired; sign in again"
       : "signed in"} (${singleLine(status.provider)}, ${singleLine(status.kind)})`);
     if (status.disabled) continue;
-    const targets = kiroTargets([account]);
+    const routes = targets.filter((target) => target.account === account.name);
+    const conflicts = collisions.filter((collision) => collision.account === account.name);
     if (status.kind === "api-key") lines.push("Profiles: not used by API keys.");
     else if (!account.catalog)
       lines.push(`Profiles: not listed yet; run omp-kiro auth profiles --account ${account.name}.`);
-    else if (!targets.length) lines.push("Profiles: none usable over Kiro HTTP.");
-    for (const target of targets)
+    else if (!routes.length && !conflicts.length) lines.push("Profiles: none usable over Kiro HTTP.");
+    for (const target of routes)
       lines.push(
         `${pinned.has(target.provider) ? `${target.provider}/…` : "kiro-http/…"} — ${singleLine(target.name ?? target.arn)}${target.arn && target.arn === account.selectedArn ? " (saved selection)" : ""}`,
       );
+    for (const { provider, profiles } of conflicts) {
+      lines.push(`${provider} — provider ID collision; no pinned provider for these profiles:`);
+      for (const { arn, name } of profiles)
+        lines.push(`  ${singleLine(name ?? arn)} — ${singleLine(arn)}`);
+    }
   }
   lines.push(
     "",
-    "kiro-http/… follows the default account's saved profile (/kiro-profile). Pinned providers exist once a named account is signed in or one account has several profiles; pick their models per session. Add an account with omp-kiro login --account <name>.",
+    "kiro-http/… uses the default account (the saved profile or KIRO_API_KEY). Pinned providers exist once a usable named account or multiple usable routes are available; pick their models per session. Add an account with omp-kiro login --account <name>.",
   );
   return lines.join("\n");
 }
@@ -534,7 +543,15 @@ export function registerKiroCommands(pi, { transport = "http", authFile, service
               // Model IDs may contain "/": only a known Kiro provider prefix qualifies one.
               const prefix = value.slice(0, Math.max(value.indexOf("/"), 0));
               const qualified = prefix === unpinned || Boolean(prefix && services.pinnedTarget?.(prefix));
-              const provider = qualified ? prefix : unpinned;
+              const currentPinned = pinned?.target.provider ?? (
+                transport === "http" && ctx.model?.api === "kiro-cli-http" && ctx.model.provider !== unpinned
+                  ? ctx.model.provider : undefined
+              );
+              if (!qualified && currentPinned && !pinned)
+                throw new KiroCommandError("This Kiro account profile is no longer usable. Run /kiro-accounts or explicitly select a provider with /kiro-model <provider/id>.", {
+                  code: "account_unavailable",
+                });
+              const provider = qualified ? prefix : currentPinned ?? unpinned;
               const id = qualified ? value.slice(prefix.length + 1) : value;
               if (provider === unpinned) await services.onBeforeModelRefresh?.();
               await ctx.modelRegistry.refreshProvider(provider);
@@ -558,7 +575,7 @@ export function registerKiroCommands(pi, { transport = "http", authFile, service
           }
           if (["kiro-accounts", "kiro-profiles", "kiro-profile"].includes(command.name))
             // Listing saved this store's catalog; register newly visible account profiles.
-            await services.onAccountsChanged?.();
+            await services.onAccountsChanged?.(ctx.modelRegistry, signal);
           signal.throwIfAborted();
         } catch (error) {
           const failure = safeFailure(error, transport, signal);

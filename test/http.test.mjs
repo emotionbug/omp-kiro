@@ -321,7 +321,8 @@ test("HTTP and framed quota errors propagate without retries or secret leakage",
 
 test("runtime overflow rejections are canonical and terminal even for transient HTTP and frame statuses", async () => {
   for (const [status, respond] of [
-    [413, () => new Response(null, { status: 413 })],
+    [413, () => Response.json({ reason: "MODEL_CONTEXT_WINDOW_EXCEEDED" }, { status: 413 })],
+    [413, () => new Response("Input token count 200001 exceeds the maximum of 200000", { status: 413 })],
     [429, () => Response.json({ reason: "CONTENT_LENGTH_EXCEEDS_THRESHOLD" }, { status: 429 })],
     [503, () => new Response(`Proxy details: Input is too long. ${auth.access_token}`, { status: 503 })],
     [429, () => Response.json({ nested: { note: "Input is too long." } }, { status: 429 })],
@@ -344,6 +345,24 @@ test("runtime overflow rejections are canonical and terminal even for transient 
       assert.ok(!JSON.stringify(error).includes(auth.access_token));
       return true;
     });
+    assert.equal(attempts, 1);
+  }
+});
+
+test("bare and attachment-size HTTP 413 responses reject payloads without compaction or retries", async () => {
+  for (const body of [
+    null,
+    JSON.stringify({ reason: "IMAGE_SIZE_LIMIT", message: "Image exceeds the limit of 1024 bytes" }),
+    "Input is too long: attachment size limit reached",
+  ]) {
+    let attempts = 0;
+    const run = createHttpTransport({
+      authProvider: async () => auth,
+      retry: fastRetry,
+      fetchImpl: async () => { attempts++; return new Response(body, { status: 413 }); },
+    });
+    await assert.rejects(run({ model: "model", context }), (error) =>
+      error.status === 413 && !error.contextOverflow && /Reduce attachment or request bytes/.test(error.message));
     assert.equal(attempts, 1);
   }
 });

@@ -5,7 +5,7 @@ import { registerKiroCommands } from "./server/commands.mjs";
 import { abortableRequest, isTransientNetworkError, isTlsError } from "./server/network.mjs";
 import { registerKiroWebSearch } from "./server/web.mjs";
 import { pinnedKiroAuth, readKiroAuth } from "./server/auth.mjs";
-import { DEFAULT_ACCOUNT, kiroTargets, listKiroAccounts, pinnedKiroTargets } from "./server/accounts.mjs";
+import { DEFAULT_ACCOUNT, kiroAccountTargets, listKiroAccounts, pinnedKiroTargets } from "./server/accounts.mjs";
 import { kiroCatalogAccountId, readKiroModelCatalog } from "./server/model-catalog.mjs";
 import { kiroThinkingConfig } from "./server/effort.mjs";
 
@@ -135,22 +135,31 @@ function streamKiro(model, context, options = {}, transport, route) {
       endThinking();
       message.stopReason = options.signal?.aborted ? "aborted" : "error";
       const billedFailure = transport === "http" && message.stopReason === "error" &&
-        error?.metered && !error.contextOverflow;
+        error?.metered;
       if (transport === "http") {
         if (error?.stopDetails) message.stopDetails = error.stopDetails;
-        if (error?.usage) message.usage = error.usage;
+        if (error?.usage) {
+          const { usage } = error;
+          // Failed-attempt input counts can independently trigger host
+          // compaction. Keep output and credits without that replay cue.
+          const input = usage.input + usage.cacheRead + usage.cacheWrite;
+          message.usage = billedFailure && model.contextWindow > 0 &&
+            Math.max(usage.contextTokens ?? 0, input) > model.contextWindow
+            ? { ...usage, input: 0, cacheRead: 0, cacheWrite: 0, contextTokens: undefined }
+            : usage;
+        }
         if (error?.upstreamModel) message.upstreamModel = error.upstreamModel;
         // Both OMP 18.22.1 and upstream classify "prompt is too long" as
         // context overflow, but an HTTP 429 status vetoes that text evidence.
         if (!error?.contextOverflow && !billedFailure && Number.isFinite(error?.status))
           message.errorStatus = error.status;
       }
-      // OMP treats socket/HTTP failures as replayable. Do not relay any
-      // retry evidence for a billed failure; explicit overflows can compact.
-      if (error?.contextOverflow)
-        message.errorMessage = error.message;
-      else if (billedFailure)
+      // OMP can replay context overflows too. Do not hand it any retry
+      // evidence after billing, even when a distinct continuation overflowed.
+      if (billedFailure)
         message.errorMessage = "Kiro did not finish the billed response. It was not replayed.";
+      else if (error?.contextOverflow)
+        message.errorMessage = error.message;
       else if (transport === "http" && !options.signal?.aborted && isTransientNetworkError(error))
         message.errorMessage = "Kiro HTTP network error: The socket connection was closed unexpectedly before the response completed.";
       else if (transport === "http" && isTlsError(error))
@@ -218,7 +227,7 @@ function pinnedProvider(target) {
     authProvider,
     discover,
     route: {
-      runTurn: createHttpTransport({ authProvider }),
+      runTurn: createHttpTransport({ authProvider, provider: target.provider }),
       async resolveModelSchema(id, signal) {
         // Host cache hits skip fetchDynamicModels in a new process.
         if (!ids) {
@@ -345,14 +354,17 @@ export default async function kiroExtension(pi) {
   const registerProvider = (catalog) => pi.registerProvider(provider, providerConfig(catalog));
   routes.set(provider, { resolveModelSchema, runTurn: transport === "http" ? runHttpTurn : runTurn });
   const pinned = new Map();
-  const reconcilePinned = async () => {
+  const pendingPinRefresh = new Set();
+  const reconcilePinned = async (registry, signal) => {
     let targets;
     try {
-      targets = pinnedKiroTargets(kiroTargets(await listKiroAccounts()));
+      const { targets: routes } = kiroAccountTargets(await listKiroAccounts());
+      targets = pinnedKiroTargets(routes);
     } catch {
       // An unreadable accounts directory keeps the current registrations.
       return;
     }
+    signal?.throwIfAborted();
     const wanted = new Map(targets.map((target) => [target.provider, target]));
     for (const [name, entry] of pinned) {
       const next = wanted.get(name);
@@ -363,17 +375,37 @@ export default async function kiroExtension(pi) {
       }
       pinned.delete(name);
       routes.delete(name);
-      if (!next) pi.unregisterProvider(name);
+      if (!next) {
+        pendingPinRefresh.delete(name);
+        pi.unregisterProvider(name);
+      }
     }
     for (const target of wanted.values()) {
       const entry = pinnedProvider(target);
       pinned.set(target.provider, entry);
       routes.set(target.provider, entry.route);
       pi.registerProvider(target.provider, providerConfig({ fetchDynamicModels: entry.discover }));
+      if (registry) pendingPinRefresh.add(target.provider);
+    }
+    if (!registry || !pendingPinRefresh.size) return;
+    // Runtime registration installs the dynamic callbacks but does not load
+    // them into OMP's available models. Restrict refresh to these providers.
+    if (typeof registry.refreshDiscoverableProviders === "function") {
+      await registry.refreshDiscoverableProviders([...pendingPinRefresh], "online");
+      pendingPinRefresh.clear();
+    } else {
+      for (const name of pendingPinRefresh) {
+        signal?.throwIfAborted();
+        await registry.refreshProvider(name);
+        pendingPinRefresh.delete(name);
+      }
     }
   };
   let syncing = Promise.resolve();
-  const syncPinnedProviders = () => (syncing = syncing.then(reconcilePinned, reconcilePinned));
+  const syncPinnedProviders = (registry, signal) => {
+    const reconcile = () => reconcilePinned(registry, signal);
+    return (syncing = syncing.then(reconcile, reconcile));
+  };
   const catalogFile = process.env.OMP_KIRO_MODEL_CATALOG_FILE;
   let models;
   if (transport === "http" && catalogFile !== undefined) {
@@ -382,17 +414,22 @@ export default async function kiroExtension(pi) {
       models = rememberModels(await readKiroModelCatalog(catalogFile, { auth }), kiroCatalogAccountId(auth), catalogVersion);
       snapshotActive = true;
     } catch (error) {
-      // Keep status and healthy pinned accounts visible without using a
-      // credential marked dead or accepting its previous model catalog.
+      // Keep the snapshot registration offline even when this login is dead.
+      // An explicit model refresh can adopt a replacement login.
       if (error?.code !== "credential_disabled") throw error;
+      models = [];
+      catalogAccountId = null;
+      snapshotActive = true;
     }
   }
   // Startup snapshots remain authoritative until a profile change invalidates
   // their account binding; only then do we replace them with live discovery.
   registerProvider(models !== undefined ? { models } : { fetchDynamicModels: fetchModels });
   if (transport === "http") {
-    // Local store reads only: startup never contacts Kiro for account inventory.
-    await syncPinnedProviders();
+    // A host may discover every dynamic registration on its startup drain.
+    // A default-account snapshot cannot seed other accounts; explicitly
+    // reconcile those providers with /kiro-accounts when ready to go online.
+    if (catalogFile === undefined) await syncPinnedProviders();
     registerKiroWebSearch(pi, {
       authProviderFor(model) {
         if (model?.api !== "kiro-cli-http" || model.provider === provider) return undefined;

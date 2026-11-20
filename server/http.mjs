@@ -33,6 +33,7 @@ export class KiroHttpError extends Error {
 
 const INPUT_TOO_LONG = "Input is too long";
 const CONTENT_LENGTH_EXCEEDS_THRESHOLD = "CONTENT_LENGTH_EXCEEDS_THRESHOLD";
+const TOKEN_OVERFLOW = /\b(?:input is too long for (?:the )?requested model|prompt is too long|(?:exceeds?|above) (?:the )?(?:model(?:'s)? )?(?:context window|token limit)|(?:(?:model[_ ])?context[_ ](?:window|length)|token[_ ]limit)[_ ]exceeded|exceeds? the limit of \d+ tokens?|too many tokens|maximum context length|input token count.*exceeds)\b/i;
 const TOOL_RESULT_MAX_BYTES = 800_000;
 const TOOL_RESULT_SHRUNK_BYTES = 25_000;
 const BUDGET_BASE_BYTES = 850_000;
@@ -58,9 +59,9 @@ function isOverflowRejection(code, reason, body) {
     body.includes(INPUT_TOO_LONG);
 }
 
-const isKiroHttpMessage = (message) => message.provider === "kiro-http" && message.api === "kiro-cli-http";
+const isKiroHttpMessage = (message, provider) => message.provider === provider && message.api === "kiro-cli-http";
 
-function textContent(message) {
+function textContent(message, provider) {
   if (typeof message.content === "string") return message.content.toWellFormed();
   const text = [];
   for (const block of message.content ?? []) {
@@ -73,7 +74,7 @@ function textContent(message) {
     }
   }
   // Kiro HTTP text blocks split by reasoning phases were one native text stream.
-  return text.join(message.role === "assistant" && isKiroHttpMessage(message) ? "" : "\n").toWellFormed();
+  return text.join(message.role === "assistant" && isKiroHttpMessage(message, provider) ? "" : "\n").toWellFormed();
 }
 
 // Historical images are never encoded or validated; only the current turn carries bytes.
@@ -140,8 +141,8 @@ function conversationId(sessionId) {
 
 // Native reasoning is replayed only to the model that produced and signed it.
 // Kiro carries one scalar per assistant message: the last complete phase.
-function replayableReasoning(message, model) {
-  if (!isKiroHttpMessage(message) || message.model !== model ||
+function replayableReasoning(message, model, provider) {
+  if (!isKiroHttpMessage(message, provider) || message.model !== model ||
     message.stopReason === "error" || message.stopReason === "aborted" ||
     (message.upstreamModel != null && message.upstreamModel !== model) ||
     !Array.isArray(message.content)) return undefined;
@@ -162,7 +163,7 @@ const PLACEHOLDER_TOOL = {
 };
 
 function prepareHttpRequest({
-  model, context, contextWindow, cwd, sessionId, modelRequestFieldsSchema, reasoning, disableReasoning, forceReasoningOff,
+  model, context, contextWindow, cwd, sessionId, provider = "kiro-http", modelRequestFieldsSchema, reasoning, disableReasoning, forceReasoningOff,
 }) {
   const additionalModelRequestFields = kiroEffortFields(modelRequestFieldsSchema, {
     reasoning, disableReasoning, forceReasoningOff,
@@ -183,7 +184,7 @@ function prepareHttpRequest({
   const userMessage = (content = "") => ({ content, modelId: model, origin: "KIRO_CLI" });
   for (const [index, message] of context.messages.entries()) {
     const isCurrent = index > lastAssistant;
-    const content = textContent(message);
+    const content = textContent(message, provider);
     if (message.role === "user" || message.role === "developer") {
       const input = message.role === "developer"
         ? `[Developer instructions at conversation message ${index + 1}]\n${content}`
@@ -211,7 +212,7 @@ function prepareHttpRequest({
                 if (!known) placeholderUsed = true;
                 return { toolUseId: block.id, name: known ? block.name : PLACEHOLDER_TOOL.name, input: block.arguments };
               });
-      const reasoningContent = replayableReasoning(message, model);
+      const reasoningContent = replayableReasoning(message, model, provider);
       const previous = messages.at(-1)?.assistantResponseMessage;
       if (previous) {
         previous.content += `${previous.content && content ? "\n\n" : ""}${content}`;
@@ -387,10 +388,6 @@ function runtimeRetryAfterMs(response, data) {
 
 async function httpResponseError(response, auth, signal) {
   const status = response.status;
-  if (status === 413) {
-    void response.body?.cancel().catch(() => {});
-    return contextOverflow(undefined, { status });
-  }
   let text = "";
   let data;
   try {
@@ -406,6 +403,16 @@ async function httpResponseError(response, auth, signal) {
     code: safeMessage(code ?? "HttpError", auth),
     reason: typeof data?.reason === "string" ? safeMessage(data.reason, auth) : undefined,
   };
+  if (status === 413) {
+    // A generic 413 is a byte/media limit, not evidence of token exhaustion.
+    // Do not echo its body to the host's looser overflow classifier.
+    const description = typeof message === "string" ? message : text;
+    if (isOverflowRejection(code, data?.reason, "") ||
+        TOKEN_OVERFLOW.test(code ?? "") || TOKEN_OVERFLOW.test(data?.reason ?? "") ||
+        TOKEN_OVERFLOW.test(description) || /^Input is too long\.?$/i.test(description.trim()))
+      return contextOverflow(undefined, details);
+    return new KiroHttpError("Kiro rejected the request size (HTTP 413). Reduce attachment or request bytes.", details);
+  }
   if (isOverflowRejection(code, data?.reason, text) ||
     (typeof message === "string" && message.includes(INPUT_TOO_LONG))) {
     // Do not include HTTP status or untrusted body text in OMP's overflow evidence.
@@ -459,6 +466,7 @@ function continueHttpRequest(prepared, text) {
 export function createHttpTransport({
   fetchImpl = defaultFetch,
   authProvider = loadKiroAuth,
+  provider,
   retry,
   idleTimeoutMs,
 } = {}) {
@@ -469,7 +477,7 @@ export function createHttpTransport({
   }) {
     signal?.throwIfAborted();
     const prepared = prepareHttpRequest({
-      model, context, contextWindow, cwd, sessionId, modelRequestFieldsSchema, reasoning, disableReasoning, forceReasoningOff,
+      model, context, contextWindow, cwd, sessionId, provider, modelRequestFieldsSchema, reasoning, disableReasoning, forceReasoningOff,
     });
     const { body } = prepared;
     if (continuePartial && onRestart)

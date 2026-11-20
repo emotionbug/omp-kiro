@@ -19,10 +19,11 @@ import {
 import {
   kiroAccountAuthFile,
   kiroTargetProvider,
-  kiroTargets,
+  kiroAccountTargets,
   listKiroAccounts,
   pinnedKiroTargets,
 } from "../server/accounts.mjs";
+import { kiroCatalogAccountId } from "../server/model-catalog.mjs";
 import { listKiroProfiles } from "../server/profiles.mjs";
 import { crc32 } from "../server/eventstream.mjs";
 
@@ -138,7 +139,7 @@ test("account profiles get stable providers, and pinning starts only when there 
   t.after(() => rm(root, { recursive: true, force: true }));
   const authFile = join(root, "auth.sqlite3");
   await saveKiroAuth(defaultLogin, { authFile });
-  const alone = kiroTargets(await listKiroAccounts({ authFile }));
+  const { targets: alone } = kiroAccountTargets(await listKiroAccounts({ authFile }));
   // Without a listed catalog the saved selection is the account's one target.
   assert.deepEqual(alone.map(({ provider, label, name }) => ({ provider, label, name })), [
     { provider: "kiro-default-default0001", label: "default", name: null },
@@ -157,13 +158,13 @@ test("account profiles get stable providers, and pinning starts only when there 
     { arn: TOKYO_ARN, name: "Unsupported region" },
   ], { authFile: workFile, credential: workLogin });
   // Stray or reserved names never become accounts.
-  for (const name of ["Work.sqlite3", "default.sqlite3", "http.sqlite3", "notes.txt"])
-    await writeFile(join(root, "accounts", name), "");
+  for (const name of ["Uppercase.sqlite3", "default.sqlite3", "http.sqlite3", "notes.txt"])
+    await writeFile(join(root, "accounts", name), "", { flag: "wx" });
   await mkdir(join(root, "accounts", "folder.sqlite3"));
 
   const accounts = await listKiroAccounts({ authFile });
   assert.deepEqual(accounts.map(({ name }) => name), ["default", "work"]);
-  const targets = kiroTargets(accounts);
+  const { targets } = kiroAccountTargets(accounts);
   assert.deepEqual(targets.map(({ provider, label, arn }) => ({ provider, label, arn })), [
     { provider: "kiro-default-default0001", label: "default", arn: DEFAULT_ARN },
     { provider: "kiro-work-team02", label: "work · Team EU 1", arn: TEAM_ARN },
@@ -279,6 +280,136 @@ test("pinned providers register offline and route generation, models, search and
   assert.equal(JSON.parse(await readAuthSnapshot({ authFile })).profile_arn, DEFAULT_ARN);
 });
 
+test("unqualified model IDs stay on the current pinned provider, even when the ID contains a slash", async (t) => {
+  const { authFile } = await stores(t);
+  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_AUTH_FILE", authFile);
+  setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", undefined);
+  setEnv(t, "KIRO_API_KEY", undefined);
+  const h = host();
+  await kiroExtension(h.pi);
+  const refreshed = [];
+  const ctx = {
+    model: { id: "auto", provider: "kiro-work-personal01", api: "kiro-cli-http" },
+    isIdle: () => true,
+    modelRegistry: {
+      refreshProvider: async (provider) => { refreshed.push(provider); },
+      find: (provider, id) => ({ provider, id, api: "kiro-cli-http" }),
+    },
+  };
+  const command = h.commands.get("kiro-model");
+  await command.handler("vendor/model", ctx);
+  assert.deepEqual(h.selected, { id: "vendor/model", provider: "kiro-work-personal01", api: "kiro-cli-http" });
+  await command.handler("kiro-http/vendor/model", ctx);
+  assert.deepEqual(h.selected, { id: "vendor/model", provider: "kiro-http", api: "kiro-cli-http" });
+  assert.deepEqual(refreshed, ["kiro-work-personal01", "kiro-http"]);
+});
+
+test("explicit account reconciliation refreshes added and renamed providers in the host model registry", async (t) => {
+  const { authFile, workFile } = await stores(t);
+  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_AUTH_FILE", authFile);
+  setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", undefined);
+  setEnv(t, "KIRO_API_KEY", undefined);
+  const h = host();
+  await kiroExtension(h.pi);
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    assert.match(String(url), /^https:\/\/management\./);
+    assert.match(init.headers["x-amz-target"], /\.ListAvailableModels$/);
+    return Response.json({ models: [{ modelId: "auto", modelName: "Auto" }] });
+  });
+  const other = arn("us-east-1", "OTHER");
+  await saveProfileCatalog([
+    { arn: TEAM_ARN, name: "Renamed" },
+    { arn: PERSONAL_ARN, name: "Personal" },
+    { arn: other, name: "Other" },
+  ], { authFile: workFile, credential: workLogin });
+  const visible = new Map();
+  const refreshed = [];
+  const ctx = {
+    modelRegistry: {
+      async refreshProvider(provider) {
+        refreshed.push(provider);
+        visible.set(provider, await h.providers.get(provider).fetchDynamicModels());
+      },
+      getAvailable() { return [...visible.values()].flat(); },
+    },
+  };
+  const command = h.commands.get("kiro-accounts");
+  await command.handler("", ctx);
+  assert.deepEqual(refreshed, ["kiro-work-team02", "kiro-work-other"]);
+  assert.deepEqual(ctx.modelRegistry.getAvailable().map(({ name }) => name), [
+    "Kiro · work · Renamed · Auto", "Kiro · work · Other · Auto",
+  ]);
+  await command.handler("", ctx);
+  assert.equal(refreshed.length, 2, "unchanged registrations do not refresh again");
+});
+
+test("snapshot startup defers pinned discovery until /kiro-accounts, even if the host drains all callbacks", async (t) => {
+  const { authFile, root } = await stores(t);
+  const path = join(root, "models.json");
+  await writeFile(path, JSON.stringify({
+    version: 1, fetchedAt: "2026-01-01T00:00:00Z", accountId: kiroCatalogAccountId(defaultLogin),
+    models: [{ id: "auto", name: "Offline" }],
+  }));
+  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_AUTH_FILE", authFile);
+  setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", path);
+  setEnv(t, "KIRO_API_KEY", undefined);
+  const h = host();
+  const fetch = t.mock.method(globalThis, "fetch", async () =>
+    Response.json({ models: [{ modelId: "auto", modelName: "Live" }] }));
+  await kiroExtension(h.pi);
+  await Promise.all([...h.providers.values()].map((config) => config.fetchDynamicModels?.()));
+  assert.deepEqual([...h.providers.keys()], ["kiro-http"]);
+  assert.equal(h.providers.get("kiro-http").models[0].name, "Kiro · Offline");
+  assert.equal(fetch.mock.callCount(), 0);
+
+  await h.commands.get("kiro-accounts").handler("", { modelRegistry: {
+    async refreshDiscoverableProviders(ids, strategy) {
+      assert.equal(strategy, "online");
+      assert.deepEqual(ids, ["kiro-default-default0001", "kiro-work-team02", "kiro-work-personal01"]);
+      await Promise.all(ids.map((id) => h.providers.get(id).fetchDynamicModels()));
+    },
+  } });
+  assert.equal(fetch.mock.callCount(), 3);
+  assert.match(h.messages.at(-1).content, /kiro-work-personal01\/…/);
+});
+
+test("pinned HTTP history joins native text and replays signed reasoning only to its own provider", async (t) => {
+  const { authFile } = await stores(t);
+  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_AUTH_FILE", authFile);
+  setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", undefined);
+  setEnv(t, "KIRO_API_KEY", undefined);
+  const sent = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    if (new URL(url).hostname.startsWith("management."))
+      return Response.json({ models: [{ modelId: "auto", modelName: "Auto" }] });
+    sent.push(JSON.parse(init.body).conversationState.history[1].assistantResponseMessage);
+    return new Response(frame("answer"));
+  });
+  const h = host();
+  await kiroExtension(h.pi);
+  const context = { messages: [
+    { role: "user", content: "first" },
+    { role: "assistant", model: "auto", provider: "kiro-work-personal01", api: "kiro-cli-http", stopReason: "stop", content: [
+      { type: "text", text: "split" },
+      { type: "thinking", thinking: "sealed", thinkingSignature: "fixture-signature" },
+      { type: "text", text: "text" },
+    ] },
+    { role: "user", content: "second" },
+  ] };
+  for (const provider of ["kiro-work-personal01", "kiro-work-team02"]) {
+    const stream = h.providers.get(provider).streamSimple({ provider, id: "auto", api: "kiro-cli-http" }, context);
+    assert.equal((await stream.result()).type, "done");
+  }
+  assert.deepEqual(sent, [
+    { content: "splittext", reasoningContent: { reasoningText: { text: "sealed", signature: "fixture-signature" } } },
+    { content: "split\ntext" },
+  ]);
+});
+
 test("signing an account out removes its providers, and its old models fail without falling back", async (t) => {
   const { authFile, workFile } = await stores(t);
   setEnv(t, "OMP_KIRO_TRANSPORT", "http");
@@ -335,7 +466,36 @@ test("the accounts command lists every store without printing credentials", asyn
   );
 });
 
-test("API-key accounts use normal pinning and route discovery, generation, usage and web without profiles", async (t) => {
+test("all distinct ARNs sharing a provider ID are excluded and reported by both accounts commands", async (t) => {
+  const { authFile, workFile } = await stores(t);
+  setEnv(t, "OMP_KIRO_TRANSPORT", "http");
+  setEnv(t, "OMP_KIRO_AUTH_FILE", authFile);
+  setEnv(t, "OMP_KIRO_MODEL_CATALOG_FILE", undefined);
+  setEnv(t, "KIRO_API_KEY", undefined);
+  const other = arn("us-east-1", "team_02");
+  const provider = "kiro-work-team02";
+  const profiles = [{ arn: TEAM_ARN, name: "First team" }, { arn: other, name: "Second team" }];
+  await saveProfileCatalog([...profiles, profiles[0], { arn: PERSONAL_ARN, name: "Personal" }], {
+    authFile: workFile, credential: workLogin,
+  });
+  const h = host();
+  await kiroExtension(h.pi);
+  assert.deepEqual([...h.providers.keys()], ["kiro-http", "kiro-default-default0001", "kiro-work-personal01"]);
+  await h.commands.get("kiro-accounts").handler("", {});
+  const args = [cli, "accounts", "--auth-file", authFile];
+  const { stdout: text } = await run(process.execPath, args);
+  for (const output of [h.messages.at(-1).content, text]) {
+    assert.match(output, /kiro-work-team02 — provider ID collision/);
+    for (const { arn, name } of profiles) assert.ok(output.includes(`${name} — ${arn}`));
+    assert.doesNotMatch(output, /kiro-work-team02\/…/);
+  }
+  const { stdout } = await run(process.execPath, [...args, "--json"]);
+  const listed = JSON.parse(stdout);
+  assert.deepEqual(listed.collisions, [{ provider, account: "work", profiles }]);
+  assert.ok(!listed.targets.some((target) => target.provider === provider));
+});
+
+test("HTTP default generation and usage use the environment key; named providers use the stored key", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "kiro-key-accounts-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const authFile = join(root, "auth.sqlite3");
@@ -345,7 +505,7 @@ test("API-key accounts use normal pinning and route discovery, generation, usage
   setEnv(t, "KIRO_API_KEY", "ksk_fixture-default-key");
   setEnv(t, "KIRO_API_REGION", "us-east-1");
   await saveKiroAuth(defaultLogin, { authFile });
-  const alone = kiroTargets(await listKiroAccounts());
+  const { targets: alone } = kiroAccountTargets(await listKiroAccounts());
   assert.deepEqual(alone.map(({ provider }) => provider), ["kiro-default-key"]);
   assert.deepEqual(pinnedKiroTargets(alone), []);
   await saveKiroAuth({
@@ -353,12 +513,13 @@ test("API-key accounts use normal pinning and route discovery, generation, usage
   }, { authFile: kiroAccountAuthFile("work") });
   const h = host();
   const operations = [];
+  let account = "work";
   t.mock.method(globalThis, "fetch", async (url, init) => {
     const target = new URL(url);
     const operation = init.headers["x-amz-target"]?.split(".").at(-1) ?? "web";
     operations.push(operation);
-    assert.match(target.hostname, /\.eu-central-1\.kiro\.dev$/);
-    assert.equal(init.headers.authorization, "Bearer ksk_fixture-work-key");
+    assert.equal(target.hostname.split(".")[1], account === "work" ? "eu-central-1" : "us-east-1");
+    assert.equal(init.headers.authorization, `Bearer ksk_fixture-${account}-key`);
     assert.equal(init.headers.tokentype, "API_KEY");
     assert.equal(init.headers["x-amzn-codewhisperer-optout"], "true");
     assert.equal(init.headers["x-amzn-kiro-profile-arn"], undefined);
@@ -396,6 +557,20 @@ test("API-key accounts use normal pinning and route discovery, generation, usage
   assert.match(h.messages.at(-1).content, /API keys have no profiles/);
   await h.tools.get("web_search").execute("call", { query: "kiro" }, undefined, undefined, ctx);
   assert.deepEqual(operations, ["ListAvailableModels", "GenerateAssistantResponse", "GetUsageLimits", "web"]);
+  account = "default";
+  for (const provider of ["kiro-http", "kiro-default-key"]) {
+    operations.length = 0;
+    const config = h.providers.get(provider);
+    const [auto] = await config.fetchDynamicModels();
+    const model = { ...auto, provider, api: "kiro-cli-http" };
+    const result = await config.streamSimple(model, { messages: [{ role: "user", content: "hi" }] }).result();
+    assert.equal(result.type, "done");
+    await h.commands.get("kiro-usage").handler("", { model });
+    assert.match(h.messages.at(-1).content, /Monthly credits/);
+    await h.tools.get("web_search").execute("call", { query: "kiro" }, undefined, undefined, { model });
+    assert.deepEqual(operations, ["ListAvailableModels", "GenerateAssistantResponse", "GetUsageLimits", "web"]);
+  }
+  assert.deepEqual(JSON.parse(await readAuthSnapshot({ authFile })), defaultLogin);
 });
 
 test("only matching-partition GovCloud profiles become account targets; dead grants stay signed in", async (t) => {
@@ -411,7 +586,7 @@ test("only matching-partition GovCloud profiles become account targets; dead gra
   const inventory = await listKiroAccounts({ authFile });
   assert.equal(inventory[0].status.loggedIn, true);
   assert.equal(inventory[0].status.disabled, "invalid_grant");
-  const targets = kiroTargets(inventory);
+  const { targets } = kiroAccountTargets(inventory);
   assert.deepEqual(targets.map(({ provider, arn }) => ({ provider, arn })), [
     { provider: "kiro-work-govteam", arn: govArn },
   ]);

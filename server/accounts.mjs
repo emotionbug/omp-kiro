@@ -2,10 +2,8 @@ import { readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
   authFilePath,
-  getKiroAuthStatus,
+  readKiroAccount,
   KiroAuthError,
-  readKiroAuth,
-  readProfileCatalog,
 } from "./auth.mjs";
 import { kiroProfileRegions, parseKiroProfileArn } from "./wire.mjs";
 
@@ -45,18 +43,7 @@ export function kiroTargetProvider(account, arn, kind) {
 
 async function readAccount(name, authFile, now, useEnv) {
   try {
-    const status = await getKiroAuthStatus({ authFile, now, useEnv });
-    if (!status.loggedIn || status.disabled || status.kind === "api-key")
-      return { name, authFile, status, selectedArn: null, catalog: null };
-    const [credential, catalog] = await Promise.all([
-      readKiroAuth({ authFile, useEnv }),
-      readProfileCatalog({ authFile }),
-    ]);
-    return {
-      name, authFile,
-      status: credential.provider === "identity-center" ? { ...status, region: credential.region } : status,
-      selectedArn: credential.profile_arn ?? null, catalog,
-    };
+    return { name, authFile, ...await readKiroAccount({ authFile, now, useEnv }) };
   } catch (error) {
     return {
       name,
@@ -91,23 +78,19 @@ function labelPart(value) {
 }
 
 /**
- * Every signed-in account profile usable over HTTP. A store without a listed
- * catalog contributes its saved selection, whose name is not known yet.
+ * Usable HTTP routes and rejected provider IDs, grouped by account and unique
+ * ARN. A store without a complete catalog contributes its saved selection.
  */
-export function kiroTargets(accounts) {
+export function kiroAccountTargets(accounts) {
   const targets = [];
-  const seen = new Set();
+  const collisions = [];
   for (const account of accounts) {
     if (!account.status?.loggedIn || account.status.disabled) continue;
     if (account.status.kind === "api-key") {
-      const provider = kiroTargetProvider(account.name, null, "api-key");
-      if (!seen.has(provider)) {
-        seen.add(provider);
-        targets.push({
-          provider, account: account.name, authFile: account.authFile,
-          arn: null, name: "API key", label: account.name,
-        });
-      }
+      targets.push({
+        provider: kiroTargetProvider(account.name, null, "api-key"), account: account.name, authFile: account.authFile,
+        arn: null, name: "API key", label: account.name,
+      });
       continue;
     }
     const listed = account.catalog?.profiles ?? (account.selectedArn ? [{ arn: account.selectedArn }] : []);
@@ -115,10 +98,23 @@ export function kiroTargets(accounts) {
     const profiles = listed
       .filter((profile) => regions.includes(parseKiroProfileArn(profile.arn)?.region))
       .sort((left, right) => (left.arn < right.arn ? -1 : left.arn > right.arn ? 1 : 0));
+    const groups = new Map();
     for (const profile of profiles) {
       const provider = kiroTargetProvider(account.name, profile.arn);
-      if (!provider || seen.has(provider)) continue;
-      seen.add(provider);
+      if (!provider) continue;
+      if (!groups.has(provider)) groups.set(provider, new Map());
+      const group = groups.get(provider);
+      if (!group.has(profile.arn)) group.set(profile.arn, profile);
+    }
+    const profileCount = [...groups.values()].reduce((count, group) => count + group.size, 0);
+    for (const [provider, group] of groups) {
+      if (group.size > 1) {
+        collisions.push({
+          provider, account: account.name, profiles: [...group.values()].map(({ arn, name }) => ({ arn, name })),
+        });
+        continue;
+      }
+      const profile = group.values().next().value;
       const name = profile.name === undefined ? "" : labelPart(profile.name);
       targets.push({
         provider,
@@ -126,11 +122,11 @@ export function kiroTargets(accounts) {
         authFile: account.authFile,
         arn: profile.arn,
         name: profile.name ?? null,
-        label: profiles.length > 1 && name ? `${account.name} · ${name}` : account.name,
+        label: profileCount > 1 && name ? `${account.name} · ${name}` : account.name,
       });
     }
   }
-  return targets;
+  return { targets, collisions };
 }
 
 /**

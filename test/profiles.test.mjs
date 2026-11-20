@@ -8,6 +8,7 @@ import {
   loadKiroAuth,
   logoutKiroAuth,
   readAuthSnapshot,
+  readProfileCatalog,
   saveKiroAuth,
 } from "../server/auth.mjs";
 import {
@@ -91,6 +92,7 @@ test("profile listing collects every page, deduplicates ARNs, and preserves sele
   assert.deepEqual(pages.filter(({ url }) => url.includes("eu-central-1")).map(({ body }) => body), [{}]);
   assert.deepEqual(report, {
     selectedArn: A,
+    complete: true,
     profiles: [
       { arn: A, name: "Personal", region: "us-east-1", accountId: "123456789012" },
       { arn: B, name: "Work", region: "eu-central-1", accountId: "987654321098" },
@@ -113,6 +115,31 @@ test("listing zero, one, or multiple assigned profiles never selects an unresolv
     assert.equal(report.profiles.length, assigned.length);
     assert.equal(await f.raw(), before);
   }
+});
+
+test("partial profile discovery never auto-selects or replaces the last complete catalog", async (t) => {
+  const unresolved = { ...credential };
+  delete unresolved.profile_arn;
+  const f = await fixture(t, unresolved);
+  const partialFetch = async (url) => url.includes("us-east-1")
+    ? Response.json({ profiles: [profiles[0]] })
+    : new Response(null, { status: 503 });
+  const partial = { ...f.options, fetchImpl: partialFetch };
+  const report = await listKiroProfiles(partial);
+  assert.equal(report.complete, false);
+  assert.deepEqual(report.profiles.map(({ arn }) => arn), [A]);
+  assert.equal(await readProfileCatalog({ authFile: f.authFile }), null);
+  await assert.rejects(loadKiroAuth(partial), (error) =>
+    /incomplete/.test(error.message) && error.profiles.length === 1 && error.profiles[0].arn === A);
+  assert.deepEqual(await f.read(), unresolved);
+  await assert.rejects(selectKiroProfile("Personal", partial), { code: "partial_profiles" });
+
+  await listKiroProfiles({ ...f.options, fetchImpl: async () => Response.json({ profiles }) });
+  const saved = await readProfileCatalog({ authFile: f.authFile });
+  assert.deepEqual(saved.profiles.map(({ arn }) => arn), [A, B]);
+  assert.equal((await listKiroProfiles(partial)).complete, false);
+  assert.deepEqual(await readProfileCatalog({ authFile: f.authFile }), saved);
+  assert.equal((await selectKiroProfile(A, partial)).arn, A, "an explicitly assigned ARN can be selected");
 });
 
 test("OIDC issuer region does not replace the selected profile service region", async (t) => {

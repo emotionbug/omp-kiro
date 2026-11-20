@@ -10,27 +10,28 @@ import {
 import { fetchKiroUsage, KiroUsageError } from "./usage.mjs";
 import { kiroProfileRegions } from "./wire.mjs";
 
-/** Every listing refreshes the store's saved catalog, which names its pinned model providers. */
+/** Only a complete listing can replace the store's saved profile catalog. */
 async function catalog(options) {
   // A key has no profiles regardless of whether its API region has been
   // resolved yet. Do not probe its region for a profile-only command.
   if ((await readKiroAuth(options)).kind === "api-key") return { profiles: [], apiKey: true };
   const credential = await loadKiroAuth({ ...options, resolveProfile: false });
   if (credential.kind === "api-key") return { profiles: [], apiKey: true };
-  const profiles = await queryKiroProfiles(credential, options);
-  await saveProfileCatalog(profiles, { authFile: options.authFile, credential, signal: options.signal });
-  return { credential, profiles };
+  const { profiles, complete } = await queryKiroProfiles(credential, options);
+  if (complete)
+    await saveProfileCatalog(profiles, { authFile: options.authFile, credential, signal: options.signal });
+  return { credential, profiles, complete };
 }
 
-/** Enumerate the complete assigned catalog without choosing a default profile. */
+/** Enumerate assigned profiles without choosing a default profile. */
 export async function listKiroProfiles(options = {}) {
-  const { credential, profiles, apiKey } = await catalog(options);
-  return { selectedArn: credential?.profile_arn ?? null, profiles, ...(apiKey ? { apiKey } : {}) };
+  const { credential, profiles, complete, apiKey } = await catalog(options);
+  return { selectedArn: credential?.profile_arn ?? null, profiles, ...(apiKey ? { apiKey } : { complete }) };
 }
 
 /** Compare quotas with an in-memory selection; refresh only the stored identity. */
 export async function fetchKiroProfileUsage(options = {}) {
-  let { credential, profiles, apiKey } = await catalog(options);
+  let { credential, profiles, complete, apiKey } = await catalog(options);
   if (apiKey) return { selectedArn: null, profiles, apiKey };
   const selectedArn = credential.profile_arn ?? null;
   const reports = [];
@@ -61,7 +62,7 @@ export async function fetchKiroProfileUsage(options = {}) {
     }
   }
   options.signal?.throwIfAborted();
-  return { selectedArn, profiles: reports };
+  return { selectedArn, profiles: reports, complete };
 }
 
 /** Commit only the credential snapshot whose catalog was used for selection. */
@@ -71,10 +72,12 @@ export async function selectKiroProfile(selector, options = {}) {
       new KiroAuthError("Provide an exact Kiro profile ARN or unique profile name."),
       { code: "invalid_profile" },
     );
-  const { credential, profiles, apiKey } = await catalog(options);
+  const { credential, profiles, complete, apiKey } = await catalog(options);
   if (apiKey)
     throw Object.assign(new KiroAuthError("Kiro API keys have no profiles."), { code: "api_key_no_profiles" });
   const exactArn = profiles.find((profile) => profile.arn === selector);
+  if (!exactArn && !complete)
+    throw new KiroAuthError("Kiro profile lookup was incomplete; specify an available profile ARN or try again.", "partial_profiles");
   const matches = exactArn ? [exactArn] : profiles.filter((profile) => profile.name === selector);
   if (!matches.length)
     throw Object.assign(

@@ -525,7 +525,7 @@ test("profile switch bypasses an old snapshot and replaces native schemas withou
   const nextSchema = {
     properties: { output_config: { properties: { effort: { enum: ["high", "none"] } } } },
   };
-  let discoveries = 0;
+  const discoveries = [];
   const requests = [];
   t.mock.method(globalThis, "fetch", async (url, init) => {
     if (init.headers["x-amz-target"]?.endsWith(".ListAvailableProfiles"))
@@ -534,7 +534,7 @@ test("profile switch bypasses an old snapshot and replaces native schemas withou
         { arn: nextArn, profileName: "Next Profile" },
       ] });
     if (new URL(url).hostname.startsWith("management.")) {
-      discoveries++;
+      discoveries.push(JSON.parse(init.body).profileArn);
       return Response.json({ models: [
         { modelId: "cached", additionalModelRequestFieldsSchema: nextSchema },
         { modelId: "unrelated" },
@@ -552,7 +552,7 @@ test("profile switch bypasses an old snapshot and replaces native schemas withou
   assert.match(h.messages.at(-1).content, /Kiro profile selected/);
   assert.match(h.messages.at(-1).content, /snapshot.*bypassed.*models\.cmd/);
   assert.match(h.messages.at(-1).content, /all sessions sharing this managed auth store/);
-  assert.equal(discoveries, 1);
+  assert.deepEqual(discoveries, [nextArn, auth.profile_arn, nextArn]);
   assert.equal(h.selected.length, 1);
   assert.equal(h.selected[0].id, "cached");
   const unpinned = h.providers.findLast(({ id }) => id === "kiro-http").config;
@@ -643,7 +643,7 @@ function partialResponse(frames, { hang = false } = {}) {
   }));
 }
 
-async function reasoningProvider(t, responses, { maxAttempts = "3" } = {}) {
+async function reasoningProvider(t, responses, { maxAttempts = "3", contextWindow } = {}) {
   const f = await fixture(t, { ...auth, expires_at: "2999-01-01T00:00:00Z" });
   setEnv(t, "OMP_KIRO_TRANSPORT", "http");
   setEnv(t, "OMP_KIRO_AUTH_FILE", f.authFile);
@@ -659,7 +659,10 @@ async function reasoningProvider(t, responses, { maxAttempts = "3" } = {}) {
   });
   const h = registrationHost();
   await kiroExtension(h.pi);
-  return { requests, stream: (context, options) => h.providers[0].config.streamSimple(cachedModel, context, options) };
+  return {
+    requests,
+    stream: (context, options) => h.providers[0].config.streamSimple({ ...cachedModel, contextWindow }, context, options),
+  };
 }
 
 // Host-visible lifecycle: event type, content index, then delta or final content.
@@ -920,6 +923,57 @@ test("a terminal metered disconnect does not hand OMP a replayable network error
   assert.equal(p.requests.length, 1);
 });
 
+test("overflow of a metered continuation is terminal to OMP and preserves the committed text", async (t) => {
+  const p = await reasoningProvider(t, [
+    partialResponse([
+      answer("committed text"),
+      frame("meteringEvent", { usage: 0.5, unit: "credits" }),
+    ]),
+    Response.json({ reason: "MODEL_CONTEXT_WINDOW_EXCEEDED" }, { status: 413 }),
+  ]);
+  const result = await p.stream(turnContext).result();
+  assert.equal(result.type, "error");
+  assert.equal(result.error.stopReason, "error");
+  assert.equal(result.error.errorStatus, undefined);
+  assert.equal(result.error.errorMessage, "Kiro did not finish the billed response. It was not replayed.");
+  assert.deepEqual(result.error.content, [{ type: "text", text: "committed text" }]);
+  assert.equal(p.requests.length, 2);
+  assert.ok(p.requests[1].conversationState.history.some(
+    (message) => message.assistantResponseMessage?.content === "committed text",
+  ));
+});
+
+test("metered continuation failure keeps credits without handing OMP usage-backed overflow evidence", async (t) => {
+  const p = await reasoningProvider(t, [
+    partialResponse([answer("committed text"), frame("meteringEvent", { usage: 0.5, unit: "credits" })]),
+    new Response(Buffer.concat([
+      frame("metadataEvent", { tokenUsage: { uncachedInputTokens: 2000, cacheReadInputTokens: 15, outputTokens: 5 } }),
+      frame("meteringEvent", { usage: 0.25, unit: "credits" }),
+      frame("invalidStateEvent", { reason: "CONTENT_LENGTH_EXCEEDS_THRESHOLD" }),
+    ])),
+  ], { contextWindow: 1000 });
+  const result = await p.stream(turnContext).result();
+  assert.equal(result.type, "error");
+  assert.equal(result.error.errorMessage, "Kiro did not finish the billed response. It was not replayed.");
+  assert.deepEqual(result.error.content, [{ type: "text", text: "committed text" }]);
+  assert.equal(result.error.usage.input + result.error.usage.cacheRead + result.error.usage.cacheWrite, 0);
+  assert.equal(result.error.usage.output, 5);
+  assert.deepEqual(result.error.usage.credits, { cost: 0.25 });
+  assert.equal(p.requests.length, 2);
+});
+
+test("an image HTTP 413 reaches OMP as a payload rejection without fuzzy overflow text", async (t) => {
+  const p = await reasoningProvider(t, [
+    Response.json({ message: "Image exceeds the limit of 1024 bytes" }, { status: 413 }),
+  ]);
+  const result = await p.stream(turnContext).result();
+  assert.equal(result.type, "error");
+  assert.equal(result.error.errorStatus, 413);
+  assert.match(result.error.errorMessage, /Reduce attachment or request bytes/);
+  assert.doesNotMatch(result.error.errorMessage, /prompt is too long|exceeds the limit of|no body/i);
+  assert.equal(p.requests.length, 1);
+});
+
 test("a disabled default account does not load its old snapshot or hide commands", async (t) => {
   const f = await fixture(t, { ...auth, disabled: "invalid_grant" });
   noNetwork(t);
@@ -929,7 +983,8 @@ test("a disabled default account does not load its old snapshot or hide commands
   setEnv(t, "KIRO_API_KEY", undefined);
   const h = profileCommandHost();
   await kiroExtension(h.pi);
-  assert.ok(!h.providers[0].config.models);
+  assert.deepEqual(h.providers[0].config.models, []);
+  assert.equal(h.providers[0].config.fetchDynamicModels, undefined);
   await h.commands.get("kiro-status").handler("", h.ctx);
   assert.match(h.messages[0].content, /signed in; sign in again/);
   const result = await h.providers[0].config.streamSimple(cachedModel, turnContext).result();

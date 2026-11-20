@@ -20,9 +20,9 @@ import { fetchKiroProfileUsage, listKiroProfiles, selectKiroProfile } from "./se
 import { executeKiroQuery } from "./server/commands.mjs";
 import {
   DEFAULT_ACCOUNT,
+  kiroAccountTargets,
   kiroAccountAuthFile,
   kiroTargetProvider,
-  kiroTargets,
   listKiroAccounts,
   pinnedKiroTargets,
 } from "./server/accounts.mjs";
@@ -165,9 +165,11 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
   if (command === "accounts") {
     if (values.json) {
       const accounts = await listKiroAccounts({ authFile: defaultAuthFile });
-      const pinned = new Set(pinnedKiroTargets(kiroTargets(accounts)).map((target) => target.provider));
-      const targets = kiroTargets(accounts).map((target) => ({ ...target, pinned: pinned.has(target.provider) }));
-      console.log(JSON.stringify({ accounts, targets }));
+      const { targets, collisions } = kiroAccountTargets(accounts);
+      const pinned = new Set(pinnedKiroTargets(targets).map((target) => target.provider));
+      console.log(JSON.stringify({
+        accounts, targets: targets.map((target) => ({ ...target, pinned: pinned.has(target.provider) })), collisions,
+      }));
     } else console.log((await executeKiroQuery("kiro-accounts", "", { authFile: defaultAuthFile })).text);
     return;
   }
@@ -218,8 +220,10 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
           console.log("Kiro API keys have no profiles.");
           return;
         }
+        if (!catalog.complete)
+          console.log("Profile lookup was incomplete; some profiles may be missing. The saved catalog was not replaced.");
         for (const profile of catalog.profiles)
-          console.log(`${profile.arn === catalog.selectedArn ? "* " : "  "}${JSON.stringify(profile.name)}\n  ${profile.arn}\n  pinned models: ${kiroTargetProvider(account, profile.arn) ?? "unavailable"}/…`);
+          console.log(`${profile.arn === catalog.selectedArn ? "* " : "  "}${JSON.stringify(profile.name)}\n  ${profile.arn}`);
         if (!catalog.selectedArn) console.log("No profile selected.");
       }
       return;
@@ -302,30 +306,35 @@ export async function runAuthCli(argv = process.argv.slice(2)) {
         expectedCredential: { ...credential, profile_arn: undefined },
       });
     } catch (error) {
-      // Several profiles and no --profile: pinned providers still need no selection.
+      // An ambiguous or incomplete list leaves the saved login unselected.
       if (values.profile || !error.profiles) throw error;
+      console.log(error.message);
       unselected = true;
     }
     console.log(`Authenticated ${credential.provider}. Credentials saved to ${authFile}.`);
-    let targets = [];
     try {
-      const { profiles } = await listKiroProfiles({ authFile, signal, useEnv: false });
-      targets = kiroTargets([{ name: account, authFile, status: {
-        loggedIn: true, kind: credential.kind, provider, region: credential.region,
-      }, catalog: { profiles } }]);
-    } catch {
+      const catalog = await listKiroProfiles({ authFile, signal, useEnv: false });
+      if (!catalog.complete)
+        console.log("Profile lookup was incomplete; some profiles may be missing. The saved catalog was not replaced.");
+    } catch (error) {
+      signal.throwIfAborted();
+      if (error?.code === "credential_changed") throw error;
       console.log(`Profiles could not be listed; run omp-kiro auth profiles --account ${account} to name its model providers.`);
     }
-    for (const target of targets)
+    const { targets } = kiroAccountTargets(await listKiroAccounts({ authFile: defaultAuthFile }));
+    const pins = pinnedKiroTargets(targets).filter((target) => target.account === account);
+    for (const target of pins)
       console.log(`Model provider: ${target.provider}/… — ${JSON.stringify(target.name)}`);
     if (account === DEFAULT_ACCOUNT) {
       console.log(`For this store, set OMP_KIRO_AUTH_FILE to ${authFile}.`);
+      if (useEnv && process.env.KIRO_API_KEY)
+        console.log("KIRO_API_KEY takes precedence over the saved default. Unset it to use this login.");
       if (unselected)
-        console.log("Several profiles are available: select one for kiro-http with omp-kiro auth profile --profile <arn>, or use a pinned provider.");
+        console.log("No profile was selected: select an assigned ARN for kiro-http, or run omp-kiro accounts to see available pinned providers and collisions.");
       else console.log("Use: omp --model kiro-http/auto");
     } else {
       console.log(`Named accounts are found beside ${defaultAuthFile}; OMP and Passession must use that same default store.`);
-      if (targets.length) console.log(`Use: omp --model ${targets[0].provider}/auto`);
+      if (pins.length) console.log(`Use: omp --model ${pins[0].provider}/auto`);
     }
   } finally {
     clearTimeout(timer);
